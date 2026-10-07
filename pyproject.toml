@@ -1,0 +1,14 @@
+[project]
+name = "fde-info-agent"
+version = "0.1.0"
+description = "Personal information processing agent for FDE learning"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.110", "uvicorn[standard]>=0.29", "typer>=0.12",
+  "httpx>=0.27", "beautifulsoup4>=4.12", "pydantic-settings>=2.2",
+  "sqlalchemy>=2.0", "python-dotenv>=1.0", "lark-oapi>=1.7.3,<2"
+]
+[project.scripts]
+fde-agent = "fde_agent.cli:app"
+[tool.pytest.ini_options]
+pythonpath = ["src"]

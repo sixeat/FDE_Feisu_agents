@@ -1,0 +1,8 @@
+# Offline incremental release using a captured, known-working dependency image.
+ARG FDE_BASE_IMAGE
+FROM ${FDE_BASE_IMAGE}
+COPY src /app/src
+COPY scripts /app/scripts
+ENV PYTHONPATH=/app/src
+ENV PYTHONUNBUFFERED=1
+CMD ["uvicorn", "scripts.fde_oauth_server:app", "--host", "0.0.0.0", "--port", "8210"]

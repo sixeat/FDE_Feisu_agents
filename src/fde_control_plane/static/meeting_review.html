@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent 组织工作台</title>
+  <link rel="stylesheet" href="/assets/meeting_review.css">
+  <script src="/assets/meeting_review.js" defer></script>
+</head>
+<body>
+  <header class="topbar"><img class="brand-icon" src="/assets/file-text.svg" alt="" width="22" height="22"><strong>Agent 组织</strong><span class="divider"></span><span id="module-label">会议审核</span><span class="account">飞书工作台</span></header>
+  <div class="workspace">
+    <aside aria-label="工作台模块">
+      <h2>工作台</h2>
+      <nav id="module-nav" class="module-nav" role="tablist" aria-label="工作台模块">
+        <button id="module-meetings" type="button" role="tab" aria-selected="true" aria-controls="view-meetings" data-view="meetings"><span>会议审核</span></button>
+        <button id="module-owner-tasks" type="button" role="tab" aria-selected="false" aria-controls="view-owner-tasks" data-view="owner-tasks"><span>我的待办</span></button>
+        <button id="module-organizer-tasks" type="button" role="tab" aria-selected="false" aria-controls="view-organizer-tasks" data-view="organizer-tasks"><span>发起的任务</span></button>
+        <button id="module-follow-up" type="button" role="tab" aria-selected="false" aria-controls="view-follow-up" data-view="follow-up"><span>跟进概览</span></button>
+      </nav>
+      <section id="meeting-context" class="meeting-context" aria-label="我的会议">
+        <h2>我的会议</h2><nav id="meetings"></nav>
+      </section>
+    </aside>
+    <main>
+      <section id="view-meetings" class="view-panel" role="tabpanel" aria-labelledby="module-meetings">
+        <div class="heading"><div><p class="eyebrow">会议 Agent</p><h1 id="title">会议审核</h1><p id="metadata" class="muted">正在加载…</p></div><button id="reload" type="button"><img src="/assets/rotate-cw.svg" alt="" width="16" height="16">重新加载</button></div>
+        <div id="notice" role="status" hidden></div>
+        <div id="summary" class="summary" hidden></div>
+        <section id="execution" class="execution" aria-live="polite" hidden></section>
+        <form id="review-form">
+          <div id="todos" aria-busy="true"></div>
+          <footer id="actions" hidden><span id="selection" class="muted"></span><div class="commands"><button id="save" type="button"><img src="/assets/save.svg" alt="" width="16" height="16">保存草稿</button><button id="submit" class="primary" type="submit"><img src="/assets/send.svg" alt="" width="16" height="16">提交审核</button></div></footer>
+        </form>
+      </section>
+      <section id="view-owner-tasks" class="view-panel" role="tabpanel" aria-labelledby="module-owner-tasks" hidden>
+        <div class="heading"><div><p class="eyebrow">任务中心</p><h1>我的待办</h1></div><button id="owner-reload" type="button">刷新任务</button></div>
+        <section id="owner-tasks" class="owner-tasks" aria-labelledby="owner-tasks-title"><div class="owner-heading"><h2 id="owner-tasks-title">任务列表</h2></div><div id="owner-notice" role="status" aria-live="polite" hidden></div><div id="owner-task-list" aria-busy="true"><p class="muted">正在加载任务…</p></div></section>
+      </section>
+      <section id="view-organizer-tasks" class="view-panel" role="tabpanel" aria-labelledby="module-organizer-tasks" hidden>
+        <div class="heading"><div><p class="eyebrow">任务中心</p><h1>我发起的任务</h1></div><button id="organizer-reload" type="button">刷新状态</button></div>
+        <section id="organizer-tasks" class="owner-tasks" aria-labelledby="organizer-tasks-title"><div class="owner-heading"><h2 id="organizer-tasks-title">任务处理</h2></div><div id="organizer-notice" role="status" aria-live="polite" hidden></div><div id="organizer-task-list" aria-busy="true"><p class="muted">正在加载任务…</p></div></section>
+      </section>
+      <section id="view-follow-up" class="view-panel" role="tabpanel" aria-labelledby="module-follow-up" hidden>
+        <div class="heading"><div><p class="eyebrow">个人助手</p><h1>跟进概览</h1></div><button id="follow-up-reload" type="button">刷新概览</button></div>
+        <section id="follow-up-digest" class="digest" aria-live="polite"></section>
+      </section>
+    </main>
+  </div>
+  <dialog id="confirm-dialog"><form method="dialog"><h2>提交会议审核</h2><p id="confirm-text"></p><div class="commands"><button value="cancel">返回核对</button><button value="confirm" class="primary">确认提交</button></div></form></dialog>
+</body>
+</html>

@@ -1,0 +1,6 @@
+FROM deploy-fde-control-plane:before-review
+COPY src /app/src
+COPY scripts/fde_oauth_server.py /app/scripts/fde_oauth_server.py
+COPY scripts/meeting_review_bundle.py /app/scripts/meeting_review_bundle.py
+COPY scripts/meeting_draft_review_export.py /app/scripts/meeting_draft_review_export.py
+COPY scripts/meeting_approval_bridge.py /app/scripts/meeting_approval_bridge.py

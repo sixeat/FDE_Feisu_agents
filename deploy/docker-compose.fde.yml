@@ -1,0 +1,70 @@
+services:
+  fde-control-plane:
+    image: ${FDE_IMAGE:-fde-control-plane:local}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.fde
+    container_name: fde-control-plane
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    mem_limit: 384m
+    pids_limit: 128
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8210/health', timeout=5)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 30s
+    env_file:
+      - .env.fde
+    ports:
+      - "127.0.0.1:8210:8210"
+    volumes:
+      - ./data:/var/lib/fde-agent
+    logging: &fde-logging
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  fde-approval-listener:
+    image: ${FDE_IMAGE:-fde-control-plane:local}
+    container_name: fde-approval-listener
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    mem_limit: 256m
+    pids_limit: 64
+    env_file: [.env.fde]
+    command: ["python", "-u", "scripts/meeting_approval_bridge.py", "listen", "--db", "/var/lib/fde-agent/control_plane.sqlite3"]
+    volumes:
+      - ./data:/var/lib/fde-agent
+    depends_on:
+      fde-control-plane:
+        condition: service_healthy
+    logging: *fde-logging
+
+  fde-task-worker:
+    image: ${FDE_IMAGE:-fde-control-plane:local}
+    container_name: fde-task-worker
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    mem_limit: 128m
+    pids_limit: 64
+    # No credentials or network are needed to observe the durable queue.
+    network_mode: none
+    command: ["python", "-u", "scripts/meeting_task_worker.py", "--loop", "--dry-run", "--poll-interval", "30"]
+    volumes:
+      - ./data:/var/lib/fde-agent:ro
+    depends_on:
+      fde-control-plane:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import time; from pathlib import Path; age=time.time()-float(Path('/tmp/fde-worker-heartbeat').read_text()); assert 0 <= age < 90"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *fde-logging

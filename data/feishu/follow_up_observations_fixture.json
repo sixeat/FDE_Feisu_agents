@@ -1,0 +1,20 @@
+[
+  {
+    "tenant_id": "tenant-demo",
+    "task_run_id": "run-alpha",
+    "status": "DUE_SOON",
+    "observed_at": "2026-10-05T12:00:00Z"
+  },
+  {
+    "tenant_id": "tenant-demo",
+    "task_run_id": "run-beta",
+    "status": "COMPLETED",
+    "observed_at": "2026-10-05T12:00:00Z"
+  },
+  {
+    "tenant_id": "other-tenant",
+    "task_run_id": "run-hidden",
+    "status": "OVERDUE",
+    "observed_at": "2026-10-05T12:00:00Z"
+  }
+]

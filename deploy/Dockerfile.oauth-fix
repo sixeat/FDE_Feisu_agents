@@ -1,0 +1,2 @@
+FROM deploy-fde-control-plane:oauth-before-fix
+COPY scripts/fde_oauth_server.py /app/scripts/fde_oauth_server.py

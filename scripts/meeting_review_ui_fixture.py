@@ -21,6 +21,7 @@ bundle = json.loads((ROOT / "data/meeting_review_bundle.json").read_text(encodin
 cp = ControlPlane(SQLiteStore())
 subject = bundle["source_member_hash"]
 cp.register_actor(Actor("member-primary", "preview", ActorType.USER, external_ref_hash=subject))
+cp.register_actor(Actor("admin-primary", "preview", ActorType.USER, roles=frozenset({"admin"}), external_ref_hash="preview-admin-subject"))
 import_bundle(cp, bundle, tenant_id="preview", member_id="member-primary", member_hash=subject)
 
 
@@ -38,8 +39,12 @@ app.mount("/assets", StaticFiles(directory=static))
 
 
 @app.get("/preview-login")
-def preview_login():
-    token = sessions(IdentityContext("preview", "member-primary", "user_oauth", subject))
+def preview_login(role: str = "member"):
+    if role == "admin":
+        identity = IdentityContext("preview", "admin-primary", "user_oauth", "preview-admin-subject")
+    else:
+        identity = IdentityContext("preview", "member-primary", "user_oauth", subject)
+    token = sessions(identity)
     response = RedirectResponse("/h5", status_code=303)
     response.set_cookie("fde_auth_session", token, httponly=True, samesite="lax")
     return response

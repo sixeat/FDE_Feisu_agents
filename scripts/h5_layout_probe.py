@@ -12,7 +12,8 @@ def main() -> None:
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(executable_path=browser_path, headless=True)
         for name, width, height in (("desktop", 1440, 900), ("mobile", 390, 844), ("narrow", 320, 700)):
-            page = browser.new_page(viewport={"width": width, "height": height}, device_scale_factor=1)
+            context = browser.new_context(viewport={"width": width, "height": height}, device_scale_factor=1)
+            page = context.new_page()
             page.goto("http://127.0.0.1:8211/preview-login", wait_until="networkidle")
             page.locator(".todo").first.wait_for()
             for view in ("meetings", "owner-tasks", "organizer-tasks", "follow-up", "agents"):
@@ -28,6 +29,7 @@ def main() -> None:
                 assert visible == 1 and not overflow and selected == view and labels_fit
                 page.screenshot(path=str(output / f"{name}-{view}.png"), full_page=True)
             page.close()
+            context.close()
 
         page = browser.new_page()
         page.goto("http://127.0.0.1:8211/preview-login#owner-tasks", wait_until="networkidle")
@@ -58,6 +60,18 @@ def main() -> None:
         assert page.get_by_text("预览 Agent", exact=True).count() == 1
         assert page.get_by_text("待审核", exact=True).count() == 1
         assert page.get_by_text("meeting-agent", exact=True).count() == 1
+        page.close()
+
+        page = browser.new_page()
+        page.goto("http://127.0.0.1:8211/preview-login?role=admin#agents", wait_until="networkidle")
+        page.get_by_text("运行审核预审", exact=True).click()
+        page.get_by_text("预审通过，待管理员确认", exact=False).wait_for()
+        assert page.get_by_text("管理员确认发布", exact=True).count() == 1
+        page.once("dialog", lambda dialog: dialog.accept())
+        page.get_by_text("管理员确认发布", exact=True).click()
+        page.get_by_text("Agent 已发布为 v1。", exact=True).wait_for()
+        assert page.get_by_text("已发布", exact=True).count() >= 1
+        assert page.get_by_text("预览 Agent", exact=True).count() >= 1
         page.close()
         browser.close()
 

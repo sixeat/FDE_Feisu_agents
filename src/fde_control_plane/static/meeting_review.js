@@ -3,7 +3,7 @@ const $ = id => document.getElementById(id);
 const state = { csrf: "", members: [], detail: null, dirty: false, busy: false };
 const ownerState = {csrf:"", tasks:[], busy:false, drafts:new Map(), retries:new Map()};
 const organizerState = {csrf:"", tasks:[], busy:false};
-const agentState = {agents:[], drafts:[], csrf:"", canPrecheck:false, busy:false};
+const agentState = {agents:[], drafts:[], csrf:"", canPrecheck:false, canConfirm:false, busy:false};
 const viewNames={meetings:"会议审核","owner-tasks":"我的待办","organizer-tasks":"发起的任务","follow-up":"跟进概览",agents:"Agent 管理"};
 let activeView="";
 const ownerStatusNames = {WAITING_OWNER:"等待你确认",IN_PROGRESS:"已接受，进行中",WAITING_HUMAN:"已退回，等待会议发起人处理",COMPLETED:"已完成",CANCELLED:"已取消",UNKNOWN:"等待核验",DUE_SOON:"即将到期",OVERDUE:"已逾期"};
@@ -162,12 +162,16 @@ function renderAgentDrafts() {
       const actions=node("div",undefined,"commands agent-review-actions"),button=node("button","运行审核预审");
       button.type="button";button.addEventListener("click",()=>precheckAgentDraft(draft,button));actions.append(button);card.append(actions);
     }
+    if(agentState.canConfirm && draft.status!=="PUBLISHED" && draft.review_status==="READY_FOR_ADMIN"){
+      const actions=node("div",undefined,"commands agent-review-actions"),button=node("button","管理员确认发布");
+      button.type="button";button.className="primary";button.addEventListener("click",()=>confirmAgentDraft(draft,button));actions.append(button);card.append(actions);
+    }
     panel.append(card);
   });
 }
 async function loadAgents() {
   if(agentState.busy)return;agentState.busy=true;$("agents-reload").disabled=true;$("agent-list").setAttribute("aria-busy","true");
-  try{const [data,drafts]=await Promise.all([api("/api/meetings/agents"),api("/api/meetings/agent-drafts")]);agentState.agents=data.agents||[];agentState.drafts=drafts.drafts||[];agentState.canPrecheck=Boolean(drafts.can_precheck);agentState.csrf=drafts.csrf_token;renderAgents();renderAgentDrafts();agentNotice("");}
+  try{const data=await api("/api/meetings/agents");const drafts=await api("/api/meetings/agent-drafts");agentState.agents=data.agents||[];agentState.drafts=drafts.drafts||[];agentState.canPrecheck=Boolean(drafts.can_precheck);agentState.canConfirm=Boolean(drafts.can_confirm);agentState.csrf=drafts.csrf_token;renderAgents();renderAgentDrafts();agentNotice("");}
   catch(error){agentNotice(error.message,"error");if(!agentState.agents.length)$("agent-list").replaceChildren(node("p","Agent 目录暂时无法加载，请稍后刷新。","muted"));}
   finally{agentState.busy=false;$("agents-reload").disabled=false;$("agent-list").setAttribute("aria-busy","false");}
 }
@@ -175,6 +179,14 @@ async function precheckAgentDraft(draft,button) {
   if(agentState.busy)return;
   agentState.busy=true;button.disabled=true;agentNotice(`正在预审“${draft.name}”…`);
   try{const result=await api(`/api/meetings/agent-drafts/${encodeURIComponent(draft.draft_id)}/precheck`,{method:"POST",headers:{"X-CSRF-Token":agentState.csrf}});agentNotice(result.status==="READY_FOR_ADMIN"?"预审通过，等待管理员确认。":"预审已阻断，请处理报告中的问题。",result.status==="READY_FOR_ADMIN"?"success":"error");agentState.busy=false;await loadAgents();}
+  catch(error){agentNotice(error.message,"error");button.disabled=false;}
+  finally{agentState.busy=false;}
+}
+async function confirmAgentDraft(draft,button) {
+  if(agentState.busy)return;
+  if(!window.confirm(`确认发布“${draft.name}”的 Agent v1？这会创建运行版本并启用申请的能力。`))return;
+  agentState.busy=true;button.disabled=true;agentNotice(`正在确认发布“${draft.name}”…`);
+  try{const result=await api(`/api/meetings/agent-drafts/${encodeURIComponent(draft.draft_id)}/confirm`,{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":agentState.csrf},body:JSON.stringify({review_id:draft.review_id,input_hash:draft.review_input_hash})});agentNotice(result.duplicate?"发布确认已处理，返回原版本。":"Agent 已发布为 v1。","success");agentState.busy=false;await loadAgents();}
   catch(error){agentNotice(error.message,"error");button.disabled=false;}
   finally{agentState.busy=false;}
 }
@@ -186,7 +198,7 @@ async function submitAgentDraft(event) {
   try{
     await api("/api/meetings/agent-drafts",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":agentState.csrf},body:JSON.stringify({name:$("agent-draft-name").value.trim(),actor_type:$("agent-draft-type").value,description:$("agent-draft-description").value.trim(),capabilities,skill_version:$("agent-draft-skill").value.trim()||null})});
     $("agent-draft-form").reset();$("agent-draft-editor").hidden=true;agentNotice("配置草稿已提交，等待审核官和管理员处理。","success");
-    const drafts=await api("/api/meetings/agent-drafts");agentState.drafts=drafts.drafts||[];agentState.canPrecheck=Boolean(drafts.can_precheck);agentState.csrf=drafts.csrf_token;renderAgentDrafts();
+    const drafts=await api("/api/meetings/agent-drafts");agentState.drafts=drafts.drafts||[];agentState.canPrecheck=Boolean(drafts.can_precheck);agentState.canConfirm=Boolean(drafts.can_confirm);agentState.csrf=drafts.csrf_token;renderAgentDrafts();
   }catch(error){agentNotice(error.message,"error");}
   finally{agentState.busy=false;$("agent-draft-form").querySelectorAll("input,select,textarea,button").forEach(el=>el.disabled=false);}
 }

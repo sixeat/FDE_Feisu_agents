@@ -20,7 +20,7 @@ from .follow_up import (
     remote_due_mismatch,
 )
 from .meeting import review_todo_ref
-from .models import IdentityContext, TaskRunStatus
+from .models import ActorType, IdentityContext, TaskRunStatus
 from .task_due_correction import (
     approve_due_correction, correction_for_task, latest_remote_observation, propose_due_correction,
 )
@@ -68,7 +68,14 @@ class AgentConfigDraftRequest(BaseModel):
     skill_version: StrictStr | None = Field(default=None, max_length=100)
 
 
+class AgentConfigApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    review_id: StrictStr = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_-]+$")
+    input_hash: StrictStr = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]+$")
+
+
 AGENT_REVIEWER_ROLES = frozenset({"admin", "agent_reviewer"})
+AGENT_ADMIN_ROLES = frozenset({"admin"})
 KNOWN_AGENT_CAPABILITIES = frozenset({
     "doc.read", "doc.write", "doc.delete", "task.read", "task.write", "task.delete",
     "message.send",
@@ -124,6 +131,8 @@ class MeetingReviewWebService:
                 "actor_type": data["actor_type"], "description": data["description"],
                 "capabilities": data["capabilities"], "skill_version": data.get("skill_version"),
                 "review_status": review["status"] if review is not None else None,
+                "review_id": review["review_id"] if review is not None else None,
+                "review_input_hash": review["input_hash"] if review is not None else None,
                 "review_blockers": (report or {}).get("blockers", []),
                 "review_warnings": (report or {}).get("warnings", []),
             })
@@ -133,6 +142,11 @@ class MeetingReviewWebService:
         actor = self.cp.verify_identity(identity)
         return (identity.auth_mode == "user_oauth" and actor.actor_type.value == "USER"
                 and bool(actor.roles & AGENT_REVIEWER_ROLES))
+
+    def can_confirm_agent_config(self, identity: IdentityContext) -> bool:
+        actor = self.cp.verify_identity(identity)
+        return (identity.auth_mode == "user_oauth" and actor.actor_type.value == "USER"
+                and bool(actor.roles & AGENT_ADMIN_ROLES))
 
     def precheck_agent_config_draft(self, draft_id: str, identity: IdentityContext) -> dict[str, Any]:
         actor = self.cp.verify_identity(identity)
@@ -146,7 +160,8 @@ class MeetingReviewWebService:
         previous = self.cp.store.get_latest_agent_config_review(draft_id, identity.tenant_id)
         if previous is not None and previous["input_hash"] == input_hash:
             report = json.loads(previous["report_json"])
-            return {"draft_id": draft_id, "review_id": previous["review_id"], "status": previous["status"],
+            return {"draft_id": draft_id, "review_id": previous["review_id"], "input_hash": input_hash,
+                    "status": previous["status"],
                     "blockers": report.get("blockers", []), "warnings": report.get("warnings", []),
                     "requires_admin_confirmation": previous["status"] == "READY_FOR_ADMIN", "duplicate": True}
 
@@ -177,9 +192,47 @@ class MeetingReviewWebService:
         self.cp._audit("AGENT_CONFIG_PRECHECKED", identity.tenant_id, identity.actor_id, None,
                        {"draft_id": draft_id, "review_id": review_id, "status": status,
                         "blocker_count": len(blockers), "warning_count": len(warnings)}, status)
-        return {"draft_id": draft_id, "review_id": review_id, "status": status,
+        return {"draft_id": draft_id, "review_id": review_id, "input_hash": input_hash, "status": status,
                 "blockers": blockers, "warnings": warnings,
                 "requires_admin_confirmation": status == "READY_FOR_ADMIN", "duplicate": False}
+
+    def confirm_agent_config_draft(self, draft_id: str, identity: IdentityContext,
+                                   body: AgentConfigApprovalRequest) -> dict[str, Any]:
+        if not self.can_confirm_agent_config(identity):
+            raise HTTPException(403, "只有管理员可以确认 Agent 配置发布")
+        row = self.cp.store.get_agent_config_draft(draft_id, identity.tenant_id)
+        if row is None:
+            raise HTTPException(404, "配置草稿不存在或无权访问")
+        data = json.loads(row["data_json"])
+        input_hash = hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+        if body.input_hash != input_hash:
+            raise HTTPException(409, "配置草稿已变化，请重新运行审核预审")
+        review = self.cp.store.get_latest_agent_config_review(draft_id, identity.tenant_id)
+        if review is None or review["review_id"] != body.review_id or review["input_hash"] != input_hash:
+            raise HTTPException(409, "审核预审版本已变化，请重新运行审核预审")
+        if review["status"] != "READY_FOR_ADMIN":
+            raise HTTPException(409, "审核预审未通过，不能发布 Agent")
+        try:
+            result = self.cp.store.publish_agent_config_draft(
+                draft_id=draft_id, tenant_id=identity.tenant_id, approver_id=identity.actor_id,
+                review_id=body.review_id, input_hash=input_hash, agent_id=data["name"],
+                actor_type=ActorType(data["actor_type"]).value, capabilities=list(data.get("capabilities") or []),
+                skill_version=data.get("skill_version"), approval_id="agent-approval-" + secrets.token_hex(10),
+            )
+        except ValueError as exc:
+            reasons = {
+                "DRAFT_NOT_FOUND": (404, "配置草稿不存在或无权访问"),
+                "DRAFT_ALREADY_PUBLISHED": (409, "配置草稿已经发布"),
+                "PRECHECK_VERSION_STALE": (409, "审核预审版本已变化，请重新运行审核预审"),
+                "PRECHECK_NOT_READY": (409, "审核预审未通过，不能发布 Agent"),
+                "AGENT_NAME_CONFLICT": (409, "Agent 名称已存在，请修改草稿后重新预审"),
+            }
+            code, message = reasons.get(str(exc), (409, "Agent 配置发布未完成，请重新核对"))
+            raise HTTPException(code, message) from exc
+        self.cp._audit("AGENT_CONFIG_CONFIRMED", identity.tenant_id, identity.actor_id, None,
+                       {"draft_id": draft_id, "approval_id": result["approval_id"],
+                        "agent_id": data["name"], "version": result["version"]}, result["status"])
+        return {**result, "draft_id": draft_id}
 
     def create_agent_config_draft(self, identity: IdentityContext, body: AgentConfigDraftRequest) -> dict[str, Any]:
         actor = self.cp.verify_identity(identity)
@@ -533,6 +586,7 @@ def build_meeting_review_router(
         with service.lock:
             return {"drafts": service.agent_config_drafts(identity),
                     "can_precheck": service.can_precheck_agent_config(identity),
+                    "can_confirm": service.can_confirm_agent_config(identity),
                     "csrf_token": csrf_token(request.cookies["fde_auth_session"])}
 
     @router.post("/agent-drafts")
@@ -548,6 +602,13 @@ def build_meeting_review_router(
         check_csrf(request)
         with service.lock:
             return service.precheck_agent_config_draft(draft_id, identity)
+
+    @router.post("/agent-drafts/{draft_id}/confirm")
+    def confirm_agent_draft(draft_id: str, body: AgentConfigApprovalRequest, request: Request,
+                            identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        with service.lock:
+            return service.confirm_agent_config_draft(draft_id, identity, body)
 
     @router.get("/owner-tasks")
     def get_owner_tasks(request: Request, identity: IdentityContext = Depends(require_identity)):

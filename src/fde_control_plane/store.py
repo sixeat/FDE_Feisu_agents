@@ -75,6 +75,17 @@ class SQLiteStore:
             );
             CREATE INDEX IF NOT EXISTS idx_agent_config_reviews_draft
                 ON agent_config_reviews(tenant_id, draft_id, created_at);
+            CREATE TABLE IF NOT EXISTS agent_config_approvals (
+                approval_id TEXT PRIMARY KEY, draft_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL, approver_id TEXT NOT NULL,
+                review_id TEXT NOT NULL, input_hash TEXT NOT NULL,
+                agent_id TEXT NOT NULL, version INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(tenant_id, draft_id, input_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_config_approvals_draft
+                ON agent_config_approvals(tenant_id, draft_id, created_at);
             CREATE TABLE IF NOT EXISTS assistant_bindings (
                 binding_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
                 member_actor_id TEXT NOT NULL, assistant_actor_id TEXT NOT NULL,
@@ -384,6 +395,80 @@ class SQLiteStore:
             "ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (draft_id, tenant_id),
         ).fetchone()
+
+    def get_agent_config_approval(self, draft_id: str, tenant_id: str,
+                                  input_hash: str | None = None) -> sqlite3.Row | None:
+        if input_hash is None:
+            return self.connection.execute(
+                "SELECT * FROM agent_config_approvals WHERE draft_id = ? AND tenant_id = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1", (draft_id, tenant_id),
+            ).fetchone()
+        return self.connection.execute(
+            "SELECT * FROM agent_config_approvals WHERE draft_id = ? AND tenant_id = ? AND input_hash = ?",
+            (draft_id, tenant_id, input_hash),
+        ).fetchone()
+
+    def publish_agent_config_draft(self, *, draft_id: str, tenant_id: str, approver_id: str,
+                                   review_id: str, input_hash: str, agent_id: str,
+                                   actor_type: str, capabilities: list[str],
+                                   skill_version: str | None, approval_id: str) -> dict[str, Any]:
+        """Atomically publish one prechecked draft as an immutable v1 AgentVersion."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.get_agent_config_approval(draft_id, tenant_id, input_hash)
+            if existing is not None:
+                self.connection.commit()
+                return {"approval_id": existing["approval_id"], "agent_id": existing["agent_id"],
+                        "version": int(existing["version"]), "status": existing["status"], "duplicate": True}
+            draft = self.connection.execute(
+                "SELECT status FROM agent_config_drafts WHERE draft_id = ? AND tenant_id = ?",
+                (draft_id, tenant_id),
+            ).fetchone()
+            if draft is None:
+                raise ValueError("DRAFT_NOT_FOUND")
+            if draft["status"] == "PUBLISHED":
+                raise ValueError("DRAFT_ALREADY_PUBLISHED")
+            review = self.connection.execute(
+                "SELECT review_id, input_hash, status FROM agent_config_reviews "
+                "WHERE review_id = ? AND draft_id = ? AND tenant_id = ?",
+                (review_id, draft_id, tenant_id),
+            ).fetchone()
+            if review is None or review["input_hash"] != input_hash:
+                raise ValueError("PRECHECK_VERSION_STALE")
+            if review["status"] != "READY_FOR_ADMIN":
+                raise ValueError("PRECHECK_NOT_READY")
+            existing_actor = self.connection.execute(
+                "SELECT actor_id FROM actors WHERE tenant_id = ? AND actor_type IN "
+                "('PERSONAL_ASSISTANT', 'BUSINESS_AGENT', 'MANAGEMENT_AGENT')",
+                (tenant_id,),
+            ).fetchall()
+            if any(str(row["actor_id"]).casefold() == agent_id.casefold() for row in existing_actor):
+                raise ValueError("AGENT_NAME_CONFLICT")
+            self.connection.execute(
+                "INSERT INTO actors(actor_id, tenant_id, actor_type, capabilities_json, roles_json, external_ref_hash, active) "
+                "VALUES (?, ?, ?, ?, ?, NULL, 1)",
+                (agent_id, tenant_id, actor_type, self._json(sorted(capabilities)), self._json([])),
+            )
+            self.connection.execute(
+                "INSERT INTO agent_versions(agent_id, version, capabilities_json, active, skill_version) "
+                "VALUES (?, 1, ?, 1, ?)",
+                (agent_id, self._json(sorted(capabilities)), skill_version),
+            )
+            self.connection.execute(
+                "UPDATE agent_config_drafts SET status = 'PUBLISHED' WHERE draft_id = ? AND tenant_id = ?",
+                (draft_id, tenant_id),
+            )
+            self.connection.execute(
+                "INSERT INTO agent_config_approvals(approval_id, draft_id, tenant_id, approver_id, review_id, "
+                "input_hash, agent_id, version, status) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'PUBLISHED')",
+                (approval_id, draft_id, tenant_id, approver_id, review_id, input_hash, agent_id),
+            )
+            self.connection.commit()
+            return {"approval_id": approval_id, "agent_id": agent_id, "version": 1,
+                    "status": "PUBLISHED", "duplicate": False}
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def save_binding(self, binding: Any) -> None:
         self.connection.execute(

@@ -185,6 +185,59 @@ def test_agent_config_precheck_blocks_unknown_capability(tmp_path):
     assert result.json()["blockers"] == ["UNKNOWN_CAPABILITY:unknown.tool"]
 
 
+def test_admin_confirmation_requires_current_precheck_and_publishes_immutable_v1(tmp_path):
+    cp, _, client, headers, _, _, _ = web_setup(tmp_path)
+    created = client.post("/api/meetings/agent-drafts", json={
+        "name": "确认发布 Agent", "actor_type": "BUSINESS_AGENT",
+        "description": "读取任务并生成跟进建议。", "capabilities": ["task.read"],
+        "skill_version": "follow-up.v1",
+    }, headers=headers)
+    draft_id = created.json()["draft_id"]
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    assert client.get("/api/meetings/agent-drafts").json()["can_confirm"] is True
+    assert client.post(f"/api/meetings/agent-drafts/{draft_id}/confirm", json={
+        "review_id": "missing", "input_hash": "0" * 64,
+    }, headers=admin_headers).status_code == 409
+    review = client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck", headers=admin_headers).json()
+    assert review["status"] == "READY_FOR_ADMIN"
+    result = client.post(f"/api/meetings/agent-drafts/{draft_id}/confirm", json={
+        "review_id": review["review_id"], "input_hash": review["input_hash"],
+    }, headers=admin_headers)
+    assert result.status_code == 200
+    assert result.json()["status"] == "PUBLISHED"
+    assert result.json()["version"] == 1 and result.json()["duplicate"] is False
+    replay = client.post(f"/api/meetings/agent-drafts/{draft_id}/confirm", json={
+        "review_id": review["review_id"], "input_hash": review["input_hash"],
+    }, headers=admin_headers)
+    assert replay.status_code == 200 and replay.json()["duplicate"] is True
+    draft = client.get("/api/meetings/agent-drafts").json()["drafts"][0]
+    assert draft["status"] == "PUBLISHED"
+    agent = next(item for item in client.get("/api/meetings/agents").json()["agents"] if item["agent_id"] == "确认发布 Agent")
+    assert agent["current_version"] == 1 and agent["status"] == "ACTIVE"
+    assert cp.store.connection.execute("SELECT COUNT(*) FROM agent_config_approvals").fetchone()[0] == 1
+    assert any(a["event_type"] == "AGENT_CONFIG_CONFIRMED" for a in cp.store.list_audits())
+
+
+def test_agent_config_confirmation_rejects_blocked_review_and_non_admin(tmp_path):
+    cp, _, client, headers, _, _, _ = web_setup(tmp_path)
+    created = client.post("/api/meetings/agent-drafts", json={
+        "name": "阻断发布 Agent", "actor_type": "BUSINESS_AGENT",
+        "description": "测试阻断发布。", "capabilities": ["unknown.tool"],
+    }, headers=headers)
+    draft_id = created.json()["draft_id"]
+    assert client.post(f"/api/meetings/agent-drafts/{draft_id}/confirm", json={
+        "review_id": "missing", "input_hash": "0" * 64,
+    }, headers=headers).status_code == 403
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    review = client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck", headers=admin_headers).json()
+    assert review["status"] == "BLOCKED"
+    result = client.post(f"/api/meetings/agent-drafts/{draft_id}/confirm", json={
+        "review_id": review["review_id"], "input_hash": review["input_hash"],
+    }, headers=admin_headers)
+    assert result.status_code == 409
+    assert not any(item["agent_id"] == "阻断发布 Agent" for item in client.get("/api/meetings/agents").json()["agents"])
+
+
 def test_agent_config_draft_requires_csrf_and_rejects_unknown_fields(tmp_path):
     _, _, client, headers, _, _, _ = web_setup(tmp_path)
     body = {"name": "Valid X", "actor_type": "BUSINESS_AGENT", "description": "测试"}

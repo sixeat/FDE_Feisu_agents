@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 from pathlib import Path
 
@@ -58,10 +59,25 @@ def create_app() -> FastAPI:
 
     control_plane = ControlPlane(SQLiteStore(db_path))
     bound_hash = os.environ.get("FDE_PREBOUND_OPEN_ID_HASH", "").strip()
-    if bound_hash and control_plane.store.get_actor("member-primary") is None:
+    admin_hash = os.environ.get("FDE_ADMIN_OPEN_ID_HASH", "").strip()
+    existing_member = control_plane.store.get_actor("member-primary")
+    if bound_hash and existing_member is None:
         control_plane.register_actor(
-            Actor("member-primary", tenant_id, ActorType.USER, external_ref_hash=bound_hash)
+            Actor("member-primary", tenant_id, ActorType.USER,
+                  roles=frozenset({"admin"}) if admin_hash == bound_hash else frozenset(),
+                  external_ref_hash=bound_hash)
         )
+    elif existing_member is not None and admin_hash and existing_member["external_ref_hash"] == admin_hash:
+        # Role elevation is explicit and hash-bound; never infer admin from OAuth login alone.
+        existing_roles = frozenset(json.loads(existing_member["roles_json"]))
+        if "admin" not in existing_roles:
+            control_plane.register_actor(
+                Actor("member-primary", existing_member["tenant_id"], ActorType(existing_member["actor_type"]),
+                      capabilities=frozenset(json.loads(existing_member["capabilities_json"])),
+                      roles=existing_roles | {"admin"},
+                      external_ref_hash=existing_member["external_ref_hash"],
+                      active=bool(existing_member["active"]))
+            )
 
     # OAuth user-info requests pass the short-lived user token explicitly.
     # lark-oapi requires manual token mode for that request path.

@@ -56,3 +56,25 @@ def test_production_oauth_client_accepts_user_token_and_h5_requires_session(tmp_
     response = TestClient(namespace["app"]).get("/h5", follow_redirects=False)
     assert response.status_code == 303
     assert response.headers["location"] == "/oauth/start"
+
+
+def test_prebound_admin_hash_assigns_explicit_admin_role(tmp_path, monkeypatch):
+    config = {
+        "FEISHU_APP_ID": "cli_test",
+        "FEISHU_APP_SECRET": "test-secret",
+        "FEISHU_TENANT_KEY": "tenant-test",
+        "FDE_OAUTH_REDIRECT_URI": "https://example.test/oauth/callback",
+        "FDE_DB_PATH": str(tmp_path / "server.sqlite3"),
+        "FDE_PREBOUND_OPEN_ID_HASH": "a" * 64,
+        "FDE_ADMIN_OPEN_ID_HASH": "a" * 64,
+    }
+    for name, value in config.items():
+        monkeypatch.setenv(name, value)
+
+    namespace = runpy.run_path(str(Path(__file__).parents[1] / "scripts" / "fde_oauth_server.py"))
+    import sqlite3
+    with sqlite3.connect(config["FDE_DB_PATH"]) as connection:
+        roles_json = connection.execute(
+            "SELECT roles_json FROM actors WHERE actor_id = 'member-primary'"
+        ).fetchone()[0]
+    assert "admin" in json.loads(roles_json)

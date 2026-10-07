@@ -45,6 +45,12 @@ def preview_login():
     return response
 
 
+@app.get("/oauth/start")
+def preview_oauth_start():
+    """Keep the fixture's expired-session recovery local and deterministic."""
+    return RedirectResponse("/preview-login", status_code=303)
+
+
 @app.get("/h5")
 def h5():
     return FileResponse(static / "meeting_review.html")

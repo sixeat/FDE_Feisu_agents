@@ -68,6 +68,14 @@ class AgentConfigDraftRequest(BaseModel):
     skill_version: StrictStr | None = Field(default=None, max_length=100)
 
 
+AGENT_REVIEWER_ROLES = frozenset({"admin", "agent_reviewer"})
+KNOWN_AGENT_CAPABILITIES = frozenset({
+    "doc.read", "doc.write", "doc.delete", "task.read", "task.write", "task.delete",
+    "message.send",
+})
+HIGH_RISK_AGENT_CAPABILITIES = frozenset({"doc.write", "doc.delete", "task.write", "task.delete", "message.send"})
+
+
 class DueCorrectionApproval(BaseModel):
     model_config = ConfigDict(extra="forbid")
     proposal_hash: StrictStr = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]+$")
@@ -103,18 +111,75 @@ class MeetingReviewWebService:
         return {"agents": items}
 
     def agent_config_drafts(self, identity: IdentityContext) -> list[dict[str, Any]]:
-        self.cp.verify_identity(identity)
+        actor = self.cp.verify_identity(identity)
         items = []
         for row in self.cp.store.list_agent_config_drafts(identity.tenant_id):
             data = json.loads(row["data_json"])
+            review = self.cp.store.get_latest_agent_config_review(row["draft_id"], identity.tenant_id)
+            report = json.loads(review["report_json"]) if review is not None else None
             items.append({
                 "draft_id": row["draft_id"], "status": row["status"],
                 "created_by_current_member": row["created_by"] == identity.actor_id,
                 "created_at": row["created_at"], "name": data["name"],
                 "actor_type": data["actor_type"], "description": data["description"],
                 "capabilities": data["capabilities"], "skill_version": data.get("skill_version"),
+                "review_status": review["status"] if review is not None else None,
+                "review_blockers": (report or {}).get("blockers", []),
+                "review_warnings": (report or {}).get("warnings", []),
             })
         return items
+
+    def can_precheck_agent_config(self, identity: IdentityContext) -> bool:
+        actor = self.cp.verify_identity(identity)
+        return (identity.auth_mode == "user_oauth" and actor.actor_type.value == "USER"
+                and bool(actor.roles & AGENT_REVIEWER_ROLES))
+
+    def precheck_agent_config_draft(self, draft_id: str, identity: IdentityContext) -> dict[str, Any]:
+        actor = self.cp.verify_identity(identity)
+        if not self.can_precheck_agent_config(identity):
+            raise HTTPException(403, "只有审核官或管理员可以执行 Agent 配置预审")
+        row = self.cp.store.get_agent_config_draft(draft_id, identity.tenant_id)
+        if row is None:
+            raise HTTPException(404, "配置草稿不存在或无权访问")
+        data = json.loads(row["data_json"])
+        input_hash = hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+        previous = self.cp.store.get_latest_agent_config_review(draft_id, identity.tenant_id)
+        if previous is not None and previous["input_hash"] == input_hash:
+            report = json.loads(previous["report_json"])
+            return {"draft_id": draft_id, "review_id": previous["review_id"], "status": previous["status"],
+                    "blockers": report.get("blockers", []), "warnings": report.get("warnings", []),
+                    "requires_admin_confirmation": previous["status"] == "READY_FOR_ADMIN", "duplicate": True}
+
+        blockers: list[str] = []
+        warnings: list[str] = []
+        capabilities = set(data.get("capabilities") or [])
+        unknown = sorted(capabilities - KNOWN_AGENT_CAPABILITIES)
+        if unknown:
+            blockers.append("UNKNOWN_CAPABILITY:" + ",".join(unknown))
+        if row["created_by"] == identity.actor_id:
+            blockers.append("SELF_REVIEW")
+        existing = self.cp.store.list_agent_actors(identity.tenant_id)
+        if any(str(item["actor_id"]).casefold() == str(data["name"]).casefold() for item in existing):
+            blockers.append("AGENT_NAME_CONFLICT")
+        high_risk = sorted(capabilities & HIGH_RISK_AGENT_CAPABILITIES)
+        if high_risk:
+            warnings.append("HIGH_RISK_CAPABILITY:" + ",".join(high_risk))
+        if data.get("actor_type") == "MANAGEMENT_AGENT":
+            warnings.append("MANAGEMENT_AGENT_REQUIRES_ADMIN_SCOPE_REVIEW")
+        status = "BLOCKED" if blockers else "READY_FOR_ADMIN"
+        report = {
+            "input_hash": input_hash, "blockers": blockers, "warnings": warnings,
+            "requested_capabilities": sorted(capabilities), "reviewer_role": sorted(actor.roles & AGENT_REVIEWER_ROLES),
+        }
+        review_id = "agent-review-" + secrets.token_hex(10)
+        self.cp.store.save_agent_config_review(review_id, draft_id, identity.tenant_id, identity.actor_id,
+                                               input_hash, status, report)
+        self.cp._audit("AGENT_CONFIG_PRECHECKED", identity.tenant_id, identity.actor_id, None,
+                       {"draft_id": draft_id, "review_id": review_id, "status": status,
+                        "blocker_count": len(blockers), "warning_count": len(warnings)}, status)
+        return {"draft_id": draft_id, "review_id": review_id, "status": status,
+                "blockers": blockers, "warnings": warnings,
+                "requires_admin_confirmation": status == "READY_FOR_ADMIN", "duplicate": False}
 
     def create_agent_config_draft(self, identity: IdentityContext, body: AgentConfigDraftRequest) -> dict[str, Any]:
         actor = self.cp.verify_identity(identity)
@@ -467,6 +532,7 @@ def build_meeting_review_router(
     def get_agent_drafts(request: Request, identity: IdentityContext = Depends(require_identity)):
         with service.lock:
             return {"drafts": service.agent_config_drafts(identity),
+                    "can_precheck": service.can_precheck_agent_config(identity),
                     "csrf_token": csrf_token(request.cookies["fde_auth_session"])}
 
     @router.post("/agent-drafts")
@@ -475,6 +541,13 @@ def build_meeting_review_router(
         check_csrf(request)
         with service.lock:
             return service.create_agent_config_draft(identity, body)
+
+    @router.post("/agent-drafts/{draft_id}/precheck")
+    def precheck_agent_draft(draft_id: str, request: Request,
+                             identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        with service.lock:
+            return service.precheck_agent_config_draft(draft_id, identity)
 
     @router.get("/owner-tasks")
     def get_owner_tasks(request: Request, identity: IdentityContext = Depends(require_identity)):

@@ -22,6 +22,7 @@ class SQLiteStore:
     def __init__(self, path: str | Path = ":memory:") -> None:
         self.path = str(path)
         self._owner_decision_lock = RLock()
+        self._session_lock = RLock()
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         # Autocommit keeps read-only lookups from holding a snapshot. Atomic
@@ -65,6 +66,15 @@ class SQLiteStore:
             );
             CREATE INDEX IF NOT EXISTS idx_agent_config_drafts_tenant
                 ON agent_config_drafts(tenant_id, created_at);
+            CREATE TABLE IF NOT EXISTS agent_config_reviews (
+                review_id TEXT PRIMARY KEY, draft_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL, reviewer_id TEXT NOT NULL,
+                input_hash TEXT NOT NULL, status TEXT NOT NULL,
+                report_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_config_reviews_draft
+                ON agent_config_reviews(tenant_id, draft_id, created_at);
             CREATE TABLE IF NOT EXISTS assistant_bindings (
                 binding_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
                 member_actor_id TEXT NOT NULL, assistant_actor_id TEXT NOT NULL,
@@ -262,33 +272,36 @@ class SQLiteStore:
         return valid
 
     def save_web_session(self, session_hash: str, data: Any, expires_at: int, now: int) -> None:
-        self.connection.execute("BEGIN IMMEDIATE")
-        try:
-            self.connection.execute("DELETE FROM web_sessions WHERE expires_at <= ? OR revoked = 1", (now,))
-            self.connection.execute(
-                "INSERT INTO web_sessions(session_hash, data_json, expires_at, revoked) VALUES (?, ?, ?, 0)",
-                (session_hash, self._json(data), expires_at),
-            )
-            self.connection.commit()
-        except Exception:
-            self.connection.rollback()
-            raise
+        with self._session_lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                self.connection.execute("DELETE FROM web_sessions WHERE expires_at <= ? OR revoked = 1", (now,))
+                self.connection.execute(
+                    "INSERT INTO web_sessions(session_hash, data_json, expires_at, revoked) VALUES (?, ?, ?, 0)",
+                    (session_hash, self._json(data), expires_at),
+                )
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
 
     def get_web_session(self, session_hash: str, now: int) -> dict[str, Any] | None:
-        row = self.connection.execute(
-            "SELECT data_json, expires_at, revoked FROM web_sessions WHERE session_hash = ?",
-            (session_hash,),
-        ).fetchone()
-        if row is None or row["revoked"] or row["expires_at"] <= now:
-            if row is not None and row["expires_at"] <= now:
-                self.connection.execute("DELETE FROM web_sessions WHERE session_hash = ?", (session_hash,))
-            return None
-        return json.loads(row["data_json"])
+        with self._session_lock:
+            row = self.connection.execute(
+                "SELECT data_json, expires_at, revoked FROM web_sessions WHERE session_hash = ?",
+                (session_hash,),
+            ).fetchone()
+            if row is None or row["revoked"] or row["expires_at"] <= now:
+                if row is not None and row["expires_at"] <= now:
+                    self.connection.execute("DELETE FROM web_sessions WHERE session_hash = ?", (session_hash,))
+                return None
+            return json.loads(row["data_json"])
 
     def revoke_web_session(self, session_hash: str) -> None:
-        self.connection.execute(
-            "UPDATE web_sessions SET revoked = 1 WHERE session_hash = ?", (session_hash,)
-        )
+        with self._session_lock:
+            self.connection.execute(
+                "UPDATE web_sessions SET revoked = 1 WHERE session_hash = ?", (session_hash,)
+            )
         self.connection.commit()
 
     def save_agent_version(self, version: Any) -> None:
@@ -346,6 +359,31 @@ class SQLiteStore:
             "FROM agent_config_drafts WHERE tenant_id = ? ORDER BY created_at DESC, rowid DESC",
             (tenant_id,),
         ).fetchall()
+
+    def get_agent_config_draft(self, draft_id: str, tenant_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT draft_id, tenant_id, created_by, status, data_json, created_at "
+            "FROM agent_config_drafts WHERE draft_id = ? AND tenant_id = ?",
+            (draft_id, tenant_id),
+        ).fetchone()
+
+    def save_agent_config_review(self, review_id: str, draft_id: str, tenant_id: str,
+                                 reviewer_id: str, input_hash: str, status: str,
+                                 report: dict[str, Any]) -> None:
+        self.connection.execute(
+            "INSERT INTO agent_config_reviews(review_id, draft_id, tenant_id, reviewer_id, input_hash, status, report_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (review_id, draft_id, tenant_id, reviewer_id, input_hash, status, self._json(report)),
+        )
+        self.connection.commit()
+
+    def get_latest_agent_config_review(self, draft_id: str, tenant_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT review_id, draft_id, tenant_id, reviewer_id, input_hash, status, report_json, created_at "
+            "FROM agent_config_reviews WHERE draft_id = ? AND tenant_id = ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (draft_id, tenant_id),
+        ).fetchone()
 
     def save_binding(self, binding: Any) -> None:
         self.connection.execute(

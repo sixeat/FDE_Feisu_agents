@@ -145,6 +145,46 @@ def test_member_can_submit_agent_config_draft_without_changing_runtime(tmp_path)
     assert any(a["event_type"] == "AGENT_CONFIG_DRAFT_CREATED" for a in cp.store.list_audits())
 
 
+def test_agent_config_precheck_is_role_gated_deterministic_and_idempotent(tmp_path):
+    cp, _, client, headers, _, _, _ = web_setup(tmp_path)
+    created = client.post("/api/meetings/agent-drafts", json={
+        "name": "审核测试 Agent", "actor_type": "BUSINESS_AGENT",
+        "description": "读取任务并发送跟进提醒。", "capabilities": ["task.write", "task.write"],
+    }, headers=headers)
+    assert created.status_code == 200
+    draft_id = created.json()["draft_id"]
+    assert client.get("/api/meetings/agent-drafts").json()["can_precheck"] is False
+    assert client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck", headers=headers).status_code == 403
+
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    listing = client.get("/api/meetings/agent-drafts").json()
+    assert listing["can_precheck"] is True
+    first = client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck", headers=admin_headers)
+    assert first.status_code == 200
+    assert first.json()["status"] == "READY_FOR_ADMIN"
+    assert first.json()["warnings"] == ["HIGH_RISK_CAPABILITY:task.write"]
+    second = client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck", headers=admin_headers)
+    assert second.status_code == 200 and second.json()["duplicate"] is True
+    item = next(item for item in client.get("/api/meetings/agent-drafts").json()["drafts"] if item["draft_id"] == draft_id)
+    assert item["review_status"] == "READY_FOR_ADMIN"
+    assert cp.store.get_latest_agent_config_review(draft_id, "tenant")["status"] == "READY_FOR_ADMIN"
+    assert not any(agent["agent_id"] == "审核测试 Agent" for agent in client.get("/api/meetings/agents").json()["agents"])
+
+
+def test_agent_config_precheck_blocks_unknown_capability(tmp_path):
+    cp, _, client, headers, _, _, _ = web_setup(tmp_path)
+    created = client.post("/api/meetings/agent-drafts", json={
+        "name": "未知能力 Agent", "actor_type": "BUSINESS_AGENT",
+        "description": "测试未知工具。", "capabilities": ["unknown.tool"],
+    }, headers=headers)
+    draft_id = created.json()["draft_id"]
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    result = client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck", headers=admin_headers)
+    assert result.status_code == 200
+    assert result.json()["status"] == "BLOCKED"
+    assert result.json()["blockers"] == ["UNKNOWN_CAPABILITY:unknown.tool"]
+
+
 def test_agent_config_draft_requires_csrf_and_rejects_unknown_fields(tmp_path):
     _, _, client, headers, _, _, _ = web_setup(tmp_path)
     body = {"name": "Valid X", "actor_type": "BUSINESS_AGENT", "description": "测试"}

@@ -78,14 +78,15 @@ Runtime：Hermes CLI 已用于会议 Agent 语义执行；OpenClaw 后置，Runt
 
 ### 2026-10-07 Agent 配置审核官预审切片（H-02 / G-01）
 
-- 状态：本地实现与验证完成；尚未部署线上。
+- 状态：本地实现、线上增量发布与只读验收完成；管理员发布仍未开放。
 - 本次目标：在 Agent 配置草稿提交之后增加审核官机器预审，为管理员最终确认提供可追溯的阻断项和风险提示，同时保持“预审不发布”的边界。
 - 实现：SQLite 新增租户隔离的 `agent_config_reviews` 表及审核记录读写；新增 `POST /api/meetings/agent-drafts/{draft_id}/precheck`。预审仅允许 OAuth 成员中的管理员/审核官执行，校验同租户草稿、未知能力、自审自批和名称冲突；写入/删除文档、写入/删除任务、发送消息等能力形成风险警告，管理 Agent 形成管理员范围警告。结果为 `BLOCKED` 或 `READY_FOR_ADMIN`，按草稿输入哈希幂等；只写审核记录和审计，不创建 `AgentVersion`、不修改运行 Agent、不调用飞书写接口。
 - H5：普通成员不显示预审按钮；管理员/审核官显示预审入口、状态、阻断项和风险提示。`READY_FOR_ADMIN` 只表示机器预审无硬阻断，仍需管理员确认权限和发布范围。
 - 会话修复：本地预览夹具的共享 SQLite 会话读写增加线程锁，并补充 `/oauth/start` 本地回退，避免并发加载 Agent 目录和草稿时出现偶发 401。
 - 验收结果：Agent 审核专项及全量测试 `186 passed`，4 项第三方弃用警告；`node --check src/fde_control_plane/static/meeting_review.js` 通过；Playwright 探针覆盖桌面、390px 移动端和 320px 窄屏的 15 个模块切换场景，全部 `visible_panels=1` 且无横向溢出，并通过草稿提交检查。
-- 未覆盖边界：管理员确认、不可变 `AgentVersion` 生成、志愿者灰度、正式发布、线上部署和真实飞书卡片通知仍未实现；本轮没有修改线上数据库、权限或运行中的 Agent。
-- 下一步：补管理员确认接口与审批绑定，生成不可变版本；实现前先构建增量镜像、备份线上 SQLite，再只读发布验收。
+- 发布与验收：先备份 `/opt/fde-agent-stage/backups/20261007-agent-precheck/control_plane.sqlite3`，`SQLITE_BACKUP_CHECK=ok`；保留旧线上镜像 `fde-control-plane:rollback-20261007-agent-precheck-current`。增量镜像以线上当前任务跟进版本为基底，并补入 `task_due_correction.py`，三个容器均切换到同一镜像并健康运行。线上 `/health` 返回 `status=ok`；匿名草稿和预审接口均返回 `401`；数据库自动创建 `agent_config_reviews` 表并保留线上既有 1 条草稿；监听器日志保持 `task_worker=OFF task_write=0`；Worker 仍为 `network=none`、只读挂载和 `--dry-run`。
+- 未覆盖边界：管理员确认、不可变 `AgentVersion` 生成、志愿者灰度、正式发布和真实飞书卡片通知仍未实现；本轮没有修改线上 Agent 配置、权限或飞书业务数据。
+- 下一步：补管理员确认接口与审批绑定，生成不可变版本；发布前继续沿用在线备份、增量镜像和只读验收规则。
 
 ### 2026-10-07 Agent 配置草稿提交切片（H-02 / G-01）
 

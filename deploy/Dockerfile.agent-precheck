@@ -5,3 +5,4 @@ COPY src/fde_control_plane/store.py /app/src/fde_control_plane/store.py
 COPY src/fde_control_plane/task_due_correction.py /app/src/fde_control_plane/task_due_correction.py
 COPY src/fde_control_plane/static/meeting_review.css /app/src/fde_control_plane/static/meeting_review.css
 COPY src/fde_control_plane/static/meeting_review.js /app/src/fde_control_plane/static/meeting_review.js
+COPY scripts/fde_oauth_server.py /app/scripts/fde_oauth_server.py

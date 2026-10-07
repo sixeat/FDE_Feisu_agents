@@ -1630,3 +1630,14 @@ UNKNOWN 卡片不能自动重发，仍需远端核实工具。部署保留数据
 - 未覆盖边界：本轮尚未把最新镜像部署到服务器；线上 `agent_config_approvals` 表和 H5 管理员流程需部署后做匿名鉴权、表结构、容器健康和 Worker 安全态复核。版本升级、志愿者灰度、暂停/回滚仍未实现。
 - 下一步：先执行 `git diff --check` 和完整测试，提交本轮代码；在线 SQLite 做新的只读备份并保留当前镜像回滚标签，构建/发布增量镜像后只重建三个 FDE 服务，验证 `/health`、匿名接口 401、审批表存在、容器健康以及 Worker 仍为无网络/只读/`--dry-run`。GitHub 推送仅在网络可达时重试，不把凭证或数据库提交到仓库。
 
+### 2026-10-07 Agent 管理确认切片线上增量部署
+
+- 状态：已完成；线上管理员身份配置待单独决定。
+- 功能 ID：G-01、H-01、D-01。
+- 完成内容：在服务器 `/opt/fde-agent-stage` 基于现有 `fde-control-plane:task-due-fix-20261007` 构建 `fde-control-plane:agent-confirm-20261007`，并将其切换到 Compose 固定标签。仅重建 `fde-control-plane`、`fde-approval-listener` 和 `fde-task-worker` 三个本项目服务，未清理其他容器；旧镜像保留为 `fde-control-plane:rollback-20261007-agent-confirm-current`。
+- 备份与验收：在线 SQLite 备份保存于 `/opt/fde-agent-stage/deploy/data/backups/20261007-agent-confirm/control_plane.sqlite3`，`quick_check=ok`；部署后会议 1、来源 1、草稿 7、审批 7、卡片交付 7、工具调用 5、outbox 5、会话 1，业务数据未被导入或改写。`/health` 正常；匿名会议、草稿和确认接口均返回 `401`；`agent_config_approvals` 表存在；三个容器运行，控制平面和 Worker 健康。
+- Worker 安全态：仍为 `network_mode=none`、`/var/lib/fde-agent` 只读挂载、`--loop --dry-run`，没有因为发布 Agent 管理功能而开放任务写入。
+- Git 备份：提交 `e8b270b feat: require admin confirmation to publish agents` 已推送到 `https://github.com/sixeat/FDE_Feisu_agents.git` 的 `main` 分支。
+- 未覆盖边界：生产 `.env.fde` 当前只有预绑定成员哈希，没有单独的管理员角色映射；因此普通成员线上登录不会看到确认发布按钮，直接调用确认接口会被拒绝。管理员身份必须通过显式配置或后续成员/角色管理功能授予，不能把“租户管理员”推断成应用内 `admin` 角色。版本升级、志愿者灰度、暂停/回滚仍未实现。
+- 下一步：先决定并记录生产管理员身份映射，再用真实 H5 完成一次“管理员预审 → 管理员确认 → Agent v1 出现在目录”的验收；配置前继续保持 Worker dry-run 和现有回滚点。
+

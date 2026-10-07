@@ -57,6 +57,14 @@ class SQLiteStore:
                 capabilities_json TEXT NOT NULL, active INTEGER NOT NULL,
                 skill_version TEXT, PRIMARY KEY (agent_id, version)
             );
+            CREATE TABLE IF NOT EXISTS agent_config_drafts (
+                draft_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                created_by TEXT NOT NULL, status TEXT NOT NULL,
+                data_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_config_drafts_tenant
+                ON agent_config_drafts(tenant_id, created_at);
             CREATE TABLE IF NOT EXISTS assistant_bindings (
                 binding_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
                 member_actor_id TEXT NOT NULL, assistant_actor_id TEXT NOT NULL,
@@ -321,6 +329,22 @@ class SQLiteStore:
             f"SELECT agent_id, version, capabilities_json, active, skill_version "
             f"FROM agent_versions WHERE agent_id IN ({placeholders}) ORDER BY agent_id, version DESC",
             ids,
+        ).fetchall()
+
+    def save_agent_config_draft(self, draft_id: str, tenant_id: str, created_by: str,
+                                status: str, data: dict[str, Any]) -> None:
+        self.connection.execute(
+            "INSERT INTO agent_config_drafts(draft_id, tenant_id, created_by, status, data_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (draft_id, tenant_id, created_by, status, self._json(data)),
+        )
+        self.connection.commit()
+
+    def list_agent_config_drafts(self, tenant_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT draft_id, tenant_id, created_by, status, data_json, created_at "
+            "FROM agent_config_drafts WHERE tenant_id = ? ORDER BY created_at DESC, rowid DESC",
+            (tenant_id,),
         ).fetchall()
 
     def save_binding(self, binding: Any) -> None:

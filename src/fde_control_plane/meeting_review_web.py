@@ -59,6 +59,15 @@ class DueCorrectionRequest(BaseModel):
     observation_id: StrictStr = Field(min_length=1, max_length=200)
 
 
+class AgentConfigDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: StrictStr = Field(min_length=2, max_length=100)
+    actor_type: Literal["PERSONAL_ASSISTANT", "BUSINESS_AGENT", "MANAGEMENT_AGENT"]
+    description: StrictStr = Field(min_length=1, max_length=2000)
+    capabilities: list[StrictStr] = Field(default_factory=list, max_length=30)
+    skill_version: StrictStr | None = Field(default=None, max_length=100)
+
+
 class DueCorrectionApproval(BaseModel):
     model_config = ConfigDict(extra="forbid")
     proposal_hash: StrictStr = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]+$")
@@ -92,6 +101,40 @@ class MeetingReviewWebService:
                 "skill_version": current["skill_version"] if current is not None else None,
             })
         return {"agents": items}
+
+    def agent_config_drafts(self, identity: IdentityContext) -> list[dict[str, Any]]:
+        self.cp.verify_identity(identity)
+        items = []
+        for row in self.cp.store.list_agent_config_drafts(identity.tenant_id):
+            data = json.loads(row["data_json"])
+            items.append({
+                "draft_id": row["draft_id"], "status": row["status"],
+                "created_by_current_member": row["created_by"] == identity.actor_id,
+                "created_at": row["created_at"], "name": data["name"],
+                "actor_type": data["actor_type"], "description": data["description"],
+                "capabilities": data["capabilities"], "skill_version": data.get("skill_version"),
+            })
+        return items
+
+    def create_agent_config_draft(self, identity: IdentityContext, body: AgentConfigDraftRequest) -> dict[str, Any]:
+        actor = self.cp.verify_identity(identity)
+        if identity.auth_mode != "user_oauth" or actor.actor_type.value != "USER":
+            raise HTTPException(403, "请使用成员身份提交 Agent 配置草稿")
+        name = body.name.strip()
+        description = body.description.strip()
+        capabilities = sorted({item.strip() for item in body.capabilities if item.strip()})
+        if not name or not description:
+            raise HTTPException(422, "Agent 名称和职责说明不能为空")
+        if any(len(item) > 100 for item in capabilities):
+            raise HTTPException(422, "单项能力名称不能超过 100 个字符")
+        draft_id = "agent-draft-" + secrets.token_hex(10)
+        data = {"name": name, "actor_type": body.actor_type, "description": description,
+                "capabilities": capabilities, "skill_version": body.skill_version.strip() if body.skill_version else None}
+        self.cp.store.save_agent_config_draft(draft_id, identity.tenant_id, identity.actor_id, "PENDING_REVIEW", data)
+        self.cp._audit("AGENT_CONFIG_DRAFT_CREATED", identity.tenant_id, identity.actor_id, None,
+                       {"draft_id": draft_id, "actor_type": body.actor_type, "capability_count": len(capabilities)},
+                       "PENDING_REVIEW")
+        return {"draft_id": draft_id, "status": "PENDING_REVIEW", "name": name}
 
     def owned_record(self, record_id: str, identity: IdentityContext) -> dict[str, Any]:
         self.cp.verify_identity(identity)
@@ -419,6 +462,19 @@ def build_meeting_review_router(
     def get_agents(identity: IdentityContext = Depends(require_identity)):
         with service.lock:
             return service.agent_registry(identity)
+
+    @router.get("/agent-drafts")
+    def get_agent_drafts(request: Request, identity: IdentityContext = Depends(require_identity)):
+        with service.lock:
+            return {"drafts": service.agent_config_drafts(identity),
+                    "csrf_token": csrf_token(request.cookies["fde_auth_session"])}
+
+    @router.post("/agent-drafts")
+    def create_agent_draft(body: AgentConfigDraftRequest, request: Request,
+                           identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        with service.lock:
+            return service.create_agent_config_draft(identity, body)
 
     @router.get("/owner-tasks")
     def get_owner_tasks(request: Request, identity: IdentityContext = Depends(require_identity)):

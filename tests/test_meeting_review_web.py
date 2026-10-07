@@ -122,6 +122,36 @@ def test_agent_directory_is_tenant_scoped_and_redacts_external_identity(tmp_path
     assert client.get("/api/meetings").status_code == 200
 
 
+def test_member_can_submit_agent_config_draft_without_changing_runtime(tmp_path):
+    cp, _, client, headers, _, _, _ = web_setup(tmp_path)
+    body = {
+        "name": "任务跟进 Agent",
+        "actor_type": "BUSINESS_AGENT",
+        "description": "汇总任务进度并生成每日跟进预览。",
+        "capabilities": ["task.read", "task.read", "message.send"],
+        "skill_version": "follow-up.v1",
+    }
+    created = client.post("/api/meetings/agent-drafts", json=body, headers=headers)
+    assert created.status_code == 200
+    assert created.json()["status"] == "PENDING_REVIEW"
+    drafts = client.get("/api/meetings/agent-drafts")
+    assert drafts.status_code == 200
+    item = drafts.json()["drafts"][0]
+    assert item["name"] == body["name"]
+    assert item["status"] == "PENDING_REVIEW"
+    assert item["capabilities"] == ["message.send", "task.read"]
+    assert all(key not in drafts.text for key in ("external_ref_hash", "app_secret", "access_token"))
+    assert not any(agent["agent_id"] == body["name"] for agent in client.get("/api/meetings/agents").json()["agents"])
+    assert any(a["event_type"] == "AGENT_CONFIG_DRAFT_CREATED" for a in cp.store.list_audits())
+
+
+def test_agent_config_draft_requires_csrf_and_rejects_unknown_fields(tmp_path):
+    _, _, client, headers, _, _, _ = web_setup(tmp_path)
+    body = {"name": "Valid X", "actor_type": "BUSINESS_AGENT", "description": "测试"}
+    assert client.post("/api/meetings/agent-drafts", json=body).status_code == 403
+    assert client.post("/api/meetings/agent-drafts", json={**body, "unexpected": True}, headers=headers).status_code == 422
+
+
 def test_stale_document_cannot_submit_or_modify_stored_draft(tmp_path):
     cp, reader, client, headers, detail, edits, task_id = web_setup(tmp_path, revision="6")
     before = cp.store.list_meeting_todos("record")

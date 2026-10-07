@@ -44,6 +44,21 @@ def main() -> None:
         page.go_back()
         assert page.locator("#view-meetings").is_visible()
         page.close()
+
+        page = browser.new_page()
+        page.goto("http://127.0.0.1:8211/preview-login#agents", wait_until="networkidle")
+        page.locator("#agent-draft-toggle").click()
+        page.locator("#agent-draft-name").fill("预览 Agent")
+        page.locator("#agent-draft-description").fill("用于验证配置草稿不会直接发布。")
+        page.locator("#agent-draft-capabilities").fill("task.read, task.read")
+        awaitable = page.locator("#agent-draft-form").evaluate("form => form.checkValidity()")
+        assert awaitable
+        page.locator("#agent-draft-form button[type=submit]").click()
+        page.get_by_text("配置草稿已提交，等待审核官和管理员处理。", exact=True).wait_for()
+        assert page.get_by_text("预览 Agent", exact=True).count() == 1
+        assert page.get_by_text("待审核", exact=True).count() == 1
+        assert page.get_by_text("meeting-agent", exact=True).count() == 1
+        page.close()
         browser.close()
 
 

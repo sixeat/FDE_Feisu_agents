@@ -3,7 +3,7 @@ const $ = id => document.getElementById(id);
 const state = { csrf: "", members: [], detail: null, dirty: false, busy: false };
 const ownerState = {csrf:"", tasks:[], busy:false, drafts:new Map(), retries:new Map()};
 const organizerState = {csrf:"", tasks:[], busy:false};
-const agentState = {agents:[], busy:false};
+const agentState = {agents:[], drafts:[], csrf:"", busy:false};
 const viewNames={meetings:"会议审核","owner-tasks":"我的待办","organizer-tasks":"发起的任务","follow-up":"跟进概览",agents:"Agent 管理"};
 let activeView="";
 const ownerStatusNames = {WAITING_OWNER:"等待你确认",IN_PROGRESS:"已接受，进行中",WAITING_HUMAN:"已退回，等待会议发起人处理",COMPLETED:"已完成",CANCELLED:"已取消",UNKNOWN:"等待核验",DUE_SOON:"即将到期",OVERDUE:"已逾期"};
@@ -12,6 +12,7 @@ const reasonNames = {ASSIGNEE_UNMAPPED:"负责人待确认",ASSIGNEE_INVALID:"�
 const executionNames = {PREPARED:"待执行",DISPATCHED:"执行中",SUCCEEDED:"已创建",FAILED:"已阻断/失败",UNKNOWN:"结果待核验",RECONCILING:"结果待核验"};
 const agentTypeNames = {PERSONAL_ASSISTANT:"个人助手",BUSINESS_AGENT:"业务 Agent",MANAGEMENT_AGENT:"管理 Agent"};
 const agentStatusNames = {ACTIVE:"运行中",PAUSED:"已暂停",UNVERSIONED:"待接入"};
+const draftStatusNames = {PENDING_REVIEW:"待审核",APPROVED:"已批准",REJECTED:"已拒绝",PUBLISHED:"已发布"};
 function node(tag, text, cls) { const el=document.createElement(tag); if(text!==undefined) el.textContent=text; if(cls) el.className=cls; return el; }
 function notice(text, type="") { $("notice").textContent=text; $("notice").className=type; $("notice").hidden=!text; }
 function ownerNotice(text,type="") { const panel=$("owner-notice");panel.textContent=text;panel.className=type;panel.hidden=!text; }
@@ -143,11 +144,34 @@ function renderAgents() {
     panel.append(card);
   });
 }
+function renderAgentDrafts() {
+  const panel=$("agent-draft-list");panel.replaceChildren();
+  if(!agentState.drafts.length){panel.append(node("p","暂无配置草稿。","muted"));return;}
+  agentState.drafts.forEach(draft=>{
+    const card=node("article",undefined,"agent-draft-row"),head=node("div",undefined,"agent-row-head");
+    head.append(node("h3",draft.name),node("span",draftStatusNames[draft.status]||draft.status,`badge ${draft.status==="PUBLISHED"||draft.status==="APPROVED"?"ready":""}`));
+    card.append(head,node("p",`${agentTypeNames[draft.actor_type]||draft.actor_type} · 提交时间 ${draft.created_at}${draft.created_by_current_member?" · 我提交":""}`,"muted"),node("p",draft.description,"agent-draft-description"));
+    if(draft.capabilities.length)card.append(node("p",`申请能力：${draft.capabilities.join("、")}`,"agent-capabilities"));
+    panel.append(card);
+  });
+}
 async function loadAgents() {
   if(agentState.busy)return;agentState.busy=true;$("agents-reload").disabled=true;$("agent-list").setAttribute("aria-busy","true");
-  try{const data=await api("/api/meetings/agents");agentState.agents=data.agents||[];renderAgents();agentNotice("");}
+  try{const [data,drafts]=await Promise.all([api("/api/meetings/agents"),api("/api/meetings/agent-drafts")]);agentState.agents=data.agents||[];agentState.drafts=drafts.drafts||[];agentState.csrf=drafts.csrf_token;renderAgents();renderAgentDrafts();agentNotice("");}
   catch(error){agentNotice(error.message,"error");if(!agentState.agents.length)$("agent-list").replaceChildren(node("p","Agent 目录暂时无法加载，请稍后刷新。","muted"));}
   finally{agentState.busy=false;$("agents-reload").disabled=false;$("agent-list").setAttribute("aria-busy","false");}
+}
+async function submitAgentDraft(event) {
+  event.preventDefault();
+  if(agentState.busy)return;
+  const capabilities=$("agent-draft-capabilities").value.split(",").map(value=>value.trim()).filter(Boolean);
+  agentState.busy=true;$("agent-draft-form").querySelectorAll("input,select,textarea,button").forEach(el=>el.disabled=true);agentNotice("正在提交配置草稿…");
+  try{
+    await api("/api/meetings/agent-drafts",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":agentState.csrf},body:JSON.stringify({name:$("agent-draft-name").value.trim(),actor_type:$("agent-draft-type").value,description:$("agent-draft-description").value.trim(),capabilities,skill_version:$("agent-draft-skill").value.trim()||null})});
+    $("agent-draft-form").reset();$("agent-draft-editor").hidden=true;agentNotice("配置草稿已提交，等待审核官和管理员处理。","success");
+    const drafts=await api("/api/meetings/agent-drafts");agentState.drafts=drafts.drafts||[];agentState.csrf=drafts.csrf_token;renderAgentDrafts();
+  }catch(error){agentNotice(error.message,"error");}
+  finally{agentState.busy=false;$("agent-draft-form").querySelectorAll("input,select,textarea,button").forEach(el=>el.disabled=false);}
 }
 async function api(path, options={}) {
   const controller=new AbortController(), timer=setTimeout(()=>controller.abort(),15000);
@@ -283,6 +307,9 @@ $("owner-reload").addEventListener("click",loadOwnerTasks);
 $("organizer-reload").addEventListener("click",loadOrganizerTasks);
 $("follow-up-reload").addEventListener("click",refreshDigest);
 $("agents-reload").addEventListener("click",loadAgents);
+$("agent-draft-toggle").addEventListener("click",()=>{const editor=$("agent-draft-editor");editor.hidden=!editor.hidden;if(!editor.hidden)$("agent-draft-name").focus();});
+$("agent-draft-cancel").addEventListener("click",()=>{$("agent-draft-form").reset();$("agent-draft-editor").hidden=true;});
+$("agent-draft-form").addEventListener("submit",submitAgentDraft);
 function showView(view,{updateHash=true}={}) {
   if(!Object.hasOwn(viewNames,view))view="meetings";
   if(view===activeView)return true;

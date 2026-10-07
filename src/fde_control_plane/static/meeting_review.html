@@ -47,8 +47,16 @@
         <section id="follow-up-digest" class="digest" aria-live="polite"></section>
       </section>
       <section id="view-agents" class="view-panel" role="tabpanel" aria-labelledby="module-agents" hidden>
-        <div class="heading"><div><p class="eyebrow">组织治理</p><h1>Agent 管理</h1><p class="muted">查看当前企业租户中的个人助手和业务 Agent 版本状态。</p></div><button id="agents-reload" type="button">刷新目录</button></div>
+        <div class="heading"><div><p class="eyebrow">组织治理</p><h1>Agent 管理</h1><p class="muted">查看当前企业租户中的个人助手和业务 Agent 版本状态。</p></div><div class="commands"><button id="agent-draft-toggle" type="button">提交配置草稿</button><button id="agents-reload" type="button">刷新目录</button></div></div>
+        <section id="agent-draft-editor" class="agent-draft-editor" aria-labelledby="agent-draft-title" hidden>
+          <div class="owner-heading"><h2 id="agent-draft-title">新建 Agent 配置草稿</h2><span class="muted">提交后等待审核，不会立即改变运行版本。</span></div>
+          <form id="agent-draft-form">
+            <div class="fields agent-draft-fields"><label class="field"><span>Agent 名称</span><input id="agent-draft-name" required maxlength="100" autocomplete="off"></label><label class="field"><span>类型</span><select id="agent-draft-type"><option value="BUSINESS_AGENT">业务 Agent</option><option value="PERSONAL_ASSISTANT">个人助手</option><option value="MANAGEMENT_AGENT">管理 Agent</option></select></label><label class="field"><span>Skill 版本（可选）</span><input id="agent-draft-skill" maxlength="100" autocomplete="off"></label><label class="field title-field"><span>职责说明</span><textarea id="agent-draft-description" required maxlength="2000" rows="3"></textarea></label><label class="field title-field"><span>申请能力（用逗号分隔）</span><input id="agent-draft-capabilities" maxlength="3000" placeholder="例如：doc.read, task.write" autocomplete="off"></label></div>
+            <div class="commands agent-draft-actions"><button id="agent-draft-cancel" type="button">取消</button><button class="primary" type="submit">提交审核</button></div>
+          </form>
+        </section>
         <section class="agent-registry" aria-labelledby="agent-registry-title"><div class="owner-heading"><h2 id="agent-registry-title">Agent 目录</h2></div><div id="agents-notice" role="status" aria-live="polite" hidden></div><div id="agent-list" aria-busy="true"><p class="muted">正在加载 Agent…</p></div></section>
+        <section class="agent-drafts" aria-labelledby="agent-drafts-title"><div class="owner-heading"><h2 id="agent-drafts-title">配置草稿</h2></div><div id="agent-draft-list" aria-busy="true"><p class="muted">正在加载配置草稿…</p></div></section>
       </section>
     </main>
   </div>

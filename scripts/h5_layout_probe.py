@@ -15,7 +15,7 @@ def main() -> None:
             page = browser.new_page(viewport={"width": width, "height": height}, device_scale_factor=1)
             page.goto("http://127.0.0.1:8211/preview-login", wait_until="networkidle")
             page.locator(".todo").first.wait_for()
-            for view in ("meetings", "owner-tasks", "organizer-tasks", "follow-up"):
+            for view in ("meetings", "owner-tasks", "organizer-tasks", "follow-up", "agents"):
                 page.locator(f"#module-{view}").click()
                 page.wait_for_timeout(150)
                 visible = page.locator(".view-panel:visible").count()

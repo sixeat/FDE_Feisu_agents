@@ -15,8 +15,9 @@
       <nav id="module-nav" class="module-nav" role="tablist" aria-label="工作台模块">
         <button id="module-meetings" type="button" role="tab" aria-selected="true" aria-controls="view-meetings" data-view="meetings"><span>会议审核</span></button>
         <button id="module-owner-tasks" type="button" role="tab" aria-selected="false" aria-controls="view-owner-tasks" data-view="owner-tasks"><span>我的待办</span></button>
-        <button id="module-organizer-tasks" type="button" role="tab" aria-selected="false" aria-controls="view-organizer-tasks" data-view="organizer-tasks"><span>发起的任务</span></button>
+        <button id="module-organizer-tasks" type="button" role="tab" aria-selected="false" aria-controls="view-organizer-tasks" data-view="organizer-tasks"><span>发起任务</span></button>
         <button id="module-follow-up" type="button" role="tab" aria-selected="false" aria-controls="view-follow-up" data-view="follow-up"><span>跟进概览</span></button>
+        <button id="module-agents" type="button" role="tab" aria-selected="false" aria-controls="view-agents" data-view="agents"><span>Agent</span></button>
       </nav>
       <section id="meeting-context" class="meeting-context" aria-label="我的会议">
         <h2>我的会议</h2><nav id="meetings"></nav>
@@ -44,6 +45,10 @@
       <section id="view-follow-up" class="view-panel" role="tabpanel" aria-labelledby="module-follow-up" hidden>
         <div class="heading"><div><p class="eyebrow">个人助手</p><h1>跟进概览</h1></div><button id="follow-up-reload" type="button">刷新概览</button></div>
         <section id="follow-up-digest" class="digest" aria-live="polite"></section>
+      </section>
+      <section id="view-agents" class="view-panel" role="tabpanel" aria-labelledby="module-agents" hidden>
+        <div class="heading"><div><p class="eyebrow">组织治理</p><h1>Agent 管理</h1><p class="muted">查看当前企业租户中的个人助手和业务 Agent 版本状态。</p></div><button id="agents-reload" type="button">刷新目录</button></div>
+        <section class="agent-registry" aria-labelledby="agent-registry-title"><div class="owner-heading"><h2 id="agent-registry-title">Agent 目录</h2></div><div id="agents-notice" role="status" aria-live="polite" hidden></div><div id="agent-list" aria-busy="true"><p class="muted">正在加载 Agent…</p></div></section>
       </section>
     </main>
   </div>

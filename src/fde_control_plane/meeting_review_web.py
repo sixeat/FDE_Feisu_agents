@@ -70,6 +70,29 @@ class MeetingReviewWebService:
         self.cp = gateway.control_plane
         self.lock = RLock()
 
+    def agent_registry(self, identity: IdentityContext) -> dict[str, Any]:
+        """Return a tenant-scoped, read-only directory of managed agents."""
+        self.cp.verify_identity(identity)
+        actors = self.cp.store.list_agent_actors(identity.tenant_id)
+        versions = self.cp.store.list_agent_versions([row["actor_id"] for row in actors])
+        by_agent: dict[str, list[Any]] = {}
+        for version in versions:
+            by_agent.setdefault(version["agent_id"], []).append(version)
+        items = []
+        for actor in actors:
+            history = by_agent.get(actor["actor_id"], [])
+            current = next((version for version in history if version["active"]), None)
+            items.append({
+                "agent_id": actor["actor_id"],
+                "actor_type": actor["actor_type"],
+                "status": "PAUSED" if not actor["active"] else ("UNVERSIONED" if current is None else "ACTIVE"),
+                "current_version": int(current["version"]) if current is not None else None,
+                "version_count": len(history),
+                "capabilities": sorted(json.loads(current["capabilities_json"])) if current is not None else [],
+                "skill_version": current["skill_version"] if current is not None else None,
+            })
+        return {"agents": items}
+
     def owned_record(self, record_id: str, identity: IdentityContext) -> dict[str, Any]:
         self.cp.verify_identity(identity)
         record = self.cp.store.get_meeting_record(record_id)
@@ -391,6 +414,11 @@ def build_meeting_review_router(
     def get_digest(business_date: str | None = None, identity: IdentityContext = Depends(require_identity)):
         with service.lock:
             return service.daily_follow_up_digest(identity, business_date)
+
+    @router.get("/agents")
+    def get_agents(identity: IdentityContext = Depends(require_identity)):
+        with service.lock:
+            return service.agent_registry(identity)
 
     @router.get("/owner-tasks")
     def get_owner_tasks(request: Request, identity: IdentityContext = Depends(require_identity)):

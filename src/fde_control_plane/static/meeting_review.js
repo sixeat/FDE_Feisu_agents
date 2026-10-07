@@ -3,12 +3,15 @@ const $ = id => document.getElementById(id);
 const state = { csrf: "", members: [], detail: null, dirty: false, busy: false };
 const ownerState = {csrf:"", tasks:[], busy:false, drafts:new Map(), retries:new Map()};
 const organizerState = {csrf:"", tasks:[], busy:false};
-const viewNames={meetings:"会议审核","owner-tasks":"我的待办","organizer-tasks":"发起的任务","follow-up":"跟进概览"};
+const agentState = {agents:[], busy:false};
+const viewNames={meetings:"会议审核","owner-tasks":"我的待办","organizer-tasks":"发起的任务","follow-up":"跟进概览",agents:"Agent 管理"};
 let activeView="";
 const ownerStatusNames = {WAITING_OWNER:"等待你确认",IN_PROGRESS:"已接受，进行中",WAITING_HUMAN:"已退回，等待会议发起人处理",COMPLETED:"已完成",CANCELLED:"已取消",UNKNOWN:"等待核验",DUE_SOON:"即将到期",OVERDUE:"已逾期"};
 const taskNames = {WAITING_REVIEW:"待核对",WAITING_APPROVAL:"待审批",CANCELLED:"已取消",RUNNING:"执行中",RECONCILING:"待核验",SUCCEEDED:"已完成",PARTIAL_SUCCESS:"部分完成",FAILED:"执行失败"};
 const reasonNames = {ASSIGNEE_UNMAPPED:"负责人待确认",ASSIGNEE_INVALID:"负责人不可用",DUE_DATE_UNCONFIRMED:"截止日期待确认",DUE_DATE_INVALID:"截止日期格式无效",TITLE_MISSING:"标题待确认",POSSIBLE_DUPLICATE_OR_CONFLICT:"存在关联或冲突，需人工裁定",DISCARDED_BY_REVIEWER:"已舍弃"};
 const executionNames = {PREPARED:"待执行",DISPATCHED:"执行中",SUCCEEDED:"已创建",FAILED:"已阻断/失败",UNKNOWN:"结果待核验",RECONCILING:"结果待核验"};
+const agentTypeNames = {PERSONAL_ASSISTANT:"个人助手",BUSINESS_AGENT:"业务 Agent",MANAGEMENT_AGENT:"管理 Agent"};
+const agentStatusNames = {ACTIVE:"运行中",PAUSED:"已暂停",UNVERSIONED:"待接入"};
 function node(tag, text, cls) { const el=document.createElement(tag); if(text!==undefined) el.textContent=text; if(cls) el.className=cls; return el; }
 function notice(text, type="") { $("notice").textContent=text; $("notice").className=type; $("notice").hidden=!text; }
 function ownerNotice(text,type="") { const panel=$("owner-notice");panel.textContent=text;panel.className=type;panel.hidden=!text; }
@@ -123,6 +126,28 @@ async function approveOrganizerCorrection(task) {
     organizerNotice("已确认修正，等待受控执行。","success");
   }catch(error){organizerNotice(error.message,"error");}
   finally{organizerState.busy=false;await loadOrganizerTasks();}
+}
+function agentNotice(message,type="") {
+  const panel=$("agents-notice");panel.textContent=message;panel.className=type;panel.hidden=!message;
+}
+function renderAgents() {
+  const panel=$("agent-list");panel.replaceChildren();
+  if(!agentState.agents.length){panel.append(node("p","当前租户还没有可展示的 Agent。","muted"));return;}
+  agentState.agents.forEach(agent=>{
+    const card=node("article",undefined,"agent-row"),head=node("div",undefined,"agent-row-head");
+    const status=agentStatusNames[agent.status]||agent.status;
+    head.append(node("h3",agent.agent_id),node("span",status,`badge ${agent.status==="ACTIVE"?"ready":"closed"}`));
+    card.append(head,node("p",`${agentTypeNames[agent.actor_type]||agent.actor_type} · 当前版本 ${agent.current_version==null?"未发布":`v${agent.current_version}`} · 历史版本 ${agent.version_count}`,"muted"));
+    if(agent.capabilities.length)card.append(node("p",`能力：${agent.capabilities.join("、")}`,"agent-capabilities"));
+    if(agent.skill_version)card.append(node("p",`Skill：${agent.skill_version}`,"muted"));
+    panel.append(card);
+  });
+}
+async function loadAgents() {
+  if(agentState.busy)return;agentState.busy=true;$("agents-reload").disabled=true;$("agent-list").setAttribute("aria-busy","true");
+  try{const data=await api("/api/meetings/agents");agentState.agents=data.agents||[];renderAgents();agentNotice("");}
+  catch(error){agentNotice(error.message,"error");if(!agentState.agents.length)$("agent-list").replaceChildren(node("p","Agent 目录暂时无法加载，请稍后刷新。","muted"));}
+  finally{agentState.busy=false;$("agents-reload").disabled=false;$("agent-list").setAttribute("aria-busy","false");}
 }
 async function api(path, options={}) {
   const controller=new AbortController(), timer=setTimeout(()=>controller.abort(),15000);
@@ -257,6 +282,7 @@ window.addEventListener("beforeunload",event=>{if(state.dirty){event.preventDefa
 $("owner-reload").addEventListener("click",loadOwnerTasks);
 $("organizer-reload").addEventListener("click",loadOrganizerTasks);
 $("follow-up-reload").addEventListener("click",refreshDigest);
+$("agents-reload").addEventListener("click",loadAgents);
 function showView(view,{updateHash=true}={}) {
   if(!Object.hasOwn(viewNames,view))view="meetings";
   if(view===activeView)return true;
@@ -278,6 +304,7 @@ function showView(view,{updateHash=true}={}) {
   if(view==="owner-tasks")loadOwnerTasks();
   if(view==="organizer-tasks")loadOrganizerTasks();
   if(view==="follow-up")refreshDigest();
+  if(view==="agents")loadAgents();
   return true;
 }
 $("module-nav").querySelectorAll("button").forEach(button=>{

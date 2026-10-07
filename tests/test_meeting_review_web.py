@@ -102,6 +102,26 @@ def test_daily_digest_preview_is_authenticated_redacted_and_unsent(tmp_path):
     assert client.get("/api/meetings/digest?business_date=bad-date").status_code == 422
 
 
+def test_agent_directory_is_tenant_scoped_and_redacts_external_identity(tmp_path):
+    cp, _, client, _, _, _, _ = web_setup(tmp_path)
+    response = client.get("/api/meetings/agents")
+    assert response.status_code == 200
+    agents = response.json()["agents"]
+    assert {item["agent_id"] for item in agents} == {"assistant", "agent"}
+    business = next(item for item in agents if item["agent_id"] == "agent")
+    assert business["actor_type"] == "BUSINESS_AGENT"
+    assert business["status"] == "ACTIVE"
+    assert business["current_version"] == 1
+    assert business["version_count"] == 1
+    assert "doc.read" in business["capabilities"]
+    assistant = next(item for item in agents if item["agent_id"] == "assistant")
+    assert assistant["status"] == "UNVERSIONED"
+    assert assistant["current_version"] is None
+    assert "external_ref_hash" not in response.text
+    assert "admin-subject" not in response.text
+    assert client.get("/api/meetings").status_code == 200
+
+
 def test_stale_document_cannot_submit_or_modify_stored_draft(tmp_path):
     cp, reader, client, headers, detail, edits, task_id = web_setup(tmp_path, revision="6")
     before = cp.store.list_meeting_todos("record")

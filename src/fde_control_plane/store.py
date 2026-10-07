@@ -302,6 +302,27 @@ class SQLiteStore:
             "SELECT * FROM agent_versions WHERE agent_id = ? AND version = ?", (agent_id, version)
         ).fetchone()
 
+    def list_agent_actors(self, tenant_id: str) -> list[sqlite3.Row]:
+        """List non-user actors for the tenant without exposing external identities."""
+        return self.connection.execute(
+            "SELECT actor_id, tenant_id, actor_type, capabilities_json, roles_json, active "
+            "FROM actors WHERE tenant_id = ? AND actor_type IN "
+            "('PERSONAL_ASSISTANT', 'BUSINESS_AGENT', 'MANAGEMENT_AGENT') "
+            "ORDER BY actor_type, actor_id",
+            (tenant_id,),
+        ).fetchall()
+
+    def list_agent_versions(self, agent_ids: Iterable[str]) -> list[sqlite3.Row]:
+        ids = list(agent_ids)
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        return self.connection.execute(
+            f"SELECT agent_id, version, capabilities_json, active, skill_version "
+            f"FROM agent_versions WHERE agent_id IN ({placeholders}) ORDER BY agent_id, version DESC",
+            ids,
+        ).fetchall()
+
     def save_binding(self, binding: Any) -> None:
         self.connection.execute(
             "INSERT OR REPLACE INTO assistant_bindings VALUES (?, ?, ?, ?, ?)",

@@ -2,5 +2,6 @@ FROM fde-control-plane:task-due-fix-20261007
 
 COPY src/fde_control_plane/meeting_review_web.py /app/src/fde_control_plane/meeting_review_web.py
 COPY src/fde_control_plane/store.py /app/src/fde_control_plane/store.py
+COPY src/fde_control_plane/task_due_correction.py /app/src/fde_control_plane/task_due_correction.py
 COPY src/fde_control_plane/static/meeting_review.css /app/src/fde_control_plane/static/meeting_review.css
 COPY src/fde_control_plane/static/meeting_review.js /app/src/fde_control_plane/static/meeting_review.js

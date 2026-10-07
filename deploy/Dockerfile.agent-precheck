@@ -1,0 +1,6 @@
+FROM fde-control-plane:agent-drafts-20261007
+
+COPY src/fde_control_plane/meeting_review_web.py /app/src/fde_control_plane/meeting_review_web.py
+COPY src/fde_control_plane/store.py /app/src/fde_control_plane/store.py
+COPY src/fde_control_plane/static/meeting_review.css /app/src/fde_control_plane/static/meeting_review.css
+COPY src/fde_control_plane/static/meeting_review.js /app/src/fde_control_plane/static/meeting_review.js

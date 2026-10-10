@@ -3,7 +3,7 @@ const $ = id => document.getElementById(id);
 const state = { csrf: "", members: [], detail: null, dirty: false, busy: false };
 const ownerState = {csrf:"", tasks:[], busy:false, drafts:new Map(), retries:new Map()};
 const organizerState = {csrf:"", tasks:[], busy:false};
-const agentState = {agents:[], drafts:[], csrf:"", canPrecheck:false, canConfirm:false, busy:false};
+const agentState = {agents:[], drafts:[], memberRequests:[], csrf:"", canPrecheck:false, canConfirm:false, busy:false};
 const viewNames={meetings:"会议审核","owner-tasks":"我的待办","organizer-tasks":"发起的任务","follow-up":"跟进概览",agents:"Agent 管理"};
 let activeView="";
 const ownerStatusNames = {WAITING_OWNER:"等待你确认",IN_PROGRESS:"已接受，进行中",WAITING_HUMAN:"已退回，等待会议发起人处理",COMPLETED:"已完成",CANCELLED:"已取消",UNKNOWN:"等待核验",DUE_SOON:"即将到期",OVERDUE:"已逾期"};
@@ -169,9 +169,30 @@ function renderAgentDrafts() {
     panel.append(card);
   });
 }
+function renderMemberAccess() {
+  const section=$("member-access-panel"),panel=$("member-access-list");section.hidden=!agentState.canConfirm;panel.replaceChildren();
+  if(!agentState.canConfirm)return;
+  if(!agentState.memberRequests.length){panel.append(node("p","暂无待批准成员。","muted"));return;}
+  agentState.memberRequests.forEach(item=>{
+    const row=node("article",undefined,"agent-draft-row"),button=node("button","批准接入","primary");
+    button.type="button";button.addEventListener("click",()=>approveMemberAccess(item,button));
+    row.append(node("h3",item.request_id),node("p",`申请时间：${item.created_at}。请先与该成员确认识别码。`,"muted"),button);panel.append(row);
+  });
+}
+async function approveMemberAccess(item,button) {
+  if(agentState.busy)return;
+  if(!window.confirm(`已与成员核对识别码 ${item.request_id}？批准后该成员可登录工作台。`))return;
+  agentState.busy=true;button.disabled=true;agentNotice("正在批准成员接入…");
+  try{
+    await api(`/api/meetings/member-access-requests/${encodeURIComponent(item.request_id)}/approve`,{method:"POST",headers:{"X-CSRF-Token":agentState.csrf}});
+    agentNotice("成员已绑定。请让该成员重新打开工作台。","success");
+    agentState.memberRequests=(await api("/api/meetings/member-access-requests")).requests||[];renderMemberAccess();
+  }catch(error){agentNotice(error.message,"error");button.disabled=false;}
+  finally{agentState.busy=false;}
+}
 async function loadAgents() {
   if(agentState.busy)return;agentState.busy=true;$("agents-reload").disabled=true;$("agent-list").setAttribute("aria-busy","true");
-  try{const data=await api("/api/meetings/agents");const drafts=await api("/api/meetings/agent-drafts");agentState.agents=data.agents||[];agentState.drafts=drafts.drafts||[];agentState.canPrecheck=Boolean(drafts.can_precheck);agentState.canConfirm=Boolean(drafts.can_confirm);agentState.csrf=drafts.csrf_token;renderAgents();renderAgentDrafts();agentNotice("");}
+  try{const data=await api("/api/meetings/agents");const drafts=await api("/api/meetings/agent-drafts");agentState.agents=data.agents||[];agentState.drafts=drafts.drafts||[];agentState.canPrecheck=Boolean(drafts.can_precheck);agentState.canConfirm=Boolean(drafts.can_confirm);agentState.csrf=drafts.csrf_token;agentState.memberRequests=agentState.canConfirm?(await api("/api/meetings/member-access-requests")).requests||[]:[];renderAgents();renderAgentDrafts();renderMemberAccess();agentNotice("");}
   catch(error){agentNotice(error.message,"error");if(!agentState.agents.length)$("agent-list").replaceChildren(node("p","Agent 目录暂时无法加载，请稍后刷新。","muted"));}
   finally{agentState.busy=false;$("agents-reload").disabled=false;$("agent-list").setAttribute("aria-busy","false");}
 }

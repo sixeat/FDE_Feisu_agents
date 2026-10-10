@@ -4,15 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+from html import escape
 import secrets
 import time
 from typing import Callable, Protocol
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-from .feishu_oauth import FeishuOAuthIdentityGateway
+from .feishu_oauth import FeishuOAuthIdentityGateway, MemberAccessPending
 from .models import ActorType, IdentityContext
 from .service import ControlPlane
 
@@ -201,7 +202,7 @@ def build_oauth_router(
         state: str | None = None,
         code: str | None = None,
         error: str | None = None,
-    ) -> RedirectResponse:
+    ) -> Response:
         browser_ref = request.cookies.get(browser_cookie_name)
         if not browser_ref:
             raise HTTPException(status_code=403, detail="OAuth browser session is missing")
@@ -213,6 +214,19 @@ def build_oauth_router(
                 browser_session_ref=browser_ref,
             )
             session_id = issue_session(identity)
+        except MemberAccessPending as exc:
+            response = HTMLResponse(
+                "<!doctype html><html lang='zh-CN'><meta charset='utf-8'>"
+                "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                "<title>等待接入批准</title><main style='font:16px/1.6 sans-serif;max-width:40rem;margin:4rem auto;padding:1rem'>"
+                "<h1>接入申请已登记</h1><p>请把下面的识别码告知应用管理员。管理员在 Agent 管理页核对并批准后，重新打开工作台。</p>"
+                f"<p><strong>{escape(exc.request_id)}</strong></p></main></html>",
+                status_code=403,
+            )
+            response.delete_cookie(browser_cookie_name, secure=cookie_secure, httponly=True, samesite="lax")
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            return response
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         response = RedirectResponse(success_url, status_code=303)

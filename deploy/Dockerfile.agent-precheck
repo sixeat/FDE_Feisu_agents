@@ -6,3 +6,6 @@ COPY src/fde_control_plane/task_due_correction.py /app/src/fde_control_plane/tas
 COPY src/fde_control_plane/static/meeting_review.css /app/src/fde_control_plane/static/meeting_review.css
 COPY src/fde_control_plane/static/meeting_review.js /app/src/fde_control_plane/static/meeting_review.js
 COPY scripts/fde_oauth_server.py /app/scripts/fde_oauth_server.py
+COPY src/fde_control_plane/feishu_oauth.py /app/src/fde_control_plane/feishu_oauth.py
+COPY src/fde_control_plane/feishu_oauth_web.py /app/src/fde_control_plane/feishu_oauth_web.py
+COPY src/fde_control_plane/static/meeting_review.html /app/src/fde_control_plane/static/meeting_review.html

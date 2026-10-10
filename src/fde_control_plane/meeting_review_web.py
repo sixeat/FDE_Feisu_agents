@@ -148,6 +148,28 @@ class MeetingReviewWebService:
         return (identity.auth_mode == "user_oauth" and actor.actor_type.value == "USER"
                 and bool(actor.roles & AGENT_ADMIN_ROLES))
 
+    def pending_member_access(self, identity: IdentityContext) -> list[dict[str, Any]]:
+        if not self.can_confirm_agent_config(identity):
+            raise HTTPException(403, "只有管理员可以查看成员接入申请")
+        return [{"request_id": row["request_id"], "created_at": row["created_at"]}
+                for row in self.cp.store.list_pending_member_access(identity.tenant_id)]
+
+    def approve_member_access(self, request_id: str, identity: IdentityContext) -> dict[str, Any]:
+        if not self.can_confirm_agent_config(identity):
+            raise HTTPException(403, "只有管理员可以批准成员接入")
+        try:
+            result = self.cp.store.approve_member_access(
+                identity.tenant_id, request_id, "member-" + secrets.token_hex(8),
+            )
+        except ValueError as exc:
+            if str(exc) == "REQUEST_NOT_FOUND":
+                raise HTTPException(404, "成员接入申请不存在") from exc
+            raise HTTPException(409, "成员接入申请已变化，请刷新后核对") from exc
+        if not result["duplicate"]:
+            self.cp._audit("MEMBER_ACCESS_APPROVED", identity.tenant_id, identity.actor_id, None,
+                           {"request_id": request_id, "actor_id": result["actor_id"]}, "APPROVED")
+        return result
+
     def precheck_agent_config_draft(self, draft_id: str, identity: IdentityContext) -> dict[str, Any]:
         actor = self.cp.verify_identity(identity)
         if not self.can_precheck_agent_config(identity):
@@ -588,6 +610,18 @@ def build_meeting_review_router(
                     "can_precheck": service.can_precheck_agent_config(identity),
                     "can_confirm": service.can_confirm_agent_config(identity),
                     "csrf_token": csrf_token(request.cookies["fde_auth_session"])}
+
+    @router.get("/member-access-requests")
+    def member_access_requests(identity: IdentityContext = Depends(require_identity)):
+        with service.lock:
+            return {"requests": service.pending_member_access(identity)}
+
+    @router.post("/member-access-requests/{request_id}/approve")
+    def approve_member_access(request_id: str, request: Request,
+                              identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        with service.lock:
+            return service.approve_member_access(request_id, identity)
 
     @router.post("/agent-drafts")
     def create_agent_draft(body: AgentConfigDraftRequest, request: Request,

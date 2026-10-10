@@ -25,6 +25,12 @@ class OAuthUser:
     tenant_key: str | None = None
 
 
+class MemberAccessPending(PermissionError):
+    def __init__(self, request_id: str) -> None:
+        self.request_id = request_id
+        super().__init__("OAuth user is not bound to a unique member; 接入申请已登记")
+
+
 class OAuthTransport(Protocol):
     def exchange_code(self, code: str) -> OAuthGrant: ...
     def get_user(self, access_token: str) -> OAuthUser: ...
@@ -105,7 +111,10 @@ class FeishuOAuthIdentityGateway:
         subject_hash = hashlib.sha256(user.open_id.encode("utf-8")).hexdigest()
         row = self.control_plane.store.find_actor_by_external_hash(self.tenant_id, subject_hash)
         if row is None:
-            raise PermissionError("OAuth user is not bound to a unique member")
+            pending = self.control_plane.store.request_member_access(
+                self.tenant_id, subject_hash, "member-request-" + secrets.token_hex(8),
+            )
+            raise MemberAccessPending(pending["request_id"])
         actor = self.control_plane._actor(row["actor_id"])
         if actor.actor_type != ActorType.USER:
             raise PermissionError("OAuth identity is not a member")
@@ -116,5 +125,6 @@ class FeishuOAuthIdentityGateway:
 
 
 __all__ = [
-    "FeishuOAuthIdentityGateway", "FeishuOAuthTransport", "OAuthGrant", "OAuthTransport", "OAuthUser",
+    "FeishuOAuthIdentityGateway", "FeishuOAuthTransport", "MemberAccessPending",
+    "OAuthGrant", "OAuthTransport", "OAuthUser",
 ]

@@ -77,10 +77,35 @@ def test_expired_state_fails_before_code_exchange(tmp_path):
     ],
 )
 def test_oauth_rejects_foreign_or_unbound_user(tmp_path, transport, error):
-    _, gateway, _ = setup_oauth(tmp_path, transport=transport)
+    cp, gateway, _ = setup_oauth(tmp_path, transport=transport)
     state = gateway.issue_state(browser_session_ref="browser-1")
     with pytest.raises(PermissionError, match=error):
         gateway.complete(state=state, code="code", browser_session_ref="browser-1")
+    pending = cp.store.list_pending_member_access("tenant")
+    assert len(pending) == (1 if transport.tenant_key == "tenant-key" else 0)
+
+
+def test_unknown_member_requests_access_once_then_logs_in_after_admin_binding(tmp_path):
+    transport = FakeOAuthTransport(open_id="ou_second")
+    cp, gateway, _ = setup_oauth(tmp_path, transport=transport)
+    for _ in range(2):
+        state = gateway.issue_state(browser_session_ref="browser-second")
+        with pytest.raises(PermissionError, match="接入申请已登记"):
+            gateway.complete(state=state, code="code", browser_session_ref="browser-second")
+    requests = cp.store.list_pending_member_access("tenant")
+    assert len(requests) == 1
+    request_id = requests[0]["request_id"]
+    subject_hash = hashlib.sha256(b"ou_second").hexdigest()
+    assert "ou_second" not in str(cp.store.connection.execute(
+        "SELECT * FROM member_access_requests"
+    ).fetchone()[:])
+    approved = cp.store.approve_member_access("tenant", request_id, "member-second")
+    assert approved["duplicate"] is False
+    assert cp.store.approve_member_access("tenant", request_id, "ignored")["actor_id"] == "member-second"
+    assert cp.store.find_actor_by_external_hash("tenant", subject_hash)["actor_id"] == "member-second"
+    assert cp._actor("member-second").roles == frozenset()
+    state = gateway.issue_state(browser_session_ref="browser-second")
+    assert gateway.complete(state=state, code="code", browser_session_ref="browser-second").actor_id == "member-second"
 
 
 def test_oauth_state_survives_control_plane_reopen(tmp_path):

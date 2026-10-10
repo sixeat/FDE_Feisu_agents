@@ -53,6 +53,16 @@ class SQLiteStore:
                 roles_json TEXT NOT NULL, external_ref_hash TEXT,
                 active INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS member_access_requests (
+                request_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                subject_ref_hash TEXT NOT NULL,
+                status TEXT NOT NULL, actor_id TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                decided_at TEXT,
+                UNIQUE(tenant_id, subject_ref_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_member_access_requests_pending
+                ON member_access_requests(tenant_id, status, created_at);
             CREATE TABLE IF NOT EXISTS agent_versions (
                 agent_id TEXT NOT NULL, version INTEGER NOT NULL,
                 capabilities_json TEXT NOT NULL, active INTEGER NOT NULL,
@@ -253,6 +263,60 @@ class SQLiteStore:
             (tenant_id, external_ref_hash),
         ).fetchall()
         return rows[0] if len(rows) == 1 else None
+
+    def request_member_access(self, tenant_id: str, subject_ref_hash: str, request_id: str) -> sqlite3.Row:
+        """Record only a verified same-tenant OAuth subject hash, never its token or open_id."""
+        self.connection.execute(
+            "INSERT OR IGNORE INTO member_access_requests(request_id, tenant_id, subject_ref_hash, status) "
+            "VALUES (?, ?, ?, 'PENDING')", (request_id, tenant_id, subject_ref_hash),
+        )
+        return self.connection.execute(
+            "SELECT * FROM member_access_requests WHERE tenant_id = ? AND subject_ref_hash = ?",
+            (tenant_id, subject_ref_hash),
+        ).fetchone()
+
+    def list_pending_member_access(self, tenant_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT request_id, created_at FROM member_access_requests "
+            "WHERE tenant_id = ? AND status = 'PENDING' ORDER BY created_at, request_id",
+            (tenant_id,),
+        ).fetchall()
+
+    def approve_member_access(self, tenant_id: str, request_id: str, actor_id: str) -> dict[str, Any]:
+        """Bind one OAuth subject as a plain member; approval is atomic and replay safe."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            request = self.connection.execute(
+                "SELECT * FROM member_access_requests WHERE tenant_id = ? AND request_id = ?",
+                (tenant_id, request_id),
+            ).fetchone()
+            if request is None:
+                raise ValueError("REQUEST_NOT_FOUND")
+            if request["status"] == "APPROVED":
+                self.connection.commit()
+                return {"request_id": request_id, "actor_id": request["actor_id"], "duplicate": True}
+            if request["status"] != "PENDING":
+                raise ValueError("REQUEST_NOT_PENDING")
+            if self.connection.execute(
+                "SELECT 1 FROM actors WHERE tenant_id = ? AND external_ref_hash = ?",
+                (tenant_id, request["subject_ref_hash"]),
+            ).fetchone() is not None:
+                raise ValueError("MEMBER_ALREADY_BOUND")
+            self.connection.execute(
+                "INSERT INTO actors(actor_id, tenant_id, actor_type, capabilities_json, roles_json, external_ref_hash, active) "
+                "VALUES (?, ?, 'USER', '[]', '[]', ?, 1)",
+                (actor_id, tenant_id, request["subject_ref_hash"]),
+            )
+            self.connection.execute(
+                "UPDATE member_access_requests SET status = 'APPROVED', actor_id = ?, "
+                "decided_at = CURRENT_TIMESTAMP WHERE tenant_id = ? AND request_id = ?",
+                (actor_id, tenant_id, request_id),
+            )
+            self.connection.commit()
+            return {"request_id": request_id, "actor_id": actor_id, "duplicate": False}
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def save_oauth_state(self, state_hash: str, session_ref_hash: str, expires_at: int, now: int) -> None:
         self.connection.execute("BEGIN IMMEDIATE")

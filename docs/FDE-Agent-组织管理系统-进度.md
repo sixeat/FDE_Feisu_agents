@@ -1671,3 +1671,12 @@ UNKNOWN 卡片不能自动重发，仍需远端核实工具。部署保留数据
 - 未覆盖边界：新账号尚未在真实线上 H5 触发申请；部门同步、部门负责人、参与人会议视图和跨部门委托尚未实现；管理员仍需人工核对申请识别码，系统不从飞书部门自动推断授权。
 - 下一步：备份线上 SQLite，部署 OAuth/成员申请增量镜像；让两个新账号各打开一次 H5，记录申请识别码；管理员在 Agent 管理页逐条批准，再分别重新登录验证会议、任务和 Agent 管理的可见范围。
 
+### 2026-10-10 多成员接入切片线上部署
+
+- 状态：已完成；等待两个新账号触发真实申请。
+- 完成内容：线上 SQLite 备份保存于 `/opt/fde-agent-stage/deploy/data/backups/20261010-member-onboarding/control_plane.sqlite3`，`quick_check=ok`；当前镜像保留为 `fde-control-plane:rollback-20261010-member-onboarding-current`。基于现有管理员映射镜像构建成员接入版本并切换固定 Compose 标签，仅重建控制平面，监听器和 Worker 未重启。
+- 验收结果：控制平面 `running/healthy`，监听器 `running`，Worker `running/healthy`；`/health` 正常，匿名草稿和成员申请接口均返回 `401`；`member_access_requests` 表已建立且当前申请数为 0；线上业务数据计数未变化。
+- Worker 安全态：仍为 `network_mode=none`、只读数据卷、`--loop --dry-run`。
+- 未覆盖边界：尚未使用两个真实飞书账号触发申请；部门仍不参与授权；尚未批准新成员或验证“新成员看不到原会议、只看到分配给自己的任务”。
+- 下一步：让两个新账号分别访问 `https://fde.sixeat.icu/h5`，记录页面显示的申请识别码；当前管理员在 Agent 管理 → 成员接入申请中逐条核对并批准，然后让新成员重新登录。
+

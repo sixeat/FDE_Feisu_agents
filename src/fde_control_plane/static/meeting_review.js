@@ -3,7 +3,7 @@ const $ = id => document.getElementById(id);
 const state = { csrf: "", members: [], detail: null, dirty: false, busy: false };
 const ownerState = {csrf:"", tasks:[], busy:false, drafts:new Map(), retries:new Map()};
 const organizerState = {csrf:"", tasks:[], busy:false};
-const agentState = {agents:[], drafts:[], memberRequests:[], csrf:"", canPrecheck:false, canConfirm:false, busy:false};
+const agentState = {agents:[], drafts:[], memberRequests:[], csrf:"", canPrecheck:false, canConfirm:false, canPause:false, busy:false};
 const auditState = {events:[], counts:{}, summary:{}, csrf:"", busy:false, canView:false};
 const viewNames={meetings:"会议审核","owner-tasks":"我的待办","organizer-tasks":"发起的任务","follow-up":"跟进概览",agents:"Agent 管理",audit:"审计运维"};
 let activeView="";
@@ -143,8 +143,29 @@ function renderAgents() {
     card.append(head,node("p",`${agentTypeNames[agent.actor_type]||agent.actor_type} · 当前版本 ${agent.current_version==null?"未发布":`v${agent.current_version}`} · 历史版本 ${agent.version_count}`,"muted"));
     if(agent.capabilities.length)card.append(node("p",`能力：${agent.capabilities.join("、")}`,"agent-capabilities"));
     if(agent.skill_version)card.append(node("p",`Skill：${agent.skill_version}`,"muted"));
+    if(agent.pause_reason)card.append(node("p",`暂停原因：${agent.pause_reason}`,"muted"));
+    if(agentState.canPause && agent.status!=="PAUSED"){
+      const actions=node("div",undefined,"commands agent-review-actions"),button=node("button","暂停 Agent");
+      button.type="button";button.addEventListener("click",()=>pauseAgent(agent,button));actions.append(button);card.append(actions);
+    }
     panel.append(card);
   });
+}
+async function pauseAgent(agent,button) {
+  if(agentState.busy)return;
+  const reason=window.prompt(`暂停“${agent.agent_id}”的原因（至少 5 个字）：`);
+  if(reason===null)return;
+  if(reason.trim().length<5){agentNotice("请填写至少 5 个字的暂停原因。","error");return;}
+  if(!window.confirm(`确认暂停“${agent.agent_id}”？新的调度和后续写入会被阻断。`))return;
+  agentState.busy=true;button.disabled=true;agentNotice("正在暂停 Agent…");
+  try{
+    await api(`/api/meetings/agents/${encodeURIComponent(agent.agent_id)}/pause`,{
+      method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":agentState.csrf},
+      body:JSON.stringify({expected_version:agent.current_version,reason:reason.trim()})
+    });
+    const data=await api("/api/meetings/agents");agentState.agents=data.agents||[];renderAgents();agentNotice("Agent 已暂停；恢复需走后续治理流程。","success");
+  }catch(error){agentNotice(error.message,"error");button.disabled=false;}
+  finally{agentState.busy=false;}
 }
 function renderAgentDrafts() {
   const panel=$("agent-draft-list");panel.replaceChildren();
@@ -193,7 +214,7 @@ async function approveMemberAccess(item,button) {
 }
 async function loadAgents() {
   if(agentState.busy)return;agentState.busy=true;$("agents-reload").disabled=true;$("agent-list").setAttribute("aria-busy","true");
-  try{const data=await api("/api/meetings/agents");const drafts=await api("/api/meetings/agent-drafts");agentState.agents=data.agents||[];agentState.drafts=drafts.drafts||[];agentState.canPrecheck=Boolean(drafts.can_precheck);agentState.canConfirm=Boolean(drafts.can_confirm);agentState.csrf=drafts.csrf_token;agentState.memberRequests=agentState.canConfirm?(await api("/api/meetings/member-access-requests")).requests||[]:[];renderAgents();renderAgentDrafts();renderMemberAccess();agentNotice("");}
+  try{const data=await api("/api/meetings/agents");const drafts=await api("/api/meetings/agent-drafts");agentState.agents=data.agents||[];agentState.drafts=drafts.drafts||[];agentState.canPause=Boolean(data.can_pause);agentState.canPrecheck=Boolean(drafts.can_precheck);agentState.canConfirm=Boolean(drafts.can_confirm);agentState.csrf=drafts.csrf_token;agentState.memberRequests=agentState.canConfirm?(await api("/api/meetings/member-access-requests")).requests||[]:[];renderAgents();renderAgentDrafts();renderMemberAccess();agentNotice("");}
   catch(error){agentNotice(error.message,"error");if(!agentState.agents.length)$("agent-list").replaceChildren(node("p","Agent 目录暂时无法加载，请稍后刷新。","muted"));}
   finally{agentState.busy=false;$("agents-reload").disabled=false;$("agent-list").setAttribute("aria-busy","false");}
 }

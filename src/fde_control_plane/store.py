@@ -68,6 +68,11 @@ class SQLiteStore:
                 capabilities_json TEXT NOT NULL, active INTEGER NOT NULL,
                 skill_version TEXT, PRIMARY KEY (agent_id, version)
             );
+            CREATE TABLE IF NOT EXISTS agent_pauses (
+                audit_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+                expected_version INTEGER, decided_by TEXT NOT NULL, reason TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS agent_config_drafts (
                 draft_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
                 created_by TEXT NOT NULL, status TEXT NOT NULL,
@@ -415,6 +420,46 @@ class SQLiteStore:
             "ORDER BY actor_type, actor_id",
             (tenant_id,),
         ).fetchall()
+
+    def pause_agent(self, tenant_id: str, agent_id: str, expected_version: int | None,
+                    reason: str, event: Any) -> bool:
+        """Pause only the version the administrator reviewed, with its audit record."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            updated = self.connection.execute(
+                "UPDATE actors SET active = 0 WHERE tenant_id = ? AND actor_id = ? "
+                "AND actor_type IN ('PERSONAL_ASSISTANT', 'BUSINESS_AGENT', 'MANAGEMENT_AGENT') "
+                "AND active = 1 AND ((? IS NULL AND NOT EXISTS "
+                "(SELECT 1 FROM agent_versions WHERE agent_id = ? AND active = 1)) "
+                "OR EXISTS (SELECT 1 FROM agent_versions WHERE agent_id = ? AND version = ? AND active = 1))",
+                (tenant_id, agent_id, expected_version, agent_id, agent_id, expected_version),
+            )
+            if updated.rowcount != 1:
+                self.connection.rollback()
+                return False
+            self.connection.execute(
+                "INSERT INTO agent_pauses(audit_id, tenant_id, agent_id, expected_version, decided_by, reason) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (event.audit_id, tenant_id, agent_id, expected_version, event.actor_id, reason),
+            )
+            self.connection.execute(
+                "INSERT INTO audit_events(audit_id, event_type, tenant_id, task_run_id, data_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (event.audit_id, event.event_type, event.tenant_id, event.task_run_id,
+                 self._json(asdict(event))),
+            )
+            self.connection.commit()
+            return True
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def latest_agent_pauses(self, tenant_id: str) -> dict[str, sqlite3.Row]:
+        rows = self.connection.execute(
+            "SELECT agent_id, reason, created_at FROM agent_pauses WHERE tenant_id = ? "
+            "ORDER BY rowid DESC", (tenant_id,),
+        ).fetchall()
+        return {row["agent_id"]: row for row in reversed(rows)}
 
     def list_agent_versions(self, agent_ids: Iterable[str]) -> list[sqlite3.Row]:
         ids = list(agent_ids)

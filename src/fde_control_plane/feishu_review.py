@@ -56,6 +56,8 @@ class FeishuMeetingReviewGateway:
             raise KeyError(record_id)
         task = self.control_plane._task(task_run_id)
         reviewer = self.control_plane.verify_identity(reviewer_identity)
+        if not self.control_plane._actor(task.agent_id).active or not self.control_plane._agent_version(task.agent_id, task.agent_version).active:
+            raise PermissionError("meeting agent is paused")
         if (
             record.get("task_run_id") != task_run_id
             or record["tenant_id"] != task.tenant_id

@@ -1,0 +1,7 @@
+FROM fde-control-plane:audit-summary-20261011
+
+COPY src/fde_control_plane/store.py /app/src/fde_control_plane/store.py
+COPY src/fde_control_plane/service.py /app/src/fde_control_plane/service.py
+COPY src/fde_control_plane/feishu_review.py /app/src/fde_control_plane/feishu_review.py
+COPY src/fde_control_plane/meeting_review_web.py /app/src/fde_control_plane/meeting_review_web.py
+COPY src/fde_control_plane/static/meeting_review.js /app/src/fde_control_plane/static/meeting_review.js

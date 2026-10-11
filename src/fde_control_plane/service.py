@@ -155,11 +155,12 @@ class ControlPlane:
                 raise PermissionError("identity actor does not match task requester")
         user = self._actor(requested_by)
         assistant = self._actor(assistant_actor_id)
+        agent = self._actor(agent_id)
         version = self._agent_version(agent_id, agent_version)
         tenant = tenant_id or user.tenant_id
-        if not user.active or not assistant.active or not version.active:
+        if not user.active or not assistant.active or not agent.active or not version.active:
             raise PermissionError("inactive actor or agent version")
-        if user.tenant_id != tenant or assistant.tenant_id != tenant:
+        if user.tenant_id != tenant or assistant.tenant_id != tenant or agent.tenant_id != tenant:
             raise PermissionError("tenant mismatch")
         binding = self.store.get_binding(requested_by, tenant)
         if binding is not None and binding["assistant_actor_id"] != assistant_actor_id:
@@ -207,6 +208,8 @@ class ControlPlane:
         if delegation.to_actor_id != task.agent_id or target.actor_type != ActorType.BUSINESS_AGENT:
             raise PermissionError("delegation target must be the task business agent")
         version = self._agent_version(task.agent_id, task.agent_version)
+        if not version.active:
+            raise PermissionError("delegation agent version is inactive")
         allowed_scope = source.capabilities & target.capabilities & version.capabilities
         if not delegation.scope or not delegation.scope.issubset(allowed_scope):
             raise PermissionError("delegation exceeds assistant, agent, or version capabilities")

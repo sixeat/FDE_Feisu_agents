@@ -74,6 +74,12 @@ class AgentConfigApprovalRequest(BaseModel):
     input_hash: StrictStr = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]+$")
 
 
+class AgentPauseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int | None = Field(default=None, ge=1)
+    reason: StrictStr = Field(min_length=5, max_length=500)
+
+
 class AuditTriageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_status: Literal["OPEN", "ACKNOWLEDGED"]
@@ -93,6 +99,7 @@ HIGH_RISK_AGENT_CAPABILITIES = frozenset({"doc.write", "doc.delete", "task.write
 AUDIT_EVENT_PREFIX_CATEGORIES = (
     ("AUDIT_TRIAGE", "OPERATIONS"),
     ("AGENT_CONFIG", "AGENT_GOVERNANCE"),
+    ("AGENT_", "AGENT_GOVERNANCE"),
     ("APPROVAL", "APPROVAL"),
     ("FEISHU_DOCUMENT", "SOURCE"),
     ("MEMBER", "MEMBER"),
@@ -120,6 +127,8 @@ class MeetingReviewWebService:
         self.cp.verify_identity(identity)
         actors = self.cp.store.list_agent_actors(identity.tenant_id)
         versions = self.cp.store.list_agent_versions([row["actor_id"] for row in actors])
+        can_pause = self.can_confirm_agent_config(identity)
+        pauses = self.cp.store.latest_agent_pauses(identity.tenant_id) if can_pause else {}
         by_agent: dict[str, list[Any]] = {}
         for version in versions:
             by_agent.setdefault(version["agent_id"], []).append(version)
@@ -135,8 +144,28 @@ class MeetingReviewWebService:
                 "version_count": len(history),
                 "capabilities": sorted(json.loads(current["capabilities_json"])) if current is not None else [],
                 "skill_version": current["skill_version"] if current is not None else None,
+                "pause_reason": pauses[actor["actor_id"]]["reason"] if not actor["active"] and actor["actor_id"] in pauses else None,
             })
-        return {"agents": items}
+        return {"agents": items, "can_pause": can_pause}
+
+    def pause_agent(self, agent_id: str, identity: IdentityContext,
+                    body: AgentPauseRequest) -> dict[str, Any]:
+        if not self.can_confirm_agent_config(identity):
+            raise HTTPException(403, "只有管理员可以暂停 Agent")
+        reason = body.reason.strip()
+        if len(reason) < 5:
+            raise HTTPException(422, "请填写至少 5 个字的暂停原因")
+        payload = {"agent_id": agent_id, "expected_version": body.expected_version, "reason": reason}
+        event = AuditEvent(
+            audit_id="audit-" + secrets.token_hex(12), event_type="AGENT_PAUSED",
+            tenant_id=identity.tenant_id, actor_id=identity.actor_id,
+            task_run_id=None, correlation_id=None,
+            payload_hash=hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode()).hexdigest(),
+            outcome="PAUSED",
+        )
+        if not self.cp.store.pause_agent(identity.tenant_id, agent_id, body.expected_version, reason, event):
+            raise HTTPException(409, "Agent 状态或版本已变化，请刷新目录后核对")
+        return {"agent_id": agent_id, "status": "PAUSED", "remote_write": False}
 
     def agent_config_drafts(self, identity: IdentityContext) -> list[dict[str, Any]]:
         actor = self.cp.verify_identity(identity)
@@ -696,6 +725,13 @@ def build_meeting_review_router(
     def get_agents(identity: IdentityContext = Depends(require_identity)):
         with service.lock:
             return service.agent_registry(identity)
+
+    @router.post("/agents/{agent_id}/pause")
+    def pause_agent(agent_id: str, body: AgentPauseRequest, request: Request,
+                    identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        with service.lock:
+            return service.pause_agent(agent_id, identity, body)
 
     @router.get("/agent-drafts")
     def get_agent_drafts(request: Request, identity: IdentityContext = Depends(require_identity)):

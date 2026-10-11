@@ -8,6 +8,8 @@ import pytest
 from fde_control_plane import (
     Actor,
     ActorType,
+    AgentVersion,
+    Delegation,
     IdentityContext,
     SQLiteOAuthSessionIssuer,
     build_remote_task_observation,
@@ -242,6 +244,57 @@ def test_agent_directory_is_tenant_scoped_and_redacts_external_identity(tmp_path
     assert "external_ref_hash" not in response.text
     assert "admin-subject" not in response.text
     assert client.get("/api/meetings").status_code == 200
+
+
+def test_admin_pause_blocks_existing_approval_and_new_dispatch_without_changing_version(tmp_path):
+    cp, _, client, _, _, _, task_id = web_setup(tmp_path)
+    task = cp._task(task_id)
+    tool = ToolDefinition("feishu.task.create", frozenset({"task.write"}), RiskLevel.HIGH, side_effect=True)
+    proposal = cp.create_operation_proposal(task_id, "pause-test-step", "create_task", "task://pause-test", {}, tool)
+    approval = cp.get_approval_for_operation(proposal.operation_id)
+    assert approval is not None
+    version_before = dict(cp.store.get_agent_version("agent", 1))
+    url = "/api/meetings/agents/agent/pause"
+    body = {"expected_version": 1, "reason": "管理员发现运行异常"}
+    member_headers = {"X-CSRF-Token": client.get("/api/meetings").json()["csrf_token"]}
+    assert client.post(url, json=body, headers=member_headers).status_code == 403
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    assert client.post(url, json=body).status_code == 403
+    assert client.post(url, json={**body, "expected_version": 2}, headers=admin_headers).status_code == 409
+    assert client.post("/api/meetings/agents/missing/pause", json=body, headers=admin_headers).status_code == 409
+    assert cp._actor("agent").active
+    result = client.post(url, json=body, headers=admin_headers)
+    assert result.status_code == 200 and result.json()["status"] == "PAUSED"
+    assert client.post(url, json=body, headers=admin_headers).status_code == 409
+    assert next(a for a in client.get("/api/meetings/agents").json()["agents"] if a["agent_id"] == "agent")["status"] == "PAUSED"
+    assert next(a for a in client.get("/api/meetings/agents").json()["agents"] if a["agent_id"] == "agent")["pause_reason"] == body["reason"]
+    assert dict(cp.store.get_agent_version("agent", 1)) == version_before
+    assert len([a for a in cp.store.list_audits() if a["event_type"] == "AGENT_PAUSED"]) == 1
+    assert cp.authorize_operation(task_id, tool).allowed is False
+    with pytest.raises(PermissionError):
+        cp.create_task_run(task.requested_by, task.assistant_actor_id, task.agent_id, task.agent_version)
+    with pytest.raises(PermissionError):
+        cp.delegate(Delegation("paused-delegation", task_id, task.assistant_actor_id, task.agent_id,
+                               frozenset({"task.write"})))
+    callback = cp.handle_approval_callback("pause-event", approval.approval_id, "admin", True,
+                                           proposal.action_version, proposal.proposal_hash)
+    assert callback["accepted"] is False
+    assert cp.store.list_tool_calls(task_id) == []
+
+
+def test_pause_is_tenant_scoped_and_requires_current_active_version(tmp_path):
+    cp, _, client, _, _, _, _ = web_setup(tmp_path)
+    cp.register_actor(Actor("other-agent", "other", ActorType.BUSINESS_AGENT, frozenset({"task.read"})))
+    cp.register_agent_version(AgentVersion("other-agent", 1, frozenset({"task.read"})))
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    assert client.post("/api/meetings/agents/other-agent/pause", json={
+        "expected_version": 1, "reason": "核查跨租户隔离",
+    }, headers=admin_headers).status_code == 409
+    assert cp._actor("other-agent").active
+    assert client.post("/api/meetings/agents/assistant/pause", json={
+        "expected_version": None, "reason": "暂停当前个人助手",
+    }, headers=admin_headers).status_code == 200
+    assert not cp._actor("assistant").active
 
 
 def test_member_can_submit_agent_config_draft_without_changing_runtime(tmp_path):

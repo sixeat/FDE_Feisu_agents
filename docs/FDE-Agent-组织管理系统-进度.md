@@ -1747,3 +1747,13 @@ UNKNOWN 卡片不能自动重发，仍需远端核实工具。部署保留数据
 - 备份与运行边界：发布前使用 SQLite 在线备份接口保存 `/opt/fde-agent-stage/deploy/data/backups/20261011-audit-summary/control_plane.sqlite3` 并备份 Compose；仅重建控制平面。监听器和 Worker 保持原启动时间，Worker 仍为无网络、只读挂载和 `--dry-run`。本次没有执行飞书业务写入。
 - 下一步：域名访问恢复后，用管理员 H5 实际核对概览与认领状态；两个手机测试号再完成 OAuth 接入及成员隔离验收。
 
+### 2026-10-11 Agent 紧急暂停治理切片
+
+- 状态：本地实现、全量测试与线上增量部署完成；真实管理员 H5 暂停演练待执行。
+- 功能 ID：G-01、G-02、R-01、H-01。
+- 完成内容：Agent 目录新增管理员暂停入口，要求当前版本前置条件和暂停原因。服务端按租户、Agent 类型、活跃状态和版本原子更新，并在同一 SQLite 事务写入暂停原因和审计；管理员目录可见原因。暂停后的新任务创建、委托、会议审核提交、旧审批推进及工具写前派发均被现有或补充的权限门阻断。Agent 版本快照保持不变；未开放直接恢复按钮。
+- 验收结果：`tests/test_meeting_review_web.py` 与 `tests/test_control_plane_m1.py` 共 45 项通过；全项目 `196 passed`，4 项第三方弃用警告。新增测试覆盖管理员/普通成员、跨租户、版本失效、重复暂停、已有审批和后续调度阻断；JS 语法检查与 `git diff --check` 通过。
+- 部署与复核：发布前用 SQLite 在线备份保存 `/opt/fde-agent-stage/deploy/data/backups/20261011-agent-pause/control_plane.sqlite3`，`quick_check=ok`，并备份 Compose。控制平面与审批监听器同步使用 `fde-control-plane:agent-pause-20261011`，两服务已运行，控制平面 healthy、`/health` 返回 `ok`，匿名暂停接口返回 `401`，监听器日志为 `task_worker=OFF task_write=0`。Worker 未重启，仍为无网络、只读挂载和 `--dry-run`。
+- 未覆盖边界：紧急暂停不会撤销已发出的远端请求，处于 `DISPATCHED`/`UNKNOWN` 的写入仍须对账；现有活跃任务的状态未批量改写，界面需进一步标明受暂停影响的任务。恢复需另做审批和版本复核。手机测试号的 OAuth 接入仍被网络访问问题阻断。
+- 下一步：域名访问恢复后，用管理员 H5 对专用测试 Agent 演练暂停并复核审计、原因展示；继续处理手机测试号网络路径与多人接入验收。
+

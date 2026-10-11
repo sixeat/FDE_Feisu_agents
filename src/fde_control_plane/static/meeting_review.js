@@ -3,9 +3,10 @@ const $ = id => document.getElementById(id);
 const state = { csrf: "", members: [], detail: null, dirty: false, busy: false };
 const ownerState = {csrf:"", tasks:[], busy:false, drafts:new Map(), retries:new Map()};
 const organizerState = {csrf:"", tasks:[], busy:false};
-const agentState = {agents:[], drafts:[], memberRequests:[], csrf:"", canPrecheck:false, canConfirm:false, canPause:false, busy:false};
+const agentState = {agents:[], drafts:[], csrf:"", canPrecheck:false, canConfirm:false, canPause:false, busy:false};
+const memberState = {requests:[], csrf:"", busy:false};
 const auditState = {events:[], counts:{}, summary:{}, csrf:"", busy:false, canView:false};
-const viewNames={meetings:"会议审核","owner-tasks":"我的待办","organizer-tasks":"发起的任务","follow-up":"跟进概览",agents:"Agent 管理",audit:"审计运维"};
+const viewNames={meetings:"会议审核","owner-tasks":"我的待办","organizer-tasks":"发起的任务","follow-up":"跟进概览",agents:"Agent 管理",members:"成员与组织",audit:"审计运维"};
 let activeView="";
 const ownerStatusNames = {WAITING_OWNER:"等待你确认",IN_PROGRESS:"已接受，进行中",WAITING_HUMAN:"已退回，等待会议发起人处理",COMPLETED:"已完成",CANCELLED:"已取消",UNKNOWN:"等待核验",DUE_SOON:"即将到期",OVERDUE:"已逾期"};
 const taskNames = {WAITING_REVIEW:"待核对",WAITING_APPROVAL:"待审批",CANCELLED:"已取消",RUNNING:"执行中",RECONCILING:"待核验",SUCCEEDED:"已完成",PARTIAL_SUCCESS:"部分完成",FAILED:"执行失败"};
@@ -192,29 +193,41 @@ function renderAgentDrafts() {
   });
 }
 function renderMemberAccess() {
-  const section=$("member-access-panel"),panel=$("member-access-list");section.hidden=!agentState.canConfirm;panel.replaceChildren();
-  if(!agentState.canConfirm)return;
-  if(!agentState.memberRequests.length){panel.append(node("p","暂无待批准成员。","muted"));return;}
-  agentState.memberRequests.forEach(item=>{
+  const panel=$("member-access-list");panel.replaceChildren();
+  if(!memberState.requests.length){panel.append(node("p","暂无待批准成员。","muted"));return;}
+  memberState.requests.forEach(item=>{
     const row=node("article",undefined,"agent-draft-row"),button=node("button","批准接入","primary");
     button.type="button";button.addEventListener("click",()=>approveMemberAccess(item,button));
     row.append(node("h3",item.request_id),node("p",`申请时间：${item.created_at}。请先与该成员确认识别码。`,"muted"),button);panel.append(row);
   });
 }
-async function approveMemberAccess(item,button) {
-  if(agentState.busy)return;
-  if(!window.confirm(`已与成员核对识别码 ${item.request_id}？批准后该成员可登录工作台。`))return;
-  agentState.busy=true;button.disabled=true;agentNotice("正在批准成员接入…");
+function memberNotice(message,type="") {
+  const panel=$("members-notice");panel.textContent=message;panel.className=type;panel.hidden=!message;
+}
+async function loadMembers() {
+  if(memberState.busy)return;
+  memberState.busy=true;$("members-reload").disabled=true;memberNotice("");
   try{
-    await api(`/api/meetings/member-access-requests/${encodeURIComponent(item.request_id)}/approve`,{method:"POST",headers:{"X-CSRF-Token":agentState.csrf}});
-    agentNotice("成员已绑定。请让该成员重新打开工作台。","success");
-    agentState.memberRequests=(await api("/api/meetings/member-access-requests")).requests||[];renderMemberAccess();
-  }catch(error){agentNotice(error.message,"error");button.disabled=false;}
-  finally{agentState.busy=false;}
+    const data=await api("/api/meetings/member-access-requests");
+    memberState.requests=data.requests||[];memberState.csrf=data.csrf_token;
+    renderMemberAccess();
+  }catch(error){memberNotice(error.message,"error");}
+  finally{memberState.busy=false;$("members-reload").disabled=false;}
+}
+async function approveMemberAccess(item,button) {
+  if(memberState.busy)return;
+  if(!window.confirm(`已与成员核对识别码 ${item.request_id}？批准后该成员可登录工作台。`))return;
+  memberState.busy=true;button.disabled=true;memberNotice("正在批准成员接入…");
+  try{
+    await api(`/api/meetings/member-access-requests/${encodeURIComponent(item.request_id)}/approve`,{method:"POST",headers:{"X-CSRF-Token":memberState.csrf}});
+    memberNotice("成员已绑定。请让该成员重新打开工作台。","success");
+    const data=await api("/api/meetings/member-access-requests");memberState.requests=data.requests||[];memberState.csrf=data.csrf_token;renderMemberAccess();
+  }catch(error){memberNotice(error.message,"error");button.disabled=false;}
+  finally{memberState.busy=false;}
 }
 async function loadAgents() {
   if(agentState.busy)return;agentState.busy=true;$("agents-reload").disabled=true;$("agent-list").setAttribute("aria-busy","true");
-  try{const data=await api("/api/meetings/agents");const drafts=await api("/api/meetings/agent-drafts");agentState.agents=data.agents||[];agentState.drafts=drafts.drafts||[];agentState.canPause=Boolean(data.can_pause);agentState.canPrecheck=Boolean(drafts.can_precheck);agentState.canConfirm=Boolean(drafts.can_confirm);agentState.csrf=drafts.csrf_token;agentState.memberRequests=agentState.canConfirm?(await api("/api/meetings/member-access-requests")).requests||[]:[];renderAgents();renderAgentDrafts();renderMemberAccess();agentNotice("");}
+  try{const data=await api("/api/meetings/agents");const drafts=await api("/api/meetings/agent-drafts");agentState.agents=data.agents||[];agentState.drafts=drafts.drafts||[];agentState.canPause=Boolean(data.can_pause);agentState.canPrecheck=Boolean(drafts.can_precheck);agentState.canConfirm=Boolean(drafts.can_confirm);agentState.csrf=drafts.csrf_token;renderAgents();renderAgentDrafts();agentNotice("");}
   catch(error){agentNotice(error.message,"error");if(!agentState.agents.length)$("agent-list").replaceChildren(node("p","Agent 目录暂时无法加载，请稍后刷新。","muted"));}
   finally{agentState.busy=false;$("agents-reload").disabled=false;$("agent-list").setAttribute("aria-busy","false");}
 }
@@ -275,7 +288,7 @@ async function triageAudit(item,status,resolution){
 }
 async function loadAudit() {
   if(auditState.busy)return;auditState.busy=true;$("audit-reload").disabled=true;$("audit-list").setAttribute("aria-busy","true");
-  try{const data=await api("/api/meetings/audit");auditState.canView=Boolean(data.can_view);auditState.events=data.events||[];auditState.counts=data.counts||{};auditState.summary=data.summary||{};auditState.csrf=data.csrf_token||"";$("module-audit").hidden=!auditState.canView;$("audit-counts").textContent=Object.entries(auditState.counts).map(([key,value])=>`${key} ${value}`).join(" · ");renderAuditSummary();renderAudit();}
+  try{const data=await api("/api/meetings/audit");auditState.canView=Boolean(data.can_view);auditState.events=data.events||[];auditState.counts=data.counts||{};auditState.summary=data.summary||{};auditState.csrf=data.csrf_token||"";$("module-audit").hidden=!auditState.canView;$("module-members").hidden=!auditState.canView;$("audit-counts").textContent=Object.entries(auditState.counts).map(([key,value])=>`${key} ${value}`).join(" · ");renderAuditSummary();renderAudit();}
   catch(error){auditNotice(error.message,"error");}
   finally{auditState.busy=false;$("audit-reload").disabled=false;$("audit-list").setAttribute("aria-busy","false");}
 }
@@ -440,12 +453,14 @@ $("owner-reload").addEventListener("click",loadOwnerTasks);
 $("organizer-reload").addEventListener("click",loadOrganizerTasks);
 $("follow-up-reload").addEventListener("click",refreshDigest);
 $("agents-reload").addEventListener("click",loadAgents);
+$("members-reload").addEventListener("click",loadMembers);
 $("audit-reload").addEventListener("click",loadAudit);
 $("agent-draft-toggle").addEventListener("click",()=>{const editor=$("agent-draft-editor");editor.hidden=!editor.hidden;if(!editor.hidden)$("agent-draft-name").focus();});
 $("agent-draft-cancel").addEventListener("click",()=>{$("agent-draft-form").reset();$("agent-draft-editor").hidden=true;});
 $("agent-draft-form").addEventListener("submit",submitAgentDraft);
 function showView(view,{updateHash=true}={}) {
   if(!Object.hasOwn(viewNames,view))view="meetings";
+  if($("module-"+view).hidden)view="meetings";
   if(view===activeView)return true;
   if(state.dirty&&activeView==="meetings"&&!window.confirm("会议草稿尚未保存，确定切换栏目？")){
     if(updateHash===false)history.replaceState(null,"",`#${activeView}`);
@@ -466,6 +481,7 @@ function showView(view,{updateHash=true}={}) {
   if(view==="organizer-tasks")loadOrganizerTasks();
   if(view==="follow-up")refreshDigest();
   if(view==="agents")loadAgents();
+  if(view==="members")loadMembers();
   if(view==="audit")loadAudit();
   return true;
 }
@@ -474,11 +490,11 @@ $("module-nav").querySelectorAll("button").forEach(button=>{
   button.addEventListener("keydown",event=>{
     if(!["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].includes(event.key))return;
     event.preventDefault();const keys=Object.keys(viewNames),index=keys.indexOf(button.dataset.view);
-    const next=keys[(index+(event.key==="ArrowUp"||event.key==="ArrowLeft"?-1:1)+keys.length)%keys.length];
+    const visible=keys.filter(key=>!$("module-"+key).hidden),visibleIndex=visible.indexOf(button.dataset.view);
+    const next=visible[(visibleIndex+(event.key==="ArrowUp"||event.key==="ArrowLeft"?-1:1)+visible.length)%visible.length];
     if(showView(next))$(`module-${next}`).focus();
   });
 });
 window.addEventListener("hashchange",()=>showView(location.hash.slice(1),{updateHash:false}));
 window.addEventListener("popstate",()=>showView(location.hash.slice(1),{updateHash:false}));
-showView(location.hash.slice(1));
-loadAudit();
+loadAudit().then(()=>showView(location.hash.slice(1)));

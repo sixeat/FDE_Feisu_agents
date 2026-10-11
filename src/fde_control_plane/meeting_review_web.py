@@ -742,9 +742,10 @@ def build_meeting_review_router(
                     "csrf_token": csrf_token(request.cookies["fde_auth_session"])}
 
     @router.get("/member-access-requests")
-    def member_access_requests(identity: IdentityContext = Depends(require_identity)):
+    def member_access_requests(request: Request, identity: IdentityContext = Depends(require_identity)):
         with service.lock:
-            return {"requests": service.pending_member_access(identity)}
+            return {"requests": service.pending_member_access(identity),
+                    "csrf_token": csrf_token(request.cookies["fde_auth_session"])}
 
     @router.get("/audit")
     def get_audit(request: Request, identity: IdentityContext = Depends(require_identity)):

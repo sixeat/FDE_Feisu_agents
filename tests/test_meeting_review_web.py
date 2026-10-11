@@ -94,6 +94,7 @@ def test_member_access_requires_admin_and_preserves_meeting_isolation(tmp_path):
     listed = client.get("/api/meetings/member-access-requests")
     assert listed.status_code == 200
     assert listed.json()["requests"][0]["request_id"] == "member-request-test2"
+    assert listed.json()["csrf_token"] == admin_headers["X-CSRF-Token"]
     assert subject_hash not in listed.text
     assert client.post(url).status_code == 403
     approved = client.post(url, headers=admin_headers)

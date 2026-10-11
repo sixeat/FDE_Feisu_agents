@@ -1210,3 +1210,18 @@ class SQLiteStore:
     def list_audits(self) -> list[dict[str, Any]]:
         rows = self.connection.execute("SELECT data_json FROM audit_events ORDER BY rowid").fetchall()
         return [json.loads(row["data_json"]) for row in rows]
+
+    def list_tenant_audits(self, tenant_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Return newest audit rows for one tenant, including database timestamps."""
+        bounded_limit = max(1, min(int(limit), 200))
+        rows = self.connection.execute(
+            "SELECT data_json, created_at FROM audit_events "
+            "WHERE tenant_id = ? ORDER BY rowid DESC LIMIT ?",
+            (tenant_id, bounded_limit),
+        ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = json.loads(row["data_json"])
+            item["created_at"] = row["created_at"]
+            items.append(item)
+        return items

@@ -105,6 +105,25 @@ def test_member_access_requires_admin_and_preserves_meeting_isolation(tmp_path):
     assert client.post(url, headers=second_headers).status_code == 403
 
 
+def test_audit_view_is_admin_only_tenant_scoped_and_redacted(tmp_path):
+    cp, _, client, _, _, _, task_id = web_setup(tmp_path)
+    member_view = client.get("/api/meetings/audit")
+    assert member_view.status_code == 200
+    assert member_view.json() == {"can_view": False, "events": [], "counts": {}}
+
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    result = client.get("/api/meetings/audit")
+    assert result.status_code == 200
+    body = result.json()
+    assert body["can_view"] is True
+    assert body["events"]
+    assert all(set(item) <= {"event_type", "outcome", "created_at", "audit_ref", "payload_ref", "task_ref"}
+               for item in body["events"])
+    assert task_id not in result.text
+    assert "admin-subject" not in result.text
+    assert any(item["event_type"] == "TASK_CREATED" for item in body["events"])
+
+
 def test_daily_digest_preview_is_authenticated_redacted_and_unsent(tmp_path):
     cp, _, client, _, _, _, task_id = web_setup(tmp_path)
     empty = client.get("/api/meetings/digest?business_date=2026-10-05").json()

@@ -4,7 +4,8 @@ const state = { csrf: "", members: [], detail: null, dirty: false, busy: false }
 const ownerState = {csrf:"", tasks:[], busy:false, drafts:new Map(), retries:new Map()};
 const organizerState = {csrf:"", tasks:[], busy:false};
 const agentState = {agents:[], drafts:[], memberRequests:[], csrf:"", canPrecheck:false, canConfirm:false, busy:false};
-const viewNames={meetings:"会议审核","owner-tasks":"我的待办","organizer-tasks":"发起的任务","follow-up":"跟进概览",agents:"Agent 管理"};
+const auditState = {events:[], counts:{}, busy:false, canView:false};
+const viewNames={meetings:"会议审核","owner-tasks":"我的待办","organizer-tasks":"发起的任务","follow-up":"跟进概览",agents:"Agent 管理",audit:"审计运维"};
 let activeView="";
 const ownerStatusNames = {WAITING_OWNER:"等待你确认",IN_PROGRESS:"已接受，进行中",WAITING_HUMAN:"已退回，等待会议发起人处理",COMPLETED:"已完成",CANCELLED:"已取消",UNKNOWN:"等待核验",DUE_SOON:"即将到期",OVERDUE:"已逾期"};
 const taskNames = {WAITING_REVIEW:"待核对",WAITING_APPROVAL:"待审批",CANCELLED:"已取消",RUNNING:"执行中",RECONCILING:"待核验",SUCCEEDED:"已完成",PARTIAL_SUCCESS:"部分完成",FAILED:"执行失败"};
@@ -196,6 +197,26 @@ async function loadAgents() {
   catch(error){agentNotice(error.message,"error");if(!agentState.agents.length)$("agent-list").replaceChildren(node("p","Agent 目录暂时无法加载，请稍后刷新。","muted"));}
   finally{agentState.busy=false;$("agents-reload").disabled=false;$("agent-list").setAttribute("aria-busy","false");}
 }
+function auditNotice(message,type="") { const panel=$("audit-notice");panel.textContent=message;panel.className=type;panel.hidden=!message; }
+function renderAudit() {
+  const panel=$("audit-list");panel.replaceChildren();
+  if(!auditState.events.length){panel.append(node("p","暂无审计事件。","muted"));return;}
+  auditState.events.forEach(item=>{
+    const row=node("article",undefined,"audit-row"),head=node("div",undefined,"audit-row-head");
+    const positive=["ACCEPTED","APPROVED","SUCCEEDED"].includes(item.outcome);
+    const negative=["DENIED","ERROR","FAILED"].includes(item.outcome);
+    head.append(node("strong",item.event_type),node("span",item.outcome,`badge ${positive?"ready":negative?"closed":""}`));
+    row.append(head,node("p",`${item.created_at} · 审计 ${item.audit_ref} · 载荷 ${item.payload_ref}`,"muted"));
+    if(item.task_ref)row.append(node("p",`任务引用：${item.task_ref}`,"audit-ref"));
+    panel.append(row);
+  });
+}
+async function loadAudit() {
+  if(auditState.busy)return;auditState.busy=true;$("audit-reload").disabled=true;$("audit-list").setAttribute("aria-busy","true");
+  try{const data=await api("/api/meetings/audit");auditState.canView=Boolean(data.can_view);auditState.events=data.events||[];auditState.counts=data.counts||{};$("module-audit").hidden=!auditState.canView;$("audit-counts").textContent=Object.entries(auditState.counts).map(([key,value])=>`${key} ${value}`).join(" · ");renderAudit();auditNotice("");}
+  catch(error){auditNotice(error.message,"error");}
+  finally{auditState.busy=false;$("audit-reload").disabled=false;$("audit-list").setAttribute("aria-busy","false");}
+}
 async function precheckAgentDraft(draft,button) {
   if(agentState.busy)return;
   agentState.busy=true;button.disabled=true;agentNotice(`正在预审“${draft.name}”…`);
@@ -357,6 +378,7 @@ $("owner-reload").addEventListener("click",loadOwnerTasks);
 $("organizer-reload").addEventListener("click",loadOrganizerTasks);
 $("follow-up-reload").addEventListener("click",refreshDigest);
 $("agents-reload").addEventListener("click",loadAgents);
+$("audit-reload").addEventListener("click",loadAudit);
 $("agent-draft-toggle").addEventListener("click",()=>{const editor=$("agent-draft-editor");editor.hidden=!editor.hidden;if(!editor.hidden)$("agent-draft-name").focus();});
 $("agent-draft-cancel").addEventListener("click",()=>{$("agent-draft-form").reset();$("agent-draft-editor").hidden=true;});
 $("agent-draft-form").addEventListener("submit",submitAgentDraft);
@@ -382,6 +404,7 @@ function showView(view,{updateHash=true}={}) {
   if(view==="organizer-tasks")loadOrganizerTasks();
   if(view==="follow-up")refreshDigest();
   if(view==="agents")loadAgents();
+  if(view==="audit")loadAudit();
   return true;
 }
 $("module-nav").querySelectorAll("button").forEach(button=>{
@@ -396,3 +419,4 @@ $("module-nav").querySelectorAll("button").forEach(button=>{
 window.addEventListener("hashchange",()=>showView(location.hash.slice(1),{updateHash:false}));
 window.addEventListener("popstate",()=>showView(location.hash.slice(1),{updateHash:false}));
 showView(location.hash.slice(1));
+loadAudit();

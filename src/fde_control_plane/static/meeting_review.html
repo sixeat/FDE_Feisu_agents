@@ -18,6 +18,7 @@
         <button id="module-organizer-tasks" type="button" role="tab" aria-selected="false" aria-controls="view-organizer-tasks" data-view="organizer-tasks"><span>发起任务</span></button>
         <button id="module-follow-up" type="button" role="tab" aria-selected="false" aria-controls="view-follow-up" data-view="follow-up"><span>跟进概览</span></button>
         <button id="module-agents" type="button" role="tab" aria-selected="false" aria-controls="view-agents" data-view="agents"><span>Agent</span></button>
+        <button id="module-audit" type="button" role="tab" aria-selected="false" aria-controls="view-audit" data-view="audit" hidden><span>审计运维</span></button>
       </nav>
       <section id="meeting-context" class="meeting-context" aria-label="我的会议">
         <h2>我的会议</h2><nav id="meetings"></nav>
@@ -58,6 +59,10 @@
         <section class="agent-registry" aria-labelledby="agent-registry-title"><div class="owner-heading"><h2 id="agent-registry-title">Agent 目录</h2></div><div id="agents-notice" role="status" aria-live="polite" hidden></div><div id="agent-list" aria-busy="true"><p class="muted">正在加载 Agent…</p></div></section>
         <section class="agent-drafts" aria-labelledby="agent-drafts-title"><div class="owner-heading"><h2 id="agent-drafts-title">配置草稿</h2></div><div id="agent-draft-list" aria-busy="true"><p class="muted">正在加载配置草稿…</p></div></section>
         <section id="member-access-panel" class="agent-drafts" aria-labelledby="member-access-title" hidden><div class="owner-heading"><h2 id="member-access-title">成员接入申请</h2></div><p class="muted">新成员先用自己的飞书账号打开工作台，核对申请识别码后由管理员批准。部门权限尚未启用。</p><div id="member-access-list"></div></section>
+      </section>
+      <section id="view-audit" class="view-panel" role="tabpanel" aria-labelledby="module-audit" hidden>
+        <div class="heading"><div><p class="eyebrow">组织治理</p><h1>审计与运维</h1><p class="muted">只显示当前租户的脱敏事件摘要，用于核对 Agent、审批和工具执行结果。</p></div><button id="audit-reload" type="button">刷新日志</button></div>
+        <section class="audit-panel" aria-labelledby="audit-title"><div class="owner-heading"><h2 id="audit-title">最近事件</h2><span id="audit-counts" class="muted"></span></div><div id="audit-notice" role="status" aria-live="polite" hidden></div><div id="audit-list" aria-busy="true"><p class="muted">正在加载审计事件…</p></div></section>
       </section>
     </main>
   </div>

@@ -148,6 +148,28 @@ class MeetingReviewWebService:
         return (identity.auth_mode == "user_oauth" and actor.actor_type.value == "USER"
                 and bool(actor.roles & AGENT_ADMIN_ROLES))
 
+    def audit_events(self, identity: IdentityContext, limit: int = 100) -> dict[str, Any]:
+        """Return a redacted audit view for administrators only."""
+        if not self.can_confirm_agent_config(identity):
+            return {"can_view": False, "events": [], "counts": {}}
+        events = []
+        for item in self.cp.store.list_tenant_audits(identity.tenant_id, limit):
+            event = {
+                "event_type": str(item.get("event_type", "UNKNOWN")),
+                "outcome": str(item.get("outcome", "UNKNOWN")),
+                "created_at": str(item.get("created_at", "")),
+                "audit_ref": hashlib.sha256(str(item.get("audit_id", "")).encode()).hexdigest()[:12],
+                "payload_ref": str(item.get("payload_hash", ""))[:12],
+            }
+            if item.get("task_run_id"):
+                event["task_ref"] = hashlib.sha256(str(item["task_run_id"]).encode()).hexdigest()[:12]
+            events.append(event)
+        counts: dict[str, int] = {}
+        for event in events:
+            key = event["outcome"]
+            counts[key] = counts.get(key, 0) + 1
+        return {"can_view": True, "events": events, "counts": counts}
+
     def pending_member_access(self, identity: IdentityContext) -> list[dict[str, Any]]:
         if not self.can_confirm_agent_config(identity):
             raise HTTPException(403, "只有管理员可以查看成员接入申请")
@@ -615,6 +637,11 @@ def build_meeting_review_router(
     def member_access_requests(identity: IdentityContext = Depends(require_identity)):
         with service.lock:
             return {"requests": service.pending_member_access(identity)}
+
+    @router.get("/audit")
+    def get_audit(identity: IdentityContext = Depends(require_identity)):
+        with service.lock:
+            return service.audit_events(identity)
 
     @router.post("/member-access-requests/{request_id}/approve")
     def approve_member_access(request_id: str, request: Request,

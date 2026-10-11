@@ -99,8 +99,8 @@ def test_member_access_requires_admin_and_preserves_meeting_isolation(tmp_path):
     assert subject_hash not in listed.text
     directory = client.get("/api/meetings/member-directory")
     assert directory.status_code == 200
-    assert directory.json()["members"] == [{"actor_id": "admin", "role": "ADMIN", "status": "ACTIVE", "joined_at": None},
-                                            {"actor_id": "member", "role": "MEMBER", "status": "ACTIVE", "joined_at": None}]
+    assert directory.json()["members"] == [{"actor_id": "admin", "role": "ADMIN", "status": "ACTIVE", "joined_at": None, "status_reason": None},
+                                            {"actor_id": "member", "role": "MEMBER", "status": "ACTIVE", "joined_at": None, "status_reason": None}]
     assert "admin-subject" not in directory.text
     assert client.post(url).status_code == 403
     approved = client.post(url, headers=admin_headers)
@@ -208,7 +208,7 @@ def test_audit_summary_counts_tenant_tool_status_without_exposing_call_details(t
         "INSERT INTO tool_calls(tool_call_id, write_idempotency_key, status, data_json) VALUES (?, ?, ?, ?)",
         ("other-secret-call", "other-secret-key", "FAILED", json.dumps({"task_run_id": "other-secret-task"})),
     )
-    switch_user(cp, client, "admin", "admin-subject")
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
     response = client.get("/api/meetings/audit")
     assert response.json()["summary"]["tool_calls"] == {"UNKNOWN": 1}
     assert "secret" not in response.text
@@ -256,6 +256,35 @@ def test_agent_directory_is_tenant_scoped_and_redacts_external_identity(tmp_path
     assert "external_ref_hash" not in response.text
     assert "admin-subject" not in response.text
     assert client.get("/api/meetings").status_code == 200
+
+
+def test_member_status_change_is_admin_only_atomic_and_reversible(tmp_path):
+    cp, _, client, _, _, _, _ = web_setup(tmp_path)
+    member_headers = switch_user(cp, client, "member", SUBJECT)
+    body = {"expected_status": "ACTIVE", "status": "INACTIVE", "reason": "成员账号暂时停用"}
+    url = "/api/meetings/member-directory/member/status"
+    assert client.post(url, json=body, headers=member_headers).status_code == 403
+
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    assert client.post("/api/meetings/member-directory/admin/status", json=body, headers=admin_headers).status_code == 409
+    assert client.post("/api/meetings/member-directory/member/status", json={**body, "expected_status": "INACTIVE"}, headers=admin_headers).status_code == 422
+    changed = client.post(url, json=body, headers=admin_headers)
+    assert changed.status_code == 200
+    assert changed.json() == {"actor_id": "member", "status": "INACTIVE", "remote_write": False}
+    row = next(item for item in client.get("/api/meetings/member-directory").json()["members"] if item["actor_id"] == "member")
+    assert row["status"] == "INACTIVE" and row["status_reason"] == body["reason"]
+    assert not cp._actor("member").active
+    assert any(a["event_type"] == "MEMBER_STATUS_CHANGED" for a in cp.store.list_audits())
+
+    with pytest.raises(PermissionError):
+        cp.verify_identity(IdentityContext("tenant", "member", "user_oauth", SUBJECT))
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    restored = client.post(url, json={
+        "expected_status": "INACTIVE", "status": "ACTIVE", "reason": "成员账号复核通过",
+    }, headers=admin_headers)
+    assert restored.status_code == 200
+    row = next(item for item in client.get("/api/meetings/member-directory").json()["members"] if item["actor_id"] == "member")
+    assert row["status"] == "ACTIVE" and row["status_reason"] == "成员账号复核通过"
 
 
 def test_admin_pause_blocks_existing_approval_and_new_dispatch_without_changing_version(tmp_path):

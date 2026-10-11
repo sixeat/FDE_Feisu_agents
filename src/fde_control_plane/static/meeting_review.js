@@ -208,8 +208,34 @@ function renderMemberDirectory() {
     const row=node("article",undefined,"member-row"),head=node("div",undefined,"agent-row-head");
     head.append(node("h3",member.actor_id),node("span",member.status==="ACTIVE"?"已启用":"已停用",`badge ${member.status==="ACTIVE"?"ready":"closed"}`));
     row.append(head,node("p",`应用角色：${member.role==="ADMIN"?"管理员":"普通成员"} · 接入时间：${member.joined_at||"初始绑定"}`,"muted"));
+    if(member.status_reason)row.append(node("p",`最近处置：${member.status_reason}`,"muted"));
+    if(member.role!=="ADMIN"){
+      const button=node("button",member.status==="ACTIVE"?"停用成员":"恢复成员");button.type="button";
+      button.addEventListener("click",()=>changeMemberStatus(member,button));
+      row.append(button);
+    }
     panel.append(row);
   });
+}
+async function changeMemberStatus(member,button){
+  if(memberState.busy)return;
+  const next=member.status==="ACTIVE"?"INACTIVE":"ACTIVE";
+  const label=next==="ACTIVE"?"恢复":"停用";
+  const reason=window.prompt(`${label}成员“${member.actor_id}”的原因（至少 5 个字）：`);
+  if(reason===null)return;
+  if(reason.trim().length<5){memberNotice("请填写至少 5 个字的原因。","error");return;}
+  if(!window.confirm(`确认${label}成员“${member.actor_id}”？`))return;
+  memberState.busy=true;button.disabled=true;memberNotice(`正在${label}成员…`);
+  try{
+    await api(`/api/meetings/member-directory/${encodeURIComponent(member.actor_id)}/status`,{
+      method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":memberState.csrf},
+      body:JSON.stringify({expected_status:member.status,status:next,reason:reason.trim()})
+    });
+    memberNotice(`成员已${next==="ACTIVE"?"恢复":"停用"}。`,"success");
+    memberState.busy=false;
+    await loadMembers();
+  }catch(error){memberNotice(error.message,"error");button.disabled=false;}
+  finally{memberState.busy=false;}
 }
 function memberNotice(message,type="") {
   const panel=$("members-notice");panel.textContent=message;panel.className=type;panel.hidden=!message;

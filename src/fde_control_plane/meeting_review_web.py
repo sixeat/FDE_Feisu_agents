@@ -80,6 +80,13 @@ class AgentPauseRequest(BaseModel):
     reason: StrictStr = Field(min_length=5, max_length=500)
 
 
+class MemberStatusRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_status: Literal["ACTIVE", "INACTIVE"]
+    status: Literal["ACTIVE", "INACTIVE"]
+    reason: StrictStr = Field(min_length=5, max_length=500)
+
+
 class AuditTriageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_status: Literal["OPEN", "ACKNOWLEDGED"]
@@ -280,12 +287,44 @@ class MeetingReviewWebService:
     def member_directory(self, identity: IdentityContext) -> list[dict[str, Any]]:
         if not self.can_confirm_agent_config(identity):
             raise HTTPException(403, "只有管理员可以查看成员目录")
+        changes = self.cp.store.latest_member_status_changes(identity.tenant_id)
         return [{
             "actor_id": row["actor_id"],
             "role": "ADMIN" if "admin" in json.loads(row["roles_json"]) else "MEMBER",
             "status": "ACTIVE" if row["active"] else "INACTIVE",
             "joined_at": row["joined_at"],
+            "status_reason": changes[row["actor_id"]]["reason"] if row["actor_id"] in changes else None,
         } for row in self.cp.store.list_member_directory(identity.tenant_id)]
+
+    def set_member_status(self, actor_id: str, identity: IdentityContext,
+                          body: MemberStatusRequest) -> dict[str, Any]:
+        if not self.can_confirm_agent_config(identity):
+            raise HTTPException(403, "只有管理员可以变更成员状态")
+        if actor_id == identity.actor_id:
+            raise HTTPException(409, "不能通过此入口停用当前管理员")
+        target = self.cp.store.get_actor(actor_id)
+        if target is None or target["tenant_id"] != identity.tenant_id or target["actor_type"] != "USER" \
+                or not target["external_ref_hash"]:
+            raise HTTPException(404, "成员不存在或不属于当前租户")
+        if "admin" in json.loads(target["roles_json"]):
+            raise HTTPException(409, "不能通过此入口变更管理员状态")
+        if body.expected_status == body.status:
+            raise HTTPException(422, "目标状态必须与当前状态不同")
+        expected_active = body.expected_status == "ACTIVE"
+        active = body.status == "ACTIVE"
+        reason = body.reason.strip()
+        payload = {"actor_id": actor_id, "expected_status": body.expected_status,
+                   "status": body.status, "reason": reason}
+        event = AuditEvent(
+            audit_id="audit-" + secrets.token_hex(12), event_type="MEMBER_STATUS_CHANGED",
+            tenant_id=identity.tenant_id, actor_id=identity.actor_id,
+            task_run_id=None, correlation_id=None,
+            payload_hash=hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode()).hexdigest(),
+            outcome=body.status,
+        )
+        if not self.cp.store.set_member_active(identity.tenant_id, actor_id, expected_active, active, reason, event):
+            raise HTTPException(409, "成员状态已变化，请刷新目录后核对")
+        return {"actor_id": actor_id, "status": body.status, "remote_write": False}
 
     def approve_member_access(self, request_id: str, identity: IdentityContext) -> dict[str, Any]:
         if not self.can_confirm_agent_config(identity):
@@ -761,6 +800,13 @@ def build_meeting_review_router(
     def member_directory(identity: IdentityContext = Depends(require_identity)):
         with service.lock:
             return {"members": service.member_directory(identity)}
+
+    @router.post("/member-directory/{actor_id}/status")
+    def set_member_status(actor_id: str, body: MemberStatusRequest, request: Request,
+                          identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        with service.lock:
+            return service.set_member_status(actor_id, identity, body)
 
     @router.get("/audit")
     def get_audit(request: Request, identity: IdentityContext = Depends(require_identity)):

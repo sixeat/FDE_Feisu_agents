@@ -63,6 +63,12 @@ class SQLiteStore:
             );
             CREATE INDEX IF NOT EXISTS idx_member_access_requests_pending
                 ON member_access_requests(tenant_id, status, created_at);
+            CREATE TABLE IF NOT EXISTS member_status_changes (
+                audit_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL, active INTEGER NOT NULL,
+                decided_by TEXT NOT NULL, reason TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS agent_versions (
                 agent_id TEXT NOT NULL, version INTEGER NOT NULL,
                 capabilities_json TEXT NOT NULL, active INTEGER NOT NULL,
@@ -897,6 +903,43 @@ class SQLiteStore:
             "WHERE a.tenant_id = ? AND a.actor_type = 'USER' AND a.external_ref_hash IS NOT NULL "
             "ORDER BY a.actor_id", (tenant_id,),
         ).fetchall()
+
+    def set_member_active(self, tenant_id: str, actor_id: str, expected_active: bool,
+                          active: bool, reason: str, event: Any) -> bool:
+        """Change one member's active state and audit it in one transaction."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            updated = self.connection.execute(
+                "UPDATE actors SET active = ? WHERE tenant_id = ? AND actor_id = ? "
+                "AND actor_type = 'USER' AND external_ref_hash IS NOT NULL AND active = ?",
+                (int(active), tenant_id, actor_id, int(expected_active)),
+            )
+            if updated.rowcount != 1:
+                self.connection.rollback()
+                return False
+            self.connection.execute(
+                "INSERT INTO member_status_changes(audit_id, tenant_id, actor_id, active, decided_by, reason) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (event.audit_id, tenant_id, actor_id, int(active), event.actor_id, reason),
+            )
+            self.connection.execute(
+                "INSERT INTO audit_events(audit_id, event_type, tenant_id, task_run_id, data_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (event.audit_id, event.event_type, event.tenant_id, event.task_run_id,
+                 self._json(asdict(event))),
+            )
+            self.connection.commit()
+            return True
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def latest_member_status_changes(self, tenant_id: str) -> dict[str, sqlite3.Row]:
+        rows = self.connection.execute(
+            "SELECT actor_id, active, reason, created_at FROM member_status_changes "
+            "WHERE tenant_id = ? ORDER BY rowid DESC", (tenant_id,),
+        ).fetchall()
+        return {row["actor_id"]: row for row in reversed(rows)}
 
     def save_meeting_todo(self, draft: Any) -> None:
         self.connection.execute(

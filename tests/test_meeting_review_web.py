@@ -253,6 +253,7 @@ def test_agent_directory_is_tenant_scoped_and_redacts_external_identity(tmp_path
     assistant = next(item for item in agents if item["agent_id"] == "assistant")
     assert assistant["status"] == "UNVERSIONED"
     assert assistant["current_version"] is None
+    assert response.json()["can_resume"] is False
     assert "external_ref_hash" not in response.text
     assert "admin-subject" not in response.text
     assert client.get("/api/meetings").status_code == 200
@@ -321,6 +322,24 @@ def test_admin_pause_blocks_existing_approval_and_new_dispatch_without_changing_
                                            proposal.action_version, proposal.proposal_hash)
     assert callback["accepted"] is False
     assert cp.store.list_tool_calls(task_id) == []
+
+    resume_url = "/api/meetings/agents/agent/resume"
+    assert client.post(resume_url, json={"expected_version": 1, "reason": "管理员复核完成"},
+                       headers=member_headers).status_code == 403
+    assert client.post(resume_url, json={"expected_version": 2, "reason": "管理员复核完成"},
+                       headers=admin_headers).status_code == 409
+    resumed = client.post(resume_url, json={"expected_version": 1, "reason": "管理员复核完成"},
+                          headers=admin_headers)
+    assert resumed.status_code == 200
+    assert resumed.json() == {"agent_id": "agent", "status": "ACTIVE", "remote_write": False}
+    assert cp._actor("agent").active
+    resumed_agent = next(a for a in client.get("/api/meetings/agents").json()["agents"]
+                         if a["agent_id"] == "agent")
+    assert resumed_agent["status"] == "ACTIVE" and resumed_agent["current_version"] == 1
+    assert dict(cp.store.get_agent_version("agent", 1)) == version_before
+    assert len([a for a in cp.store.list_audits() if a["event_type"] == "AGENT_RESUMED"]) == 1
+    assert client.post(resume_url, json={"expected_version": 1, "reason": "重复恢复操作"},
+                       headers=admin_headers).status_code == 409
 
 
 def test_pause_is_tenant_scoped_and_requires_current_active_version(tmp_path):

@@ -3,7 +3,7 @@ const $ = id => document.getElementById(id);
 const state = { csrf: "", members: [], detail: null, dirty: false, busy: false };
 const ownerState = {csrf:"", tasks:[], busy:false, drafts:new Map(), retries:new Map()};
 const organizerState = {csrf:"", tasks:[], busy:false};
-const agentState = {agents:[], drafts:[], csrf:"", canPrecheck:false, canConfirm:false, canPause:false, busy:false};
+const agentState = {agents:[], drafts:[], csrf:"", canPrecheck:false, canConfirm:false, canPause:false, canResume:false, busy:false};
 const memberState = {requests:[], members:[], csrf:"", busy:false};
 const auditState = {events:[], counts:{}, summary:{}, csrf:"", busy:false, canView:false};
 const viewNames={meetings:"会议审核","owner-tasks":"我的待办","organizer-tasks":"发起的任务","follow-up":"跟进概览",agents:"Agent 管理",members:"成员与组织",audit:"审计运维"};
@@ -148,6 +148,9 @@ function renderAgents() {
     if(agentState.canPause && agent.status!=="PAUSED"){
       const actions=node("div",undefined,"commands agent-review-actions"),button=node("button","暂停 Agent");
       button.type="button";button.addEventListener("click",()=>pauseAgent(agent,button));actions.append(button);card.append(actions);
+    }else if(agentState.canResume && agent.status==="PAUSED" && agent.current_version!=null){
+      const actions=node("div",undefined,"commands agent-review-actions"),button=node("button","恢复 Agent");
+      button.type="button";button.className="primary";button.addEventListener("click",()=>resumeAgent(agent,button));actions.append(button);card.append(actions);
     }
     panel.append(card);
   });
@@ -164,7 +167,23 @@ async function pauseAgent(agent,button) {
       method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":agentState.csrf},
       body:JSON.stringify({expected_version:agent.current_version,reason:reason.trim()})
     });
-    const data=await api("/api/meetings/agents");agentState.agents=data.agents||[];renderAgents();agentNotice("Agent 已暂停；恢复需走后续治理流程。","success");
+    const data=await api("/api/meetings/agents");agentState.agents=data.agents||[];renderAgents();agentNotice("Agent 已暂停；恢复需管理员复核当前版本。","success");
+  }catch(error){agentNotice(error.message,"error");button.disabled=false;}
+  finally{agentState.busy=false;}
+}
+async function resumeAgent(agent,button) {
+  if(agentState.busy)return;
+  const reason=window.prompt(`恢复“${agent.agent_id}”的原因（至少 5 个字）：`);
+  if(reason===null)return;
+  if(reason.trim().length<5){agentNotice("请填写至少 5 个字的恢复原因。","error");return;}
+  if(!window.confirm(`确认恢复“${agent.agent_id}”当前 v${agent.current_version}？不会自动重试旧任务或执行远端写入。`))return;
+  agentState.busy=true;button.disabled=true;agentNotice("正在恢复 Agent…");
+  try{
+    await api(`/api/meetings/agents/${encodeURIComponent(agent.agent_id)}/resume`,{
+      method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":agentState.csrf},
+      body:JSON.stringify({expected_version:agent.current_version,reason:reason.trim()})
+    });
+    const data=await api("/api/meetings/agents");agentState.agents=data.agents||[];renderAgents();agentNotice("Agent 已恢复；旧任务不会自动重试。","success");
   }catch(error){agentNotice(error.message,"error");button.disabled=false;}
   finally{agentState.busy=false;}
 }
@@ -269,7 +288,7 @@ async function approveMemberAccess(item,button) {
 }
 async function loadAgents() {
   if(agentState.busy)return;agentState.busy=true;$("agents-reload").disabled=true;$("agent-list").setAttribute("aria-busy","true");
-  try{const data=await api("/api/meetings/agents");const drafts=await api("/api/meetings/agent-drafts");agentState.agents=data.agents||[];agentState.drafts=drafts.drafts||[];agentState.canPause=Boolean(data.can_pause);agentState.canPrecheck=Boolean(drafts.can_precheck);agentState.canConfirm=Boolean(drafts.can_confirm);agentState.csrf=drafts.csrf_token;renderAgents();renderAgentDrafts();agentNotice("");}
+  try{const data=await api("/api/meetings/agents");const drafts=await api("/api/meetings/agent-drafts");agentState.agents=data.agents||[];agentState.drafts=drafts.drafts||[];agentState.canPause=Boolean(data.can_pause);agentState.canResume=Boolean(data.can_resume);agentState.canPrecheck=Boolean(drafts.can_precheck);agentState.canConfirm=Boolean(drafts.can_confirm);agentState.csrf=drafts.csrf_token;renderAgents();renderAgentDrafts();agentNotice("");}
   catch(error){agentNotice(error.message,"error");if(!agentState.agents.length)$("agent-list").replaceChildren(node("p","Agent 目录暂时无法加载，请稍后刷新。","muted"));}
   finally{agentState.busy=false;$("agents-reload").disabled=false;$("agent-list").setAttribute("aria-busy","false");}
 }

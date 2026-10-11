@@ -117,8 +117,19 @@ def test_audit_view_is_admin_only_tenant_scoped_and_redacted(tmp_path):
     body = result.json()
     assert body["can_view"] is True
     assert body["events"]
-    assert all(set(item) <= {"event_type", "outcome", "created_at", "audit_ref", "payload_ref", "task_ref"}
+    assert all(set(item) <= {"event_type", "outcome", "category", "severity", "recommended_action",
+                             "created_at", "audit_ref", "payload_ref", "task_ref"}
                for item in body["events"])
+    task_created = next(item for item in body["events"] if item["event_type"] == "TASK_CREATED")
+    assert task_created["category"] == "TASK"
+    assert task_created["severity"] == "INFO"
+    assert task_created["recommended_action"] == "NONE"
+    cp._audit("TOOL_CALL_RECONCILED", "tenant", "member", task_id,
+               {"error_code": "REMOTE_UNKNOWN"}, "UNKNOWN")
+    classified = client.get("/api/meetings/audit").json()["events"][0]
+    assert classified["category"] == "TOOL"
+    assert classified["severity"] == "HIGH"
+    assert classified["recommended_action"] == "RECONCILE_BEFORE_RETRY"
     assert task_id not in result.text
     assert "admin-subject" not in result.text
     assert any(item["event_type"] == "TASK_CREATED" for item in body["events"])

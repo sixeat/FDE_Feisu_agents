@@ -83,6 +83,19 @@ KNOWN_AGENT_CAPABILITIES = frozenset({
 HIGH_RISK_AGENT_CAPABILITIES = frozenset({"doc.write", "doc.delete", "task.write", "task.delete", "message.send"})
 
 
+AUDIT_EVENT_PREFIX_CATEGORIES = (
+    ("AGENT_CONFIG", "AGENT_GOVERNANCE"),
+    ("APPROVAL", "APPROVAL"),
+    ("FEISHU_DOCUMENT", "SOURCE"),
+    ("MEMBER", "MEMBER"),
+    ("OWNER_", "TASK_FOLLOW_UP"),
+    ("TASK_", "TASK"),
+    ("TOOL_", "TOOL"),
+)
+AUDIT_ERROR_OUTCOMES = frozenset({"ERROR", "FAILED", "UNKNOWN"})
+AUDIT_WARNING_OUTCOMES = frozenset({"BLOCKED", "DENIED", "INVALIDATED", "REJECTED", "STALE"})
+
+
 class DueCorrectionApproval(BaseModel):
     model_config = ConfigDict(extra="forbid")
     proposal_hash: StrictStr = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]+$")
@@ -154,9 +167,25 @@ class MeetingReviewWebService:
             return {"can_view": False, "events": [], "counts": {}}
         events = []
         for item in self.cp.store.list_tenant_audits(identity.tenant_id, limit):
+            event_type = str(item.get("event_type", "UNKNOWN"))
+            outcome = str(item.get("outcome", "UNKNOWN"))
+            category = "SYSTEM"
+            for prefix, candidate in AUDIT_EVENT_PREFIX_CATEGORIES:
+                if event_type.startswith(prefix):
+                    category = candidate
+                    break
+            if outcome in AUDIT_ERROR_OUTCOMES:
+                severity, action = "HIGH", "RECONCILE_BEFORE_RETRY"
+            elif outcome in AUDIT_WARNING_OUTCOMES:
+                severity, action = "WARN", "CHECK_POLICY_OR_SOURCE"
+            else:
+                severity, action = "INFO", "NONE"
             event = {
-                "event_type": str(item.get("event_type", "UNKNOWN")),
-                "outcome": str(item.get("outcome", "UNKNOWN")),
+                "event_type": event_type,
+                "outcome": outcome,
+                "category": category,
+                "severity": severity,
+                "recommended_action": action,
                 "created_at": str(item.get("created_at", "")),
                 "audit_ref": hashlib.sha256(str(item.get("audit_id", "")).encode()).hexdigest()[:12],
                 "payload_ref": str(item.get("payload_hash", ""))[:12],

@@ -201,12 +201,15 @@ function auditNotice(message,type="") { const panel=$("audit-notice");panel.text
 function renderAudit() {
   const panel=$("audit-list");panel.replaceChildren();
   if(!auditState.events.length){panel.append(node("p","暂无审计事件。","muted"));return;}
+  const categoryNames={AGENT_GOVERNANCE:"Agent治理",APPROVAL:"审批",SOURCE:"来源校验",MEMBER:"成员",TASK_FOLLOW_UP:"任务跟进",TASK:"任务",TOOL:"工具",SYSTEM:"系统"};
+  const actionNames={NONE:"无需处理",CHECK_POLICY_OR_SOURCE:"检查权限、审批或来源版本",RECONCILE_BEFORE_RETRY:"先对账确认，再考虑人工重试"};
   auditState.events.forEach(item=>{
     const row=node("article",undefined,"audit-row"),head=node("div",undefined,"audit-row-head");
     const positive=["ACCEPTED","APPROVED","SUCCEEDED"].includes(item.outcome);
     const negative=["DENIED","ERROR","FAILED"].includes(item.outcome);
     head.append(node("strong",item.event_type),node("span",item.outcome,`badge ${positive?"ready":negative?"closed":""}`));
     row.append(head,node("p",`${item.created_at} · 审计 ${item.audit_ref} · 载荷 ${item.payload_ref}`,"muted"));
+    row.append(node("p",`分类：${categoryNames[item.category]||item.category||"系统"} · 级别：${item.severity||"INFO"} · 建议：${actionNames[item.recommended_action]||"人工核对"}`,`audit-action ${(item.severity||"INFO").toLowerCase()}`));
     if(item.task_ref)row.append(node("p",`任务引用：${item.task_ref}`,"audit-ref"));
     panel.append(row);
   });

@@ -1234,6 +1234,27 @@ class SQLiteStore:
             items.append(item)
         return items
 
+    def audit_operations_summary(self, tenant_id: str) -> dict[str, dict[str, int]]:
+        """Count tenant incidents and tool results without exposing event contents."""
+        incident_rows = self.connection.execute(
+            "SELECT COALESCE(triage.status, 'OPEN') AS status, COUNT(*) AS total "
+            "FROM audit_events AS event LEFT JOIN audit_triage AS triage "
+            "ON triage.audit_id = event.audit_id AND triage.tenant_id = event.tenant_id "
+            "WHERE event.tenant_id = ? AND event.event_type != 'AUDIT_TRIAGE_UPDATED' "
+            "AND json_extract(event.data_json, '$.outcome') IN "
+            "('ERROR', 'FAILED', 'UNKNOWN', 'BLOCKED', 'DENIED', 'INVALIDATED', 'REJECTED', 'STALE') "
+            "GROUP BY COALESCE(triage.status, 'OPEN')", (tenant_id,),
+        ).fetchall()
+        tool_rows = self.connection.execute(
+            "SELECT call.status AS status, COUNT(*) AS total FROM tool_calls AS call "
+            "JOIN task_runs AS task ON task.task_run_id = json_extract(call.data_json, '$.task_run_id') "
+            "WHERE task.tenant_id = ? GROUP BY call.status", (tenant_id,),
+        ).fetchall()
+        return {
+            "incidents": {row["status"]: row["total"] for row in incident_rows},
+            "tool_calls": {row["status"]: row["total"] for row in tool_rows},
+        }
+
     def get_audit_triage(self, tenant_id: str, audit_id: str) -> dict[str, Any] | None:
         row = self.connection.execute(
             "SELECT status, decided_by, resolution, updated_at FROM audit_triage "

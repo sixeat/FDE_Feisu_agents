@@ -4,7 +4,7 @@ const state = { csrf: "", members: [], detail: null, dirty: false, busy: false }
 const ownerState = {csrf:"", tasks:[], busy:false, drafts:new Map(), retries:new Map()};
 const organizerState = {csrf:"", tasks:[], busy:false};
 const agentState = {agents:[], drafts:[], memberRequests:[], csrf:"", canPrecheck:false, canConfirm:false, busy:false};
-const auditState = {events:[], counts:{}, csrf:"", busy:false, canView:false};
+const auditState = {events:[], counts:{}, summary:{}, csrf:"", busy:false, canView:false};
 const viewNames={meetings:"会议审核","owner-tasks":"我的待办","organizer-tasks":"发起的任务","follow-up":"跟进概览",agents:"Agent 管理",audit:"审计运维"};
 let activeView="";
 const ownerStatusNames = {WAITING_OWNER:"等待你确认",IN_PROGRESS:"已接受，进行中",WAITING_HUMAN:"已退回，等待会议发起人处理",COMPLETED:"已完成",CANCELLED:"已取消",UNKNOWN:"等待核验",DUE_SOON:"即将到期",OVERDUE:"已逾期"};
@@ -198,6 +198,19 @@ async function loadAgents() {
   finally{agentState.busy=false;$("agents-reload").disabled=false;$("agent-list").setAttribute("aria-busy","false");}
 }
 function auditNotice(message,type="") { const panel=$("audit-notice");panel.textContent=message;panel.className=type;panel.hidden=!message; }
+function renderAuditSummary(){
+  const panel=$("audit-summary");panel.replaceChildren();
+  const incidents=auditState.summary.incidents||{},tools=auditState.summary.tool_calls||{};
+  const metrics=[
+    ["待处理异常",incidents.OPEN||0],
+    ["已认领异常",incidents.ACKNOWLEDGED||0],
+    ["已核实关闭",incidents.RESOLVED||0],
+    ["工具成功",tools.SUCCEEDED||0],
+    ["工具待对账",(tools.UNKNOWN||0)+(tools.RECONCILING||0)],
+    ["工具失败",tools.FAILED||0],
+  ];
+  metrics.forEach(([label,value])=>{const card=node("div",undefined,"audit-metric");card.append(node("strong",String(value)),node("span",label));panel.append(card);});
+}
 function renderAudit() {
   const panel=$("audit-list");panel.replaceChildren();
   if(!auditState.events.length){panel.append(node("p","暂无审计事件。","muted"));return;}
@@ -241,7 +254,7 @@ async function triageAudit(item,status,resolution){
 }
 async function loadAudit() {
   if(auditState.busy)return;auditState.busy=true;$("audit-reload").disabled=true;$("audit-list").setAttribute("aria-busy","true");
-  try{const data=await api("/api/meetings/audit");auditState.canView=Boolean(data.can_view);auditState.events=data.events||[];auditState.counts=data.counts||{};auditState.csrf=data.csrf_token||"";$("module-audit").hidden=!auditState.canView;$("audit-counts").textContent=Object.entries(auditState.counts).map(([key,value])=>`${key} ${value}`).join(" · ");renderAudit();}
+  try{const data=await api("/api/meetings/audit");auditState.canView=Boolean(data.can_view);auditState.events=data.events||[];auditState.counts=data.counts||{};auditState.summary=data.summary||{};auditState.csrf=data.csrf_token||"";$("module-audit").hidden=!auditState.canView;$("audit-counts").textContent=Object.entries(auditState.counts).map(([key,value])=>`${key} ${value}`).join(" · ");renderAuditSummary();renderAudit();}
   catch(error){auditNotice(error.message,"error");}
   finally{auditState.busy=false;$("audit-reload").disabled=false;$("audit-list").setAttribute("aria-busy","false");}
 }

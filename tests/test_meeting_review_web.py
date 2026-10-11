@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from datetime import date, datetime, timezone
 import hashlib
+import json
 import pytest
 
 from fde_control_plane import (
@@ -118,6 +119,8 @@ def test_audit_view_is_admin_only_tenant_scoped_and_redacted(tmp_path):
     body = result.json()
     assert body["can_view"] is True
     assert body["events"]
+    assert body["summary"]["incidents"] == {}
+    assert body["summary"]["tool_calls"] == {}
     assert all(set(item) <= {"event_type", "outcome", "category", "severity", "recommended_action",
                              "created_at", "audit_ref", "payload_ref", "task_ref", "triage_status"}
                for item in body["events"])
@@ -131,6 +134,7 @@ def test_audit_view_is_admin_only_tenant_scoped_and_redacted(tmp_path):
     assert classified["category"] == "TOOL"
     assert classified["severity"] == "HIGH"
     assert classified["recommended_action"] == "RECONCILE_BEFORE_RETRY"
+    assert client.get("/api/meetings/audit").json()["summary"]["incidents"] == {"OPEN": 1}
     assert task_id not in result.text
     assert "admin-subject" not in result.text
     assert any(item["event_type"] == "TASK_CREATED" for item in body["events"])
@@ -157,12 +161,14 @@ def test_audit_triage_requires_admin_and_preserves_conclusion_without_remote_wri
     claimed = client.post(url, json=claim, headers=admin_headers)
     assert claimed.status_code == 200
     assert claimed.json() == {"audit_ref": event["audit_ref"], "status": "ACKNOWLEDGED", "remote_write": False}
+    assert client.get("/api/meetings/audit").json()["summary"]["incidents"] == {"ACKNOWLEDGED": 1}
     assert client.post(url, json=claim, headers=admin_headers).status_code == 409
     assert client.post(url, json={"expected_status": "ACKNOWLEDGED", "status": "RESOLVED", "resolution": "  "}, headers=admin_headers).status_code == 422
     closed = client.post(url, json={"expected_status": "ACKNOWLEDGED", "status": "RESOLVED", "resolution": "已核对远端结果"}, headers=admin_headers)
     assert closed.status_code == 200
     assert client.post(url, json={"expected_status": "ACKNOWLEDGED", "status": "RESOLVED", "resolution": "重复关闭"}, headers=admin_headers).status_code == 409
     result = client.get("/api/meetings/audit").json()
+    assert result["summary"]["incidents"] == {"RESOLVED": 1}
     assert next(item for item in result["events"] if item["audit_ref"] == event["audit_ref"])["triage_status"] == "RESOLVED"
     assert "已核对远端结果" not in str(result)
     assert len([a for a in cp.store.list_audits() if a["event_type"] == "AUDIT_TRIAGE_UPDATED"]) == 2
@@ -172,6 +178,26 @@ def test_audit_triage_requires_admin_and_preserves_conclusion_without_remote_wri
     switch_user(cp, client, "member", SUBJECT)
     assert client.post(url, json=claim, headers={"X-CSRF-Token": client.get("/api/meetings").json()["csrf_token"]}).status_code == 403
     assert client.get("/api/meetings/audit").json() == {"can_view": False, "events": [], "counts": {}}
+
+
+def test_audit_summary_counts_tenant_tool_status_without_exposing_call_details(tmp_path):
+    cp, _, client, _, _, _, task_id = web_setup(tmp_path)
+    cp.store.connection.execute(
+        "INSERT INTO tool_calls(tool_call_id, write_idempotency_key, status, data_json) VALUES (?, ?, ?, ?)",
+        ("own-secret-call", "own-secret-key", "UNKNOWN", json.dumps({"task_run_id": task_id})),
+    )
+    cp.store.connection.execute(
+        "INSERT INTO task_runs(task_run_id, tenant_id, data_json) VALUES (?, ?, ?)",
+        ("other-secret-task", "other", "{}"),
+    )
+    cp.store.connection.execute(
+        "INSERT INTO tool_calls(tool_call_id, write_idempotency_key, status, data_json) VALUES (?, ?, ?, ?)",
+        ("other-secret-call", "other-secret-key", "FAILED", json.dumps({"task_run_id": "other-secret-task"})),
+    )
+    switch_user(cp, client, "admin", "admin-subject")
+    response = client.get("/api/meetings/audit")
+    assert response.json()["summary"]["tool_calls"] == {"UNKNOWN": 1}
+    assert "secret" not in response.text
 
 
 def test_daily_digest_preview_is_authenticated_redacted_and_unsent(tmp_path):

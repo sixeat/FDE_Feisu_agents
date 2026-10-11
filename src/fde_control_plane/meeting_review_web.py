@@ -206,7 +206,8 @@ class MeetingReviewWebService:
         for event in events:
             key = event["outcome"]
             counts[key] = counts.get(key, 0) + 1
-        return {"can_view": True, "events": events, "counts": counts}
+        return {"can_view": True, "events": events, "counts": counts,
+                "summary": self.cp.store.audit_operations_summary(identity.tenant_id)}
 
     def triage_audit(self, identity: IdentityContext, audit_ref: str,
                      body: AuditTriageRequest) -> dict[str, Any]:

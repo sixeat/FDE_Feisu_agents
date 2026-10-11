@@ -62,6 +62,7 @@
       </section>
       <section id="view-audit" class="view-panel" role="tabpanel" aria-labelledby="module-audit" hidden>
         <div class="heading"><div><p class="eyebrow">组织治理</p><h1>审计与运维</h1><p class="muted">只显示当前租户的脱敏事件摘要，用于核对 Agent、审批和工具执行结果。</p></div><button id="audit-reload" type="button">刷新日志</button></div>
+        <section class="audit-panel" aria-labelledby="audit-summary-title"><div class="owner-heading"><h2 id="audit-summary-title">运维概览</h2><span class="muted">当前租户累计</span></div><div id="audit-summary" class="audit-summary" aria-live="polite"></div></section>
         <section class="audit-panel" aria-labelledby="audit-title"><div class="owner-heading"><h2 id="audit-title">最近事件</h2><span id="audit-counts" class="muted"></span></div><div id="audit-notice" role="status" aria-live="polite" hidden></div><div id="audit-list" aria-busy="true"><p class="muted">正在加载审计事件…</p></div></section>
       </section>
     </main>

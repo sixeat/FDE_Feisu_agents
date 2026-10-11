@@ -1707,3 +1707,12 @@ UNKNOWN 卡片不能自动重发，仍需远端核实工具。部署保留数据
 - 验收：`tests/test_meeting_review_web.py` 通过 `29 passed`；新增测试覆盖管理员门控、租户查询和脱敏字段。`node --check`、Python `compileall`、`git diff --check` 通过。全量测试尚未在本轮完成，当前机器的系统测试环境缺少 `lark_oapi`/加密依赖，相关失败属于环境依赖问题。
 - 下一步：部署该只读工作域并用管理员账号复验页面；随后继续补运维异常分类和有上限的人工重试建议，保持自动写入关闭。
 
+### 2026-10-11 审计与运维工作域线上增量部署
+
+- 状态：已完成；等待管理员在真实 H5 页面复验入口和脱敏列表。
+- 完成内容：线上 SQLite 备份保存于 `/opt/fde-agent-stage/deploy/data/backups/20261011-audit-view/control_plane.sqlite3`，同时备份 Compose 配置。基于现有 `fde-control-plane:member-onboarding-20261010` 构建 `fde-control-plane:audit-view-20261011`，仅将控制平面切换到新镜像并重建，未重启监听器和 Worker。
+- 验收结果：控制平面 `running/healthy`，`/health` 返回 `status=ok`；匿名 `/api/meetings/audit` 返回 `401`；数据库 `quick_check=ok`。控制平面启动时间为本次发布时间，监听器和 Worker 仍保持原启动时间与运行镜像，业务数据未主动导入或改写。
+- Worker 安全态：仍为 `network_mode=none`、`/var/lib/fde-agent` 只读挂载和 `--loop --dry-run`。
+- 说明：服务器本地健康检查已通过；本机对 `https://fde.sixeat.icu` 的 TLS 探测被外层连接重置，HTTP 探测返回 `403`，暂不把该现象归因于控制平面应用。管理员页面访问应以飞书 H5 实际登录结果为准。
+- 下一步：管理员登录 H5 确认“审计运维”入口和脱敏字段；随后实现运维异常分类与有上限的人工重试建议，继续保持自动写入关闭。
+

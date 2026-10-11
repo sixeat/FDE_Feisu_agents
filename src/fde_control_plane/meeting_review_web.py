@@ -20,7 +20,7 @@ from .follow_up import (
     remote_due_mismatch,
 )
 from .meeting import review_todo_ref
-from .models import ActorType, IdentityContext, TaskRunStatus
+from .models import ActorType, AuditEvent, IdentityContext, TaskRunStatus
 from .task_due_correction import (
     approve_due_correction, correction_for_task, latest_remote_observation, propose_due_correction,
 )
@@ -74,6 +74,13 @@ class AgentConfigApprovalRequest(BaseModel):
     input_hash: StrictStr = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]+$")
 
 
+class AuditTriageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_status: Literal["OPEN", "ACKNOWLEDGED"]
+    status: Literal["ACKNOWLEDGED", "RESOLVED"]
+    resolution: StrictStr | None = Field(default=None, max_length=500)
+
+
 AGENT_REVIEWER_ROLES = frozenset({"admin", "agent_reviewer"})
 AGENT_ADMIN_ROLES = frozenset({"admin"})
 KNOWN_AGENT_CAPABILITIES = frozenset({
@@ -84,6 +91,7 @@ HIGH_RISK_AGENT_CAPABILITIES = frozenset({"doc.write", "doc.delete", "task.write
 
 
 AUDIT_EVENT_PREFIX_CATEGORIES = (
+    ("AUDIT_TRIAGE", "OPERATIONS"),
     ("AGENT_CONFIG", "AGENT_GOVERNANCE"),
     ("APPROVAL", "APPROVAL"),
     ("FEISHU_DOCUMENT", "SOURCE"),
@@ -189,6 +197,7 @@ class MeetingReviewWebService:
                 "created_at": str(item.get("created_at", "")),
                 "audit_ref": hashlib.sha256(str(item.get("audit_id", "")).encode()).hexdigest()[:12],
                 "payload_ref": str(item.get("payload_hash", ""))[:12],
+                "triage_status": (self.cp.store.get_audit_triage(identity.tenant_id, str(item["audit_id"])) or {}).get("status", "OPEN"),
             }
             if item.get("task_run_id"):
                 event["task_ref"] = hashlib.sha256(str(item["task_run_id"]).encode()).hexdigest()[:12]
@@ -198,6 +207,39 @@ class MeetingReviewWebService:
             key = event["outcome"]
             counts[key] = counts.get(key, 0) + 1
         return {"can_view": True, "events": events, "counts": counts}
+
+    def triage_audit(self, identity: IdentityContext, audit_ref: str,
+                     body: AuditTriageRequest) -> dict[str, Any]:
+        if not self.can_confirm_agent_config(identity):
+            raise HTTPException(403, "只有管理员可以处置审计事件")
+        matches = [item for item in self.cp.store.list_tenant_audits(identity.tenant_id, 100)
+                   if hashlib.sha256(str(item["audit_id"]).encode()).hexdigest()[:12] == audit_ref]
+        if len(matches) != 1:
+            raise HTTPException(404, "审计事件不存在或不在最近列表中")
+        source = matches[0]
+        if str(source.get("outcome", "")).upper() not in AUDIT_ERROR_OUTCOMES | AUDIT_WARNING_OUTCOMES:
+            raise HTTPException(409, "该事件无需人工处置")
+        resolution = (body.resolution or "").strip()
+        if body.status == "RESOLVED" and not resolution:
+            raise HTTPException(422, "关闭事件必须填写核实结论")
+        if body.status == "ACKNOWLEDGED" and resolution:
+            raise HTTPException(422, "认领事件时无需填写结论")
+        audit_event = AuditEvent(
+            audit_id="audit-triage-" + secrets.token_hex(10), event_type="AUDIT_TRIAGE_UPDATED",
+            tenant_id=identity.tenant_id, actor_id=identity.actor_id,
+            task_run_id=None, correlation_id=None,
+            payload_hash=hashlib.sha256(json.dumps({
+                "source_audit_id": source["audit_id"], "status": body.status,
+                "resolution_hash": hashlib.sha256(resolution.encode()).hexdigest() if resolution else None,
+            }, sort_keys=True).encode()).hexdigest(), outcome=body.status,
+        )
+        result = self.cp.store.set_audit_triage(
+            identity.tenant_id, str(source["audit_id"]), identity.actor_id,
+            body.expected_status, body.status, resolution or None, audit_event,
+        )
+        if result != body.status:
+            raise HTTPException(409 if result != "NOT_FOUND" else 404, "事件状态已变化，请刷新后核对")
+        return {"audit_ref": audit_ref, "status": result, "remote_write": False}
 
     def pending_member_access(self, identity: IdentityContext) -> list[dict[str, Any]]:
         if not self.can_confirm_agent_config(identity):
@@ -668,9 +710,19 @@ def build_meeting_review_router(
             return {"requests": service.pending_member_access(identity)}
 
     @router.get("/audit")
-    def get_audit(identity: IdentityContext = Depends(require_identity)):
+    def get_audit(request: Request, identity: IdentityContext = Depends(require_identity)):
         with service.lock:
-            return service.audit_events(identity)
+            result = service.audit_events(identity)
+            if result["can_view"]:
+                result["csrf_token"] = csrf_token(request.cookies["fde_auth_session"])
+            return result
+
+    @router.post("/audit/{audit_ref}/triage")
+    def triage_audit(audit_ref: str, body: AuditTriageRequest, request: Request,
+                     identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        with service.lock:
+            return service.triage_audit(identity, audit_ref, body)
 
     @router.post("/member-access-requests/{request_id}/approve")
     def approve_member_access(request_id: str, request: Request,

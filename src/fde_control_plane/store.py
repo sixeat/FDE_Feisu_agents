@@ -212,6 +212,14 @@ class SQLiteStore:
                 tenant_id TEXT NOT NULL, task_run_id TEXT,
                 data_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS audit_triage (
+                audit_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('ACKNOWLEDGED', 'RESOLVED')),
+                decided_by TEXT NOT NULL, resolution TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_triage_tenant
+                ON audit_triage(tenant_id, status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_approvals_task ON approvals(task_run_id);
             CREATE INDEX IF NOT EXISTS idx_tool_calls_task ON tool_calls(json_extract(data_json, '$.task_run_id'));
             """
@@ -1225,3 +1233,54 @@ class SQLiteStore:
             item["created_at"] = row["created_at"]
             items.append(item)
         return items
+
+    def get_audit_triage(self, tenant_id: str, audit_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT status, decided_by, resolution, updated_at FROM audit_triage "
+            "WHERE tenant_id = ? AND audit_id = ?", (tenant_id, audit_id),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def set_audit_triage(self, tenant_id: str, audit_id: str, decided_by: str,
+                         expected_status: str, status: str, resolution: str | None,
+                         audit_event: Any) -> str:
+        """Change triage state once; a stale browser cannot overwrite another administrator."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            audit = self.connection.execute(
+                "SELECT 1 FROM audit_events WHERE tenant_id = ? AND audit_id = ?",
+                (tenant_id, audit_id),
+            ).fetchone()
+            if audit is None:
+                self.connection.rollback()
+                return "NOT_FOUND"
+            current = self.get_audit_triage(tenant_id, audit_id)
+            current_status = current["status"] if current is not None else "OPEN"
+            if current_status != expected_status:
+                self.connection.rollback()
+                return "STALE"
+            if status == "ACKNOWLEDGED" and current_status == "OPEN":
+                self.connection.execute(
+                    "INSERT INTO audit_triage(audit_id, tenant_id, status, decided_by, resolution) "
+                    "VALUES (?, ?, ?, ?, NULL)", (audit_id, tenant_id, status, decided_by),
+                )
+            elif status == "RESOLVED" and current_status == "ACKNOWLEDGED":
+                self.connection.execute(
+                    "UPDATE audit_triage SET status = ?, decided_by = ?, resolution = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE tenant_id = ? AND audit_id = ?",
+                    (status, decided_by, resolution, tenant_id, audit_id),
+                )
+            else:
+                self.connection.rollback()
+                return "INVALID_TRANSITION"
+            self.connection.execute(
+                "INSERT INTO audit_events(audit_id, event_type, tenant_id, task_run_id, data_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (audit_event.audit_id, audit_event.event_type, tenant_id, audit_event.task_run_id,
+                 self._json(asdict(audit_event))),
+            )
+            self.connection.commit()
+            return status
+        except Exception:
+            self.connection.rollback()
+            raise

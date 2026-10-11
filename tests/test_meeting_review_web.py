@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from datetime import date, datetime, timezone
+import hashlib
 import pytest
 
 from fde_control_plane import (
@@ -118,7 +119,7 @@ def test_audit_view_is_admin_only_tenant_scoped_and_redacted(tmp_path):
     assert body["can_view"] is True
     assert body["events"]
     assert all(set(item) <= {"event_type", "outcome", "category", "severity", "recommended_action",
-                             "created_at", "audit_ref", "payload_ref", "task_ref"}
+                             "created_at", "audit_ref", "payload_ref", "task_ref", "triage_status"}
                for item in body["events"])
     task_created = next(item for item in body["events"] if item["event_type"] == "TASK_CREATED")
     assert task_created["category"] == "TASK"
@@ -133,6 +134,44 @@ def test_audit_view_is_admin_only_tenant_scoped_and_redacted(tmp_path):
     assert task_id not in result.text
     assert "admin-subject" not in result.text
     assert any(item["event_type"] == "TASK_CREATED" for item in body["events"])
+
+
+def test_audit_triage_requires_admin_and_preserves_conclusion_without_remote_write(tmp_path):
+    cp, _, client, _, _, _, task_id = web_setup(tmp_path)
+    cp._audit("TOOL_CALL_RECONCILED", "tenant", "member", task_id,
+              {"error_code": "REMOTE_UNKNOWN"}, "UNKNOWN")
+    cp._audit("TOOL_CALL_RECONCILED", "other", "member", None, {}, "UNKNOWN")
+    other_audit_id = cp.store.list_audits()[-1]["audit_id"]
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    listed = client.get("/api/meetings/audit").json()
+    event = next(item for item in listed["events"] if item["outcome"] == "UNKNOWN")
+    source_audit_id = next(a["audit_id"] for a in cp.store.list_audits()
+                           if hashlib.sha256(a["audit_id"].encode()).hexdigest()[:12] == event["audit_ref"])
+    url = f'/api/meetings/audit/{event["audit_ref"]}/triage'
+    claim = {"expected_status": "OPEN", "status": "ACKNOWLEDGED"}
+    assert client.post(url, json=claim).status_code == 403
+    assert client.post(url, json=claim, headers={**admin_headers, "Origin": "https://evil.test"}).status_code == 403
+    other_url = f'/api/meetings/audit/{hashlib.sha256(other_audit_id.encode()).hexdigest()[:12]}/triage'
+    assert client.post(other_url, json=claim, headers=admin_headers).status_code == 404
+    assert client.post(url, json={"expected_status": "OPEN", "status": "RESOLVED", "resolution": "已核实"}, headers=admin_headers).status_code == 409
+    claimed = client.post(url, json=claim, headers=admin_headers)
+    assert claimed.status_code == 200
+    assert claimed.json() == {"audit_ref": event["audit_ref"], "status": "ACKNOWLEDGED", "remote_write": False}
+    assert client.post(url, json=claim, headers=admin_headers).status_code == 409
+    assert client.post(url, json={"expected_status": "ACKNOWLEDGED", "status": "RESOLVED", "resolution": "  "}, headers=admin_headers).status_code == 422
+    closed = client.post(url, json={"expected_status": "ACKNOWLEDGED", "status": "RESOLVED", "resolution": "已核对远端结果"}, headers=admin_headers)
+    assert closed.status_code == 200
+    assert client.post(url, json={"expected_status": "ACKNOWLEDGED", "status": "RESOLVED", "resolution": "重复关闭"}, headers=admin_headers).status_code == 409
+    result = client.get("/api/meetings/audit").json()
+    assert next(item for item in result["events"] if item["audit_ref"] == event["audit_ref"])["triage_status"] == "RESOLVED"
+    assert "已核对远端结果" not in str(result)
+    assert len([a for a in cp.store.list_audits() if a["event_type"] == "AUDIT_TRIAGE_UPDATED"]) == 2
+    from fde_control_plane.store import SQLiteStore
+    with SQLiteStore(cp.store.path) as reopened:
+        assert reopened.get_audit_triage("tenant", source_audit_id)["status"] == "RESOLVED"
+    switch_user(cp, client, "member", SUBJECT)
+    assert client.post(url, json=claim, headers={"X-CSRF-Token": client.get("/api/meetings").json()["csrf_token"]}).status_code == 403
+    assert client.get("/api/meetings/audit").json() == {"can_view": False, "events": [], "counts": {}}
 
 
 def test_daily_digest_preview_is_authenticated_redacted_and_unsent(tmp_path):

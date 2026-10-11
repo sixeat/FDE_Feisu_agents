@@ -4,7 +4,7 @@ const state = { csrf: "", members: [], detail: null, dirty: false, busy: false }
 const ownerState = {csrf:"", tasks:[], busy:false, drafts:new Map(), retries:new Map()};
 const organizerState = {csrf:"", tasks:[], busy:false};
 const agentState = {agents:[], drafts:[], csrf:"", canPrecheck:false, canConfirm:false, canPause:false, busy:false};
-const memberState = {requests:[], csrf:"", busy:false};
+const memberState = {requests:[], members:[], csrf:"", busy:false};
 const auditState = {events:[], counts:{}, summary:{}, csrf:"", busy:false, canView:false};
 const viewNames={meetings:"会议审核","owner-tasks":"我的待办","organizer-tasks":"发起的任务","follow-up":"跟进概览",agents:"Agent 管理",members:"成员与组织",audit:"审计运维"};
 let activeView="";
@@ -201,18 +201,30 @@ function renderMemberAccess() {
     row.append(node("h3",item.request_id),node("p",`申请时间：${item.created_at}。请先与该成员确认识别码。`,"muted"),button);panel.append(row);
   });
 }
+function renderMemberDirectory() {
+  const panel=$("member-directory-list");panel.replaceChildren();
+  if(!memberState.members.length){panel.append(node("p","暂无已接入成员。","muted"));return;}
+  memberState.members.forEach(member=>{
+    const row=node("article",undefined,"member-row"),head=node("div",undefined,"agent-row-head");
+    head.append(node("h3",member.actor_id),node("span",member.status==="ACTIVE"?"已启用":"已停用",`badge ${member.status==="ACTIVE"?"ready":"closed"}`));
+    row.append(head,node("p",`应用角色：${member.role==="ADMIN"?"管理员":"普通成员"} · 接入时间：${member.joined_at||"初始绑定"}`,"muted"));
+    panel.append(row);
+  });
+}
 function memberNotice(message,type="") {
   const panel=$("members-notice");panel.textContent=message;panel.className=type;panel.hidden=!message;
 }
 async function loadMembers() {
   if(memberState.busy)return;
-  memberState.busy=true;$("members-reload").disabled=true;memberNotice("");
+  memberState.busy=true;$("members-reload").disabled=true;$("member-directory-list").setAttribute("aria-busy","true");memberNotice("");
   try{
-    const data=await api("/api/meetings/member-access-requests");
-    memberState.requests=data.requests||[];memberState.csrf=data.csrf_token;
-    renderMemberAccess();
-  }catch(error){memberNotice(error.message,"error");}
-  finally{memberState.busy=false;$("members-reload").disabled=false;}
+    const [directory,data]=await Promise.all([
+      api("/api/meetings/member-directory"),api("/api/meetings/member-access-requests")
+    ]);
+    memberState.members=directory.members||[];memberState.requests=data.requests||[];memberState.csrf=data.csrf_token;
+    renderMemberDirectory();renderMemberAccess();
+  }catch(error){memberNotice(error.message,"error");$("member-directory-list").replaceChildren(node("p","成员目录暂时无法加载，请稍后刷新。","muted"));}
+  finally{memberState.busy=false;$("members-reload").disabled=false;$("member-directory-list").setAttribute("aria-busy","false");}
 }
 async function approveMemberAccess(item,button) {
   if(memberState.busy)return;
@@ -221,7 +233,11 @@ async function approveMemberAccess(item,button) {
   try{
     await api(`/api/meetings/member-access-requests/${encodeURIComponent(item.request_id)}/approve`,{method:"POST",headers:{"X-CSRF-Token":memberState.csrf}});
     memberNotice("成员已绑定。请让该成员重新打开工作台。","success");
-    const data=await api("/api/meetings/member-access-requests");memberState.requests=data.requests||[];memberState.csrf=data.csrf_token;renderMemberAccess();
+    const [directory,data]=await Promise.all([
+      api("/api/meetings/member-directory"),api("/api/meetings/member-access-requests")
+    ]);
+    memberState.members=directory.members||[];memberState.requests=data.requests||[];memberState.csrf=data.csrf_token;
+    renderMemberDirectory();renderMemberAccess();
   }catch(error){memberNotice(error.message,"error");button.disabled=false;}
   finally{memberState.busy=false;}
 }

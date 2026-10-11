@@ -88,6 +88,7 @@ def test_member_access_requires_admin_and_preserves_meeting_isolation(tmp_path):
     request = cp.store.request_member_access("tenant", subject_hash, "member-request-test2")
     assert request["status"] == "PENDING"
     assert client.get("/api/meetings/member-access-requests").status_code == 403
+    assert client.get("/api/meetings/member-directory").status_code == 403
     url = "/api/meetings/member-access-requests/member-request-test2/approve"
     assert client.post(url, headers=headers).status_code == 403
     admin_headers = switch_user(cp, client, "admin", "admin-subject")
@@ -96,17 +97,27 @@ def test_member_access_requires_admin_and_preserves_meeting_isolation(tmp_path):
     assert listed.json()["requests"][0]["request_id"] == "member-request-test2"
     assert listed.json()["csrf_token"] == admin_headers["X-CSRF-Token"]
     assert subject_hash not in listed.text
+    directory = client.get("/api/meetings/member-directory")
+    assert directory.status_code == 200
+    assert directory.json()["members"] == [{"actor_id": "admin", "role": "ADMIN", "status": "ACTIVE", "joined_at": None},
+                                            {"actor_id": "member", "role": "MEMBER", "status": "ACTIVE", "joined_at": None}]
+    assert "admin-subject" not in directory.text
     assert client.post(url).status_code == 403
     approved = client.post(url, headers=admin_headers)
     assert approved.status_code == 200 and approved.json()["duplicate"] is False
     actor_id = approved.json()["actor_id"]
     assert cp._actor(actor_id).roles == frozenset()
+    directory = client.get("/api/meetings/member-directory").json()["members"]
+    new_member = next(item for item in directory if item["actor_id"] == actor_id)
+    assert new_member["role"] == "MEMBER" and new_member["status"] == "ACTIVE" and new_member["joined_at"]
+    assert subject_hash not in str(directory)
     assert client.post(url, headers=admin_headers).json()["duplicate"] is True
     assert client.get("/api/meetings/member-access-requests").json()["requests"] == []
     second_headers = switch_user(cp, client, actor_id, subject_hash)
     assert client.get("/api/meetings").json()["meetings"] == []
     assert client.get("/api/meetings/record").status_code == 404
     assert client.get("/api/meetings/member-access-requests").status_code == 403
+    assert client.get("/api/meetings/member-directory").status_code == 403
     assert client.post(url, headers=second_headers).status_code == 403
 
 

@@ -888,6 +888,16 @@ class SQLiteStore:
         ).fetchall()
         return [{"actor_id": row["actor_id"]} for row in rows]
 
+    def list_member_directory(self, tenant_id: str) -> list[sqlite3.Row]:
+        """Return local member identities without OAuth subject hashes."""
+        return self.connection.execute(
+            "SELECT a.actor_id, a.roles_json, a.active, r.decided_at AS joined_at "
+            "FROM actors AS a LEFT JOIN member_access_requests AS r "
+            "ON r.tenant_id = a.tenant_id AND r.actor_id = a.actor_id AND r.status = 'APPROVED' "
+            "WHERE a.tenant_id = ? AND a.actor_type = 'USER' AND a.external_ref_hash IS NOT NULL "
+            "ORDER BY a.actor_id", (tenant_id,),
+        ).fetchall()
+
     def save_meeting_todo(self, draft: Any) -> None:
         self.connection.execute(
             "INSERT OR REPLACE INTO meeting_todo_drafts(draft_id, record_id, todo_id, data_json) VALUES (?, ?, ?, ?)",

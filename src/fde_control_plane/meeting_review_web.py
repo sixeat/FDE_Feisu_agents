@@ -277,6 +277,16 @@ class MeetingReviewWebService:
         return [{"request_id": row["request_id"], "created_at": row["created_at"]}
                 for row in self.cp.store.list_pending_member_access(identity.tenant_id)]
 
+    def member_directory(self, identity: IdentityContext) -> list[dict[str, Any]]:
+        if not self.can_confirm_agent_config(identity):
+            raise HTTPException(403, "只有管理员可以查看成员目录")
+        return [{
+            "actor_id": row["actor_id"],
+            "role": "ADMIN" if "admin" in json.loads(row["roles_json"]) else "MEMBER",
+            "status": "ACTIVE" if row["active"] else "INACTIVE",
+            "joined_at": row["joined_at"],
+        } for row in self.cp.store.list_member_directory(identity.tenant_id)]
+
     def approve_member_access(self, request_id: str, identity: IdentityContext) -> dict[str, Any]:
         if not self.can_confirm_agent_config(identity):
             raise HTTPException(403, "只有管理员可以批准成员接入")
@@ -746,6 +756,11 @@ def build_meeting_review_router(
         with service.lock:
             return {"requests": service.pending_member_access(identity),
                     "csrf_token": csrf_token(request.cookies["fde_auth_session"])}
+
+    @router.get("/member-directory")
+    def member_directory(identity: IdentityContext = Depends(require_identity)):
+        with service.lock:
+            return {"members": service.member_directory(identity)}
 
     @router.get("/audit")
     def get_audit(request: Request, identity: IdentityContext = Depends(require_identity)):

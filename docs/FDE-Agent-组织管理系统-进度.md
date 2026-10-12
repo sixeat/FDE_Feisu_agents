@@ -1,7 +1,7 @@
 # 飞书 Agent 组织管理系统进度记录
 
 > 这是项目状态的唯一来源。计划书描述目标、依赖和验收要求；本文件记录实际讨论、验证和实施状态。
-> 更新时间：2026-10-11
+> 更新时间：2026-10-12
 
 ## 当前状态
 
@@ -1797,4 +1797,13 @@ UNKNOWN 卡片不能自动重发，仍需远端核实工具。部署保留数据
 - 部署与运行边界：发布前在线 SQLite 备份保存于 `/opt/fde-agent-stage/deploy/data/backups/20261011-agent-resume/control_plane.sqlite3`，`quick_check=ok`，同时备份 Compose。审批监听器仍为 `fde-control-plane:agent-pause-20261011` 且启动时间未变；Worker 未重启，仍为 `network_mode=none`、只读数据卷和 `--dry-run`。本次没有执行飞书远端写入。
 - 遗留问题：管理员真实 H5 暂停/恢复演练、部门同步、部门负责人、细粒度角色授予和两个测试号 OAuth 接入仍未完成。
 - 下一步：让两个测试账号分别完成 OAuth 接入申请，管理员核对识别码并批准；随后验证成员目录、会议可见范围和负责人任务隔离。部门同步先做权限与接口核验，不把部门名称直接写入授权计算。
+
+### 2026-10-12 工作台退出登录
+
+- 状态：本地实现、全量测试与线上增量部署完成；浏览器实点待验收。
+- 完成内容：工作台顶栏增加“退出登录”。服务端要求有效会话及 CSRF/Origin 校验，撤销数据库中的当前会话并清除工作台及 OAuth 浏览器 Cookie；退出后显示独立页面，用户主动点击才重新进入飞书 OAuth。未保存会议草稿时先提示确认。
+- 账号边界：退出工作台不会退出飞书 SSO。同一浏览器切换测试账号时，需要先在飞书侧切换账号或使用独立浏览器资料，避免 OAuth 自动选择原账号。
+- 验收结果：Web 测试 `35 passed`，全项目 `198 passed`、4 项第三方弃用警告；新增测试覆盖 CSRF、错误 Origin、会话撤销、Cookie 清除及退出页可访问。线上镜像 `fde-control-plane:logout-20261012` 已 healthy，`/health` 返回 `status=ok`，退出页返回 `200`，匿名业务接口返回 `401`，SQLite `quick_check=ok`。
+- 部署与运行边界：发布前在线 SQLite 备份保存于 `/opt/fde-agent-stage/deploy/data/backups/20261012-logout/control_plane.sqlite3`，`quick_check=ok`，同时备份 Compose。仅重建控制平面；审批监听器启动时间未变，Worker 未重启，保持 `network_mode=none`、只读数据卷和 `--dry-run`。本次没有退出真实用户会话，也没有飞书远端写入。
+- 下一步：管理员在 H5 实点“退出登录”，确认退出页与重新登录行为；随后切换飞书账号，用一个测试账号申请接入。
 

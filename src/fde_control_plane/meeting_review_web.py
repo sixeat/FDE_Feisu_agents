@@ -11,6 +11,7 @@ from threading import RLock
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr
 
 from .feishu_oauth_web import SQLiteOAuthSessionIssuer, build_session_dependency
@@ -773,6 +774,35 @@ def build_meeting_review_router(
             request.headers.get("x-csrf-token", ""), expected,
         ):
             raise HTTPException(403, "请求校验失败，请重新加载页面")
+
+    @router.post("/logout")
+    def logout(request: Request, identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        sessions.revoke(request.cookies["fde_auth_session"])
+        response = JSONResponse({"status": "LOGGED_OUT"})
+        response.delete_cookie(
+            "fde_auth_session", path="/", secure=public_origin.startswith("https://"),
+            httponly=True, samesite="lax",
+        )
+        response.delete_cookie(
+            "fde_oauth_browser", path="/", secure=public_origin.startswith("https://"),
+            httponly=True, samesite="lax",
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @router.get("/logged-out", response_class=HTMLResponse)
+    def logged_out():
+        return HTMLResponse(
+            "<!doctype html><html lang='zh-CN'><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>已退出工作台</title>"
+            "<main style='font:16px/1.7 sans-serif;max-width:38rem;margin:4rem auto;padding:1.5rem'>"
+            "<h1>已退出工作台</h1>"
+            "<p>当前工作台会话已结束。飞书账号仍可能保持登录；切换账号时，请先在飞书中切换账号，或使用另一个浏览器资料。</p>"
+            "<p><a href='/oauth/start'>重新登录工作台</a></p></main></html>",
+            headers={"Cache-Control": "no-store"},
+        )
 
     @router.get("")
     def list_meetings(request: Request, identity: IdentityContext = Depends(require_identity)):

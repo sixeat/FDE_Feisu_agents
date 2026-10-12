@@ -82,6 +82,23 @@ def test_other_bound_member_and_logged_out_user_cannot_read_meeting(tmp_path):
     assert client.get("/api/meetings/record").status_code == 404
 
 
+def test_logout_revokes_session_and_clears_browser_cookies(tmp_path):
+    cp, _, client, headers, _, _, _ = web_setup(tmp_path)
+    token = client.cookies.get("fde_auth_session")
+    assert token
+    session_hash = hashlib.sha256(token.encode()).hexdigest()
+    assert cp.store.get_web_session(session_hash, 0) is not None
+    assert client.post("/api/meetings/logout").status_code == 403
+    assert client.post("/api/meetings/logout", headers={**headers, "Origin": "https://evil.test"}).status_code == 403
+    response = client.post("/api/meetings/logout", headers=headers)
+    assert response.status_code == 200
+    assert response.json() == {"status": "LOGGED_OUT"}
+    assert 'fde_auth_session=""' in response.headers["set-cookie"]
+    assert client.get("/api/meetings").status_code == 401
+    assert client.get("/api/meetings/logged-out").status_code == 200
+    assert cp.store.get_web_session(session_hash, 0) is None
+
+
 def test_member_access_requires_admin_and_preserves_meeting_isolation(tmp_path):
     cp, _, client, headers, _, _, _ = web_setup(tmp_path)
     subject_hash = "b" * 64

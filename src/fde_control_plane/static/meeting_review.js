@@ -509,6 +509,15 @@ async function persist(submit){
   finally{setBusy(false);}
 }
 $("reload").addEventListener("click",load);$("save").addEventListener("click",()=>persist(false));$("review-form").addEventListener("submit",event=>{event.preventDefault();persist(true);});
+$("logout").addEventListener("click",async()=>{
+  if(state.dirty&&!window.confirm("会议草稿尚未保存，确定退出登录？"))return;
+  const button=$("logout");button.disabled=true;
+  try{
+    const csrf=state.csrf||auditState.csrf||agentState.csrf||memberState.csrf||(await api("/api/meetings")).csrf_token;
+    await api("/api/meetings/logout",{method:"POST",headers:{"X-CSRF-Token":csrf}});
+    state.dirty=false;window.location.replace("/api/meetings/logged-out");
+  }catch(error){button.disabled=false;window.alert(`退出失败：${error.message}`);}
+});
 window.addEventListener("beforeunload",event=>{if(state.dirty){event.preventDefault();event.returnValue="";}});
 $("owner-reload").addEventListener("click",loadOwnerTasks);
 $("organizer-reload").addEventListener("click",loadOrganizerTasks);

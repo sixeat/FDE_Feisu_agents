@@ -41,7 +41,7 @@ def test_production_oauth_client_accepts_user_token_and_h5_requires_session(tmp_
         response.status_code = 200
         response.content = json.dumps({
             "code": 0,
-            "data": {"open_id": "ou_test", "tenant_key": "tenant-test"},
+            "data": {"open_id": "ou_test", "tenant_key": "tenant-test", "name": "飞书测试员"},
         }).encode()
         return response
 
@@ -50,6 +50,7 @@ def test_production_oauth_client_accepts_user_token_and_h5_requires_session(tmp_
     user = transports[0].get_user("test-user-token")
     assert user.open_id == "ou_test"
     assert user.tenant_key == "tenant-test"
+    assert user.name == "飞书测试员"
     assert calls == [(
         "/open-apis/authen/v1/user_info", {lark.AccessTokenType.USER}, "test-user-token",
     )]

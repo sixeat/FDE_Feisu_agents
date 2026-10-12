@@ -1,7 +1,7 @@
 """Minimal production entry point for the FDE OAuth/H5 gateway.
 
-All secrets are read from the process environment. The app intentionally does
-not auto-register Feishu users: an operator must pre-bind an open_id hash.
+All secrets are read from the process environment. Verified same-tenant OAuth
+users enter as plain members; administrator roles remain explicitly assigned.
 """
 
 from __future__ import annotations

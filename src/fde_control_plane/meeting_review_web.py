@@ -316,6 +316,7 @@ class MeetingReviewWebService:
         changes = self.cp.store.latest_member_status_changes(identity.tenant_id)
         return [{
             "actor_id": row["actor_id"],
+            "display_name": row["display_name"],
             "role": "ADMIN" if "admin" in json.loads(row["roles_json"]) else "MEMBER",
             "status": "ACTIVE" if row["active"] else "INACTIVE",
             "joined_at": row["joined_at"],
@@ -816,7 +817,7 @@ def build_meeting_review_router(
                               "revision_id": record["revision_id"], "status": task.status})
             members = service.cp.store.list_bound_members(identity.tenant_id)
             for member in members:
-                member["name"] = "当前成员" if member["actor_id"] == identity.actor_id else member["actor_id"]
+                member["name"] = member["name"] or ("当前成员" if member["actor_id"] == identity.actor_id else member["actor_id"])
             return {"meetings": items, "members": members,
                     "csrf_token": csrf_token(request.cookies["fde_auth_session"])}
 

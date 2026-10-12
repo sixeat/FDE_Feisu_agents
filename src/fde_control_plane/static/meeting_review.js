@@ -213,7 +213,7 @@ function renderAgentDrafts() {
 }
 function renderMemberAccess() {
   const panel=$("member-access-list");panel.replaceChildren();
-  if(!memberState.requests.length){panel.append(node("p","暂无待批准成员。","muted"));return;}
+  if(!memberState.requests.length){panel.append(node("p","暂无历史待处理申请。","muted"));return;}
   memberState.requests.forEach(item=>{
     const row=node("article",undefined,"agent-draft-row"),button=node("button","批准接入","primary");
     button.type="button";button.addEventListener("click",()=>approveMemberAccess(item,button));
@@ -225,8 +225,8 @@ function renderMemberDirectory() {
   if(!memberState.members.length){panel.append(node("p","暂无已接入成员。","muted"));return;}
   memberState.members.forEach(member=>{
     const row=node("article",undefined,"member-row"),head=node("div",undefined,"agent-row-head");
-    head.append(node("h3",member.actor_id),node("span",member.status==="ACTIVE"?"已启用":"已停用",`badge ${member.status==="ACTIVE"?"ready":"closed"}`));
-    row.append(head,node("p",`应用角色：${member.role==="ADMIN"?"管理员":"普通成员"} · 接入时间：${member.joined_at||"初始绑定"}`,"muted"));
+    head.append(node("h3",member.display_name||member.actor_id),node("span",member.status==="ACTIVE"?"已启用":"已停用",`badge ${member.status==="ACTIVE"?"ready":"closed"}`));
+    row.append(head,node("p",`成员编号：${member.actor_id} · 应用角色：${member.role==="ADMIN"?"管理员":"普通成员"} · 接入时间：${member.joined_at||"初始绑定"}`,"muted"));
     if(member.status_reason)row.append(node("p",`最近处置：${member.status_reason}`,"muted"));
     if(member.role!=="ADMIN"){
       const button=node("button",member.status==="ACTIVE"?"停用成员":"恢复成员");button.type="button";

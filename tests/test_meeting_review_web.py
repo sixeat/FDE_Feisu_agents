@@ -116,9 +116,16 @@ def test_member_access_requires_admin_and_preserves_meeting_isolation(tmp_path):
     assert subject_hash not in listed.text
     directory = client.get("/api/meetings/member-directory")
     assert directory.status_code == 200
-    assert directory.json()["members"] == [{"actor_id": "admin", "role": "ADMIN", "status": "ACTIVE", "joined_at": None, "status_reason": None},
-                                            {"actor_id": "member", "role": "MEMBER", "status": "ACTIVE", "joined_at": None, "status_reason": None}]
+    assert directory.json()["members"] == [{"actor_id": "admin", "display_name": None, "role": "ADMIN", "status": "ACTIVE", "joined_at": None, "status_reason": None},
+                                            {"actor_id": "member", "display_name": None, "role": "MEMBER", "status": "ACTIVE", "joined_at": None, "status_reason": None}]
     assert "admin-subject" not in directory.text
+    cp.store.connection.execute(
+        "INSERT INTO member_profiles(actor_id, tenant_id, display_name) VALUES ('member', 'tenant', '飞书测试员')"
+    )
+    assert next(item for item in client.get("/api/meetings/member-directory").json()["members"]
+                if item["actor_id"] == "member")["display_name"] == "飞书测试员"
+    assert next(item for item in client.get("/api/meetings").json()["members"]
+                if item["actor_id"] == "member")["name"] == "飞书测试员"
     assert client.post(url).status_code == 403
     approved = client.post(url, headers=admin_headers)
     assert approved.status_code == 200 and approved.json()["duplicate"] is False

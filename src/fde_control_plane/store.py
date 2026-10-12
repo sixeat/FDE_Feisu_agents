@@ -61,6 +61,10 @@ class SQLiteStore:
                 decided_at TEXT,
                 UNIQUE(tenant_id, subject_ref_hash)
             );
+            CREATE TABLE IF NOT EXISTS member_profiles (
+                actor_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                display_name TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE INDEX IF NOT EXISTS idx_member_access_requests_pending
                 ON member_access_requests(tenant_id, status, created_at);
             CREATE TABLE IF NOT EXISTS member_status_changes (
@@ -287,6 +291,67 @@ class SQLiteStore:
             (tenant_id, external_ref_hash),
         ).fetchall()
         return rows[0] if len(rows) == 1 else None
+
+    def ensure_oauth_member(self, tenant_id: str, subject_ref_hash: str, actor_id: str,
+                            display_name: str | None, event: Any) -> sqlite3.Row:
+        """Provision a plain member after verified same-tenant OAuth, once per subject."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.connection.execute(
+                "SELECT * FROM actors WHERE tenant_id = ? AND external_ref_hash = ?",
+                (tenant_id, subject_ref_hash),
+            ).fetchall()
+            if len(existing) > 1:
+                raise PermissionError("OAuth identity has multiple member bindings")
+            if existing:
+                if existing[0]["actor_type"] == "USER" and existing[0]["active"] and display_name:
+                    self._upsert_member_profile(existing[0]["actor_id"], tenant_id, display_name)
+                self.connection.commit()
+                return existing[0]
+            pending = self.connection.execute(
+                "SELECT * FROM member_access_requests WHERE tenant_id = ? AND subject_ref_hash = ?",
+                (tenant_id, subject_ref_hash),
+            ).fetchone()
+            if pending is not None and pending["status"] != "PENDING":
+                raise PermissionError("OAuth member application has an incompatible status")
+            self.connection.execute(
+                "INSERT INTO actors(actor_id, tenant_id, actor_type, capabilities_json, roles_json, external_ref_hash, active) "
+                "VALUES (?, ?, 'USER', '[]', '[]', ?, 1)",
+                (actor_id, tenant_id, subject_ref_hash),
+            )
+            if display_name:
+                self._upsert_member_profile(actor_id, tenant_id, display_name)
+            if pending is not None:
+                self.connection.execute(
+                    "UPDATE member_access_requests SET status = 'APPROVED', actor_id = ?, "
+                    "decided_at = CURRENT_TIMESTAMP WHERE request_id = ? AND status = 'PENDING'",
+                    (actor_id, pending["request_id"]),
+                )
+            else:
+                self.connection.execute(
+                    "INSERT INTO member_access_requests(request_id, tenant_id, subject_ref_hash, status, actor_id, decided_at) "
+                    "VALUES (?, ?, ?, 'APPROVED', ?, CURRENT_TIMESTAMP)",
+                    ("member-join-" + actor_id, tenant_id, subject_ref_hash, actor_id),
+                )
+            self.connection.execute(
+                "INSERT INTO audit_events(audit_id, event_type, tenant_id, task_run_id, data_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (event.audit_id, event.event_type, event.tenant_id, event.task_run_id,
+                 self._json(asdict(event))),
+            )
+            self.connection.commit()
+            return self.get_actor(actor_id)
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def _upsert_member_profile(self, actor_id: str, tenant_id: str, display_name: str) -> None:
+        self.connection.execute(
+            "INSERT INTO member_profiles(actor_id, tenant_id, display_name) VALUES (?, ?, ?) "
+            "ON CONFLICT(actor_id) DO UPDATE SET display_name = excluded.display_name, "
+            "updated_at = CURRENT_TIMESTAMP",
+            (actor_id, tenant_id, display_name),
+        )
 
     def request_member_access(self, tenant_id: str, subject_ref_hash: str, request_id: str) -> sqlite3.Row:
         """Record only a verified same-tenant OAuth subject hash, never its token or open_id."""
@@ -926,17 +991,20 @@ class SQLiteStore:
 
     def list_bound_members(self, tenant_id: str) -> list[dict[str, Any]]:
         rows = self.connection.execute(
-            "SELECT actor_id FROM actors WHERE tenant_id = ? AND actor_type = 'USER' "
-            "AND active = 1 AND external_ref_hash IS NOT NULL", (tenant_id,),
+            "SELECT a.actor_id, p.display_name FROM actors AS a "
+            "LEFT JOIN member_profiles AS p ON p.actor_id = a.actor_id AND p.tenant_id = a.tenant_id "
+            "WHERE a.tenant_id = ? AND a.actor_type = 'USER' "
+            "AND a.active = 1 AND a.external_ref_hash IS NOT NULL", (tenant_id,),
         ).fetchall()
-        return [{"actor_id": row["actor_id"]} for row in rows]
+        return [{"actor_id": row["actor_id"], "name": row["display_name"]} for row in rows]
 
     def list_member_directory(self, tenant_id: str) -> list[sqlite3.Row]:
         """Return local member identities without OAuth subject hashes."""
         return self.connection.execute(
-            "SELECT a.actor_id, a.roles_json, a.active, r.decided_at AS joined_at "
+            "SELECT a.actor_id, a.roles_json, a.active, r.decided_at AS joined_at, p.display_name "
             "FROM actors AS a LEFT JOIN member_access_requests AS r "
             "ON r.tenant_id = a.tenant_id AND r.actor_id = a.actor_id AND r.status = 'APPROVED' "
+            "LEFT JOIN member_profiles AS p ON p.actor_id = a.actor_id AND p.tenant_id = a.tenant_id "
             "WHERE a.tenant_id = ? AND a.actor_type = 'USER' AND a.external_ref_hash IS NOT NULL "
             "ORDER BY a.actor_id", (tenant_id,),
         ).fetchall()

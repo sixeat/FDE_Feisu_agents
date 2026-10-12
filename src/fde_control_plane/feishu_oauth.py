@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
-from .models import ActorType, IdentityContext
+from .models import ActorType, AuditEvent, IdentityContext
 from .service import ControlPlane
 
 
@@ -23,6 +23,7 @@ class OAuthGrant:
 class OAuthUser:
     open_id: str
     tenant_key: str | None = None
+    name: str | None = None
 
 
 class MemberAccessPending(PermissionError):
@@ -65,11 +66,11 @@ class FeishuOAuthTransport:
         open_id = getattr(data, "open_id", None)
         if not open_id:
             raise RuntimeError("FEISHU_OAUTH_OPEN_ID_MISSING")
-        return OAuthUser(str(open_id), getattr(data, "tenant_key", None))
+        return OAuthUser(str(open_id), getattr(data, "tenant_key", None), getattr(data, "name", None))
 
 
 class FeishuOAuthIdentityGateway:
-    """Consume one-time state before exchanging a code; never auto-register users."""
+    """Consume one-time state and bind verified same-tenant users as plain members."""
 
     def __init__(
         self, control_plane: ControlPlane, transport: OAuthTransport, *,
@@ -109,12 +110,15 @@ class FeishuOAuthIdentityGateway:
         if user.tenant_key != self.expected_tenant_key:
             raise PermissionError("OAuth user belongs to another tenant")
         subject_hash = hashlib.sha256(user.open_id.encode("utf-8")).hexdigest()
-        row = self.control_plane.store.find_actor_by_external_hash(self.tenant_id, subject_hash)
-        if row is None:
-            pending = self.control_plane.store.request_member_access(
-                self.tenant_id, subject_hash, "member-request-" + secrets.token_hex(8),
-            )
-            raise MemberAccessPending(pending["request_id"])
+        display_name = "".join(ch for ch in (user.name or "").strip() if ch.isprintable())[:100] or None
+        row = self.control_plane.store.ensure_oauth_member(
+            self.tenant_id, subject_hash, "member-" + secrets.token_hex(8), display_name,
+            AuditEvent(
+                audit_id="audit-" + secrets.token_hex(12), event_type="MEMBER_AUTO_JOINED",
+                tenant_id=self.tenant_id, actor_id=None, task_run_id=None,
+                correlation_id=None, payload_hash=subject_hash, outcome="ACTIVE",
+            ),
+        )
         actor = self.control_plane._actor(row["actor_id"])
         if actor.actor_type != ActorType.USER:
             raise PermissionError("OAuth identity is not a member")

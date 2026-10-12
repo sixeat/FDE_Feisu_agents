@@ -219,7 +219,7 @@ def build_oauth_router(
                 "<!doctype html><html lang='zh-CN'><meta charset='utf-8'>"
                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
                 "<title>等待接入批准</title><main style='font:16px/1.6 sans-serif;max-width:40rem;margin:4rem auto;padding:1rem'>"
-                "<h1>接入申请已登记</h1><p>请把下面的识别码告知应用管理员。管理员在 Agent 管理页核对并批准后，重新打开工作台。</p>"
+                "<h1>接入申请已登记</h1><p>请把下面的识别码告知应用管理员。管理员在“成员与组织”中核对后处理，再重新打开工作台。</p>"
                 f"<p><strong>{escape(exc.request_id)}</strong></p></main></html>",
                 status_code=403,
             )

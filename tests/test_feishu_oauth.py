@@ -13,9 +13,10 @@ from fde_control_plane.models import IdentityContext
 
 
 class FakeOAuthTransport:
-    def __init__(self, *, tenant_key="tenant-key", open_id="ou_member"):
+    def __init__(self, *, tenant_key="tenant-key", open_id="ou_member", name="测试成员"):
         self.tenant_key = tenant_key
         self.open_id = open_id
+        self.name = name
         self.codes = []
         self.tokens = []
 
@@ -25,7 +26,7 @@ class FakeOAuthTransport:
 
     def get_user(self, access_token):
         self.tokens.append(access_token)
-        return OAuthUser(self.open_id, self.tenant_key)
+        return OAuthUser(self.open_id, self.tenant_key, self.name)
 
 
 def setup_oauth(tmp_path, *, now=None, transport=None):
@@ -73,39 +74,55 @@ def test_expired_state_fails_before_code_exchange(tmp_path):
     ("transport", "error"),
     [
         (FakeOAuthTransport(tenant_key="other-tenant"), "another tenant"),
-        (FakeOAuthTransport(open_id="ou_unknown"), "not bound"),
     ],
 )
-def test_oauth_rejects_foreign_or_unbound_user(tmp_path, transport, error):
+def test_oauth_rejects_foreign_user(tmp_path, transport, error):
     cp, gateway, _ = setup_oauth(tmp_path, transport=transport)
     state = gateway.issue_state(browser_session_ref="browser-1")
     with pytest.raises(PermissionError, match=error):
         gateway.complete(state=state, code="code", browser_session_ref="browser-1")
     pending = cp.store.list_pending_member_access("tenant")
-    assert len(pending) == (1 if transport.tenant_key == "tenant-key" else 0)
+    assert pending == []
 
 
-def test_unknown_member_requests_access_once_then_logs_in_after_admin_binding(tmp_path):
+def test_same_tenant_member_auto_joins_once_without_admin_role(tmp_path):
     transport = FakeOAuthTransport(open_id="ou_second")
     cp, gateway, _ = setup_oauth(tmp_path, transport=transport)
+    actor_ids = []
     for _ in range(2):
         state = gateway.issue_state(browser_session_ref="browser-second")
-        with pytest.raises(PermissionError, match="接入申请已登记"):
-            gateway.complete(state=state, code="code", browser_session_ref="browser-second")
-    requests = cp.store.list_pending_member_access("tenant")
-    assert len(requests) == 1
-    request_id = requests[0]["request_id"]
+        actor_ids.append(gateway.complete(state=state, code="code", browser_session_ref="browser-second").actor_id)
+    assert actor_ids[0] == actor_ids[1]
+    assert cp.store.list_pending_member_access("tenant") == []
     subject_hash = hashlib.sha256(b"ou_second").hexdigest()
     assert "ou_second" not in str(cp.store.connection.execute(
         "SELECT * FROM member_access_requests"
     ).fetchone()[:])
-    approved = cp.store.approve_member_access("tenant", request_id, "member-second")
-    assert approved["duplicate"] is False
-    assert cp.store.approve_member_access("tenant", request_id, "ignored")["actor_id"] == "member-second"
-    assert cp.store.find_actor_by_external_hash("tenant", subject_hash)["actor_id"] == "member-second"
-    assert cp._actor("member-second").roles == frozenset()
+    assert cp.store.find_actor_by_external_hash("tenant", subject_hash)["actor_id"] == actor_ids[0]
+    assert cp._actor(actor_ids[0]).roles == frozenset()
+    assert len([a for a in cp.store.list_audits() if a["event_type"] == "MEMBER_AUTO_JOINED"]) == 1
+    assert cp.store.list_member_directory("tenant")[1]["joined_at"] is not None
+    assert cp.store.list_bound_members("tenant")[1]["name"] == "测试成员"
+    transport.name = "新姓名"
     state = gateway.issue_state(browser_session_ref="browser-second")
-    assert gateway.complete(state=state, code="code", browser_session_ref="browser-second").actor_id == "member-second"
+    assert gateway.complete(state=state, code="code", browser_session_ref="browser-second").actor_id == actor_ids[0]
+    assert cp.store.list_bound_members("tenant")[1]["name"] == "新姓名"
+
+
+def test_old_pending_request_auto_joins_but_disabled_member_stays_disabled(tmp_path):
+    transport = FakeOAuthTransport(open_id="ou_second")
+    cp, gateway, _ = setup_oauth(tmp_path, transport=transport)
+    subject_hash = hashlib.sha256(b"ou_second").hexdigest()
+    cp.store.request_member_access("tenant", subject_hash, "member-request-old")
+    state = gateway.issue_state(browser_session_ref="browser-second")
+    member_id = gateway.complete(state=state, code="code", browser_session_ref="browser-second").actor_id
+    assert cp.store.list_pending_member_access("tenant") == []
+    assert cp.store.connection.execute("SELECT actor_id FROM member_access_requests WHERE request_id = 'member-request-old'").fetchone()[0] == member_id
+    cp.store.connection.execute("UPDATE actors SET active = 0 WHERE actor_id = ?", (member_id,))
+    state = gateway.issue_state(browser_session_ref="browser-second")
+    with pytest.raises(PermissionError):
+        gateway.complete(state=state, code="code", browser_session_ref="browser-second")
+    assert cp.store.get_actor(member_id)["active"] == 0
 
 
 def test_oauth_state_survives_control_plane_reopen(tmp_path):

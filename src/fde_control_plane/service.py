@@ -163,7 +163,7 @@ class ControlPlane:
         if user.tenant_id != tenant or assistant.tenant_id != tenant or agent.tenant_id != tenant:
             raise PermissionError("tenant mismatch")
         binding = self.store.get_binding(requested_by, tenant)
-        if binding is not None and binding["assistant_actor_id"] != assistant_actor_id:
+        if binding is None or binding["assistant_actor_id"] != assistant_actor_id:
             raise PermissionError("assistant is not bound to member")
         task = TaskRun(task_run_id=task_run_id or _id("run"), tenant_id=tenant, requested_by=requested_by,
                        assistant_actor_id=assistant_actor_id, agent_id=agent_id, agent_version=agent_version,

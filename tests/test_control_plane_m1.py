@@ -246,6 +246,10 @@ def test_identity_binding_delegation_and_task_state_guards(tmp_path):
     with pytest.raises(PermissionError):
         cp.create_task_run("user-1", "assistant-1", "meeting-agent", 1, identity=context)
 
+    cp.register_actor(Actor("unbound-user", "tenant-1", ActorType.USER, CAPS))
+    with pytest.raises(PermissionError, match="assistant is not bound"):
+        cp.create_task_run("unbound-user", "assistant-1", "meeting-agent", 1)
+
     cp.create_task_step(TaskStep("step-domain", task.task_run_id, "parse meeting", sequence=1))
     delegation = cp.delegate(Delegation("delegation-1", task.task_run_id, "assistant-1", "meeting-agent", CAPS))
     assert delegation.status == "ACTIVE"

@@ -54,6 +54,11 @@ def create_app() -> FastAPI:
     tenant_key = _required("FEISHU_TENANT_KEY")
     tenant_id = os.environ.get("FDE_TENANT_ID", "sixeat")
     redirect_uri = _required("FDE_OAUTH_REDIRECT_URI")
+    default_member_capabilities = frozenset(filter(None, (
+        item.strip() for item in os.environ.get("FDE_DEFAULT_MEMBER_CAPABILITIES", "").split(",")
+    )))
+    if not default_member_capabilities.issubset({"doc.read", "task.write"}):
+        raise ValueError("unsupported default member capability")
     db_path = Path(os.environ.get("FDE_DB_PATH", "/var/lib/fde-agent/control_plane.sqlite3"))
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -79,6 +84,12 @@ def create_app() -> FastAPI:
                       active=bool(existing_member["active"]))
             )
 
+    default_assistant_actor_id = os.environ.get("FDE_DEFAULT_ASSISTANT_ACTOR_ID", "").strip()
+    if default_assistant_actor_id:
+        control_plane.store.ensure_default_assistant_members(
+            tenant_id, default_assistant_actor_id, default_member_capabilities,
+        )
+
     # OAuth user-info requests pass the short-lived user token explicitly.
     # lark-oapi requires manual token mode for that request path.
     client = (
@@ -94,6 +105,8 @@ def create_app() -> FastAPI:
         FeishuOAuthTransport(client, redirect_uri=redirect_uri),
         tenant_id=tenant_id,
         expected_tenant_key=tenant_key,
+        default_assistant_actor_id=os.environ.get("FDE_DEFAULT_ASSISTANT_ACTOR_ID") or None,
+        default_member_capabilities=default_member_capabilities,
     )
     flow = FeishuOAuthWebFlow(
         gateway,

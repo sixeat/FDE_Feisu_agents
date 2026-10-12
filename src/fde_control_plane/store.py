@@ -8,6 +8,7 @@ field; callers pass already-sanitized payloads.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -64,6 +65,11 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS member_profiles (
                 actor_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
                 display_name TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS member_default_grants (
+                actor_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                capabilities_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_member_access_requests_pending
                 ON member_access_requests(tenant_id, status, created_at);
@@ -293,8 +299,10 @@ class SQLiteStore:
         return rows[0] if len(rows) == 1 else None
 
     def ensure_oauth_member(self, tenant_id: str, subject_ref_hash: str, actor_id: str,
-                            display_name: str | None, event: Any) -> sqlite3.Row:
-        """Provision a plain member after verified same-tenant OAuth, once per subject."""
+                            display_name: str | None, event: Any,
+                            default_assistant_actor_id: str | None = None,
+                            default_member_capabilities: frozenset[str] = frozenset()) -> sqlite3.Row:
+        """Provision a plain member and default assistant in one transaction."""
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             existing = self.connection.execute(
@@ -304,7 +312,13 @@ class SQLiteStore:
             if len(existing) > 1:
                 raise PermissionError("OAuth identity has multiple member bindings")
             if existing:
-                if existing[0]["actor_type"] == "USER" and existing[0]["active"] and display_name:
+                if existing[0]["actor_type"] != "USER" or not existing[0]["active"]:
+                    raise PermissionError("OAuth identity is not an active member")
+                if default_assistant_actor_id:
+                    self._ensure_default_assistant_binding(existing[0]["actor_id"], tenant_id, default_assistant_actor_id)
+                if default_member_capabilities:
+                    self._grant_auto_member_defaults(existing[0], tenant_id, default_member_capabilities, event)
+                if display_name:
                     self._upsert_member_profile(existing[0]["actor_id"], tenant_id, display_name)
                 self.connection.commit()
                 return existing[0]
@@ -316,9 +330,16 @@ class SQLiteStore:
                 raise PermissionError("OAuth member application has an incompatible status")
             self.connection.execute(
                 "INSERT INTO actors(actor_id, tenant_id, actor_type, capabilities_json, roles_json, external_ref_hash, active) "
-                "VALUES (?, ?, 'USER', '[]', '[]', ?, 1)",
-                (actor_id, tenant_id, subject_ref_hash),
+                "VALUES (?, ?, 'USER', ?, '[]', ?, 1)",
+                (actor_id, tenant_id, self._json(sorted(default_member_capabilities)), subject_ref_hash),
             )
+            if default_member_capabilities:
+                self.connection.execute(
+                    "INSERT INTO member_default_grants(actor_id, tenant_id, capabilities_json) VALUES (?, ?, ?)",
+                    (actor_id, tenant_id, self._json(sorted(default_member_capabilities))),
+                )
+            if default_assistant_actor_id:
+                self._ensure_default_assistant_binding(actor_id, tenant_id, default_assistant_actor_id)
             if display_name:
                 self._upsert_member_profile(actor_id, tenant_id, display_name)
             if pending is not None:
@@ -344,6 +365,134 @@ class SQLiteStore:
         except Exception:
             self.connection.rollback()
             raise
+
+    def _grant_auto_member_defaults(self, member: sqlite3.Row, tenant_id: str,
+                                    capabilities: frozenset[str], event: Any) -> None:
+        member_id = member["actor_id"]
+        prior_join = self.connection.execute(
+            "SELECT 1 FROM member_access_requests WHERE actor_id = ? AND tenant_id = ? "
+            "AND request_id = ? AND status = 'APPROVED'",
+            (member_id, tenant_id, "member-join-" + member_id),
+        ).fetchone()
+        already_granted = self.connection.execute(
+            "SELECT 1 FROM member_default_grants WHERE actor_id = ? AND tenant_id = ?",
+            (member_id, tenant_id),
+        ).fetchone()
+        if prior_join is None or already_granted is not None:
+            return
+        if json.loads(member["capabilities_json"]) == []:
+            self.connection.execute(
+                "UPDATE actors SET capabilities_json = ? WHERE actor_id = ? AND tenant_id = ?",
+                (self._json(sorted(capabilities)), member_id, tenant_id),
+            )
+            grant_event = {**asdict(event), "event_type": "MEMBER_DEFAULT_CAPABILITIES_GRANTED",
+                           "actor_id": member_id}
+            self.connection.execute(
+                "INSERT INTO audit_events(audit_id, event_type, tenant_id, task_run_id, data_json) "
+                "VALUES (?, ?, ?, NULL, ?)",
+                (event.audit_id, grant_event["event_type"], tenant_id, self._json(grant_event)),
+            )
+        self.connection.execute(
+            "INSERT INTO member_default_grants(actor_id, tenant_id, capabilities_json) VALUES (?, ?, ?)",
+            (member_id, tenant_id, self._json(sorted(capabilities))),
+        )
+
+    def _ensure_default_assistant_binding(self, member_actor_id: str, tenant_id: str,
+                                          assistant_actor_id: str) -> None:
+        assistant = self.connection.execute(
+            "SELECT actor_type, active FROM actors WHERE actor_id = ? AND tenant_id = ?",
+            (assistant_actor_id, tenant_id),
+        ).fetchone()
+        if assistant is None or assistant["actor_type"] != "PERSONAL_ASSISTANT" or not assistant["active"]:
+            raise PermissionError("configured default assistant is unavailable")
+        binding = self.connection.execute(
+            "SELECT assistant_actor_id FROM assistant_bindings "
+            "WHERE tenant_id = ? AND member_actor_id = ? AND is_default = 1",
+            (tenant_id, member_actor_id),
+        ).fetchall()
+        if len(binding) > 1:
+            raise PermissionError("member has multiple default assistants")
+        if binding:
+            return
+        self.connection.execute(
+            "INSERT INTO assistant_bindings(binding_id, tenant_id, member_actor_id, assistant_actor_id, is_default) "
+            "VALUES (?, ?, ?, ?, 1)",
+            ("binding-" + member_actor_id, tenant_id, member_actor_id, assistant_actor_id),
+        )
+
+    def ensure_default_assistant_members(self, tenant_id: str, assistant_actor_id: str,
+                                         capabilities: frozenset[str]) -> dict[str, int]:
+        """Idempotently bring existing active members onto the tenant default assistant."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        bound = granted = 0
+        try:
+            assistant = self.connection.execute(
+                "SELECT actor_type, active FROM actors WHERE actor_id = ? AND tenant_id = ?",
+                (assistant_actor_id, tenant_id),
+            ).fetchone()
+            if assistant is None or assistant["actor_type"] != "PERSONAL_ASSISTANT" or not assistant["active"]:
+                raise PermissionError("configured default assistant is unavailable")
+            members = self.connection.execute(
+                "SELECT * FROM actors WHERE tenant_id = ? AND actor_type = 'USER' AND active = 1",
+                (tenant_id,),
+            ).fetchall()
+            for member in members:
+                member_id = member["actor_id"]
+                binding = self.connection.execute(
+                    "SELECT 1 FROM assistant_bindings WHERE tenant_id = ? AND member_actor_id = ? AND is_default = 1",
+                    (tenant_id, member_id),
+                ).fetchone()
+                if binding is None:
+                    self._ensure_default_assistant_binding(member_id, tenant_id, assistant_actor_id)
+                    self._record_system_audit(
+                        "MEMBER_DEFAULT_ASSISTANT_BOUND", tenant_id, member_id,
+                        {"assistant_actor_id": assistant_actor_id},
+                    )
+                    bound += 1
+                if not capabilities:
+                    continue
+                grant = self.connection.execute(
+                    "SELECT 1 FROM member_default_grants WHERE actor_id = ? AND tenant_id = ?",
+                    (member_id, tenant_id),
+                ).fetchone()
+                auto_joined = self.connection.execute(
+                    "SELECT 1 FROM member_access_requests WHERE actor_id = ? AND tenant_id = ? "
+                    "AND request_id = ? AND status = 'APPROVED'",
+                    (member_id, tenant_id, "member-join-" + member_id),
+                ).fetchone()
+                current = frozenset(json.loads(member["capabilities_json"]))
+                if auto_joined is not None and grant is None and not current:
+                    self.connection.execute(
+                        "UPDATE actors SET capabilities_json = ? WHERE actor_id = ? AND tenant_id = ?",
+                        (self._json(sorted(capabilities)), member_id, tenant_id),
+                    )
+                    self.connection.execute(
+                        "INSERT INTO member_default_grants(actor_id, tenant_id, capabilities_json) VALUES (?, ?, ?)",
+                        (member_id, tenant_id, self._json(sorted(capabilities))),
+                    )
+                    self._record_system_audit(
+                        "MEMBER_DEFAULT_CAPABILITIES_GRANTED", tenant_id, member_id,
+                        {"capabilities": sorted(capabilities)},
+                    )
+                    granted += 1
+            self.connection.commit()
+            return {"bound": bound, "granted": granted}
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def _record_system_audit(self, event_type: str, tenant_id: str, actor_id: str,
+                             payload: dict[str, Any]) -> None:
+        audit_id = f"system-{event_type.lower()}-{actor_id}"
+        data = {"audit_id": audit_id, "event_type": event_type, "tenant_id": tenant_id,
+                "actor_id": actor_id, "task_run_id": None, "correlation_id": None,
+                "payload_hash": hashlib.sha256(self._json(payload).encode()).hexdigest(),
+                "outcome": "APPLIED", **payload}
+        self.connection.execute(
+            "INSERT OR IGNORE INTO audit_events(audit_id, event_type, tenant_id, task_run_id, data_json) "
+            "VALUES (?, ?, ?, NULL, ?)",
+            (audit_id, event_type, tenant_id, self._json(data)),
+        )
 
     def _upsert_member_profile(self, actor_id: str, tenant_id: str, display_name: str) -> None:
         self.connection.execute(

@@ -75,6 +75,8 @@ class FeishuOAuthIdentityGateway:
     def __init__(
         self, control_plane: ControlPlane, transport: OAuthTransport, *,
         tenant_id: str, expected_tenant_key: str,
+        default_assistant_actor_id: str | None = None,
+        default_member_capabilities: frozenset[str] = frozenset(),
         state_ttl_seconds: int = 300, clock: Callable[[], float] = time.time,
     ) -> None:
         if state_ttl_seconds < 1 or not tenant_id or not expected_tenant_key:
@@ -83,6 +85,8 @@ class FeishuOAuthIdentityGateway:
         self.transport = transport
         self.tenant_id = tenant_id
         self.expected_tenant_key = expected_tenant_key
+        self.default_assistant_actor_id = default_assistant_actor_id
+        self.default_member_capabilities = default_member_capabilities
         self.state_ttl_seconds = state_ttl_seconds
         self.clock = clock
 
@@ -118,6 +122,8 @@ class FeishuOAuthIdentityGateway:
                 tenant_id=self.tenant_id, actor_id=None, task_run_id=None,
                 correlation_id=None, payload_hash=subject_hash, outcome="ACTIVE",
             ),
+            self.default_assistant_actor_id,
+            self.default_member_capabilities,
         )
         actor = self.control_plane._actor(row["actor_id"])
         if actor.actor_type != ActorType.USER:

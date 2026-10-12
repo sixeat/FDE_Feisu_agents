@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from fde_control_plane import (
-    Actor, ActorType, ControlPlane, FeishuOAuthIdentityGateway, FeishuOAuthWebFlow,
+    Actor, ActorType, AssistantBinding, ControlPlane, FeishuOAuthIdentityGateway, FeishuOAuthWebFlow,
     OAuthWebConfig, SQLiteStore,
 )
 from fde_control_plane.feishu_oauth import OAuthGrant, OAuthUser
@@ -123,6 +123,117 @@ def test_old_pending_request_auto_joins_but_disabled_member_stays_disabled(tmp_p
     with pytest.raises(PermissionError):
         gateway.complete(state=state, code="code", browser_session_ref="browser-second")
     assert cp.store.get_actor(member_id)["active"] == 0
+
+
+def test_two_members_get_distinct_default_bindings_and_existing_binding_is_preserved(tmp_path):
+    cp, _, _ = setup_oauth(tmp_path)
+    cp.register_actor(Actor("assistant-default", "tenant", ActorType.PERSONAL_ASSISTANT,
+                            frozenset({"doc.read"})))
+    cp.register_actor(Actor("assistant-custom", "tenant", ActorType.PERSONAL_ASSISTANT,
+                            frozenset({"doc.read"})))
+    cp.bind_assistant(AssistantBinding("binding-custom", "tenant", "member", "assistant-custom"))
+    transport = FakeOAuthTransport(open_id="ou_second")
+    gateway = FeishuOAuthIdentityGateway(
+        cp, transport, tenant_id="tenant", expected_tenant_key="tenant-key",
+        default_assistant_actor_id="assistant-default", clock=lambda: 1000,
+    )
+    state = gateway.issue_state(browser_session_ref="browser-second")
+    second = gateway.complete(state=state, code="code", browser_session_ref="browser-second")
+    assert cp.store.get_binding(second.actor_id, "tenant")["assistant_actor_id"] == "assistant-default"
+    transport.open_id = "ou_member"
+    state = gateway.issue_state(browser_session_ref="browser-first")
+    first = gateway.complete(state=state, code="code", browser_session_ref="browser-first")
+    assert cp.store.get_binding(first.actor_id, "tenant")["assistant_actor_id"] == "assistant-custom"
+    assert cp.store.get_binding(first.actor_id, "tenant")["member_actor_id"] != second.actor_id
+    assert cp._actor(second.actor_id).capabilities == frozenset()
+
+
+def test_missing_or_cross_tenant_default_assistant_cannot_partially_join(tmp_path):
+    cp, _, _ = setup_oauth(tmp_path)
+    cp.register_actor(Actor("other-assistant", "other", ActorType.PERSONAL_ASSISTANT))
+    transport = FakeOAuthTransport(open_id="ou_second")
+    gateway = FeishuOAuthIdentityGateway(
+        cp, transport, tenant_id="tenant", expected_tenant_key="tenant-key",
+        default_assistant_actor_id="other-assistant", clock=lambda: 1000,
+    )
+    state = gateway.issue_state(browser_session_ref="browser-second")
+    with pytest.raises(PermissionError, match="default assistant"):
+        gateway.complete(state=state, code="code", browser_session_ref="browser-second")
+    assert cp.store.find_actor_by_external_hash("tenant", hashlib.sha256(b"ou_second").hexdigest()) is None
+    assert cp.store.list_pending_member_access("tenant") == []
+
+
+def test_default_meeting_capabilities_are_one_time_and_revocation_survives_login(tmp_path):
+    cp, _, _ = setup_oauth(tmp_path)
+    cp.register_actor(Actor("assistant-default", "tenant", ActorType.PERSONAL_ASSISTANT,
+                            frozenset({"doc.read", "task.write"})))
+    transport = FakeOAuthTransport(open_id="ou_second")
+    gateway = FeishuOAuthIdentityGateway(
+        cp, transport, tenant_id="tenant", expected_tenant_key="tenant-key",
+        default_assistant_actor_id="assistant-default",
+        default_member_capabilities=frozenset({"doc.read", "task.write"}), clock=lambda: 1000,
+    )
+    state = gateway.issue_state(browser_session_ref="browser-second")
+    member_id = gateway.complete(state=state, code="code", browser_session_ref="browser-second").actor_id
+    assert cp._actor(member_id).capabilities == frozenset({"doc.read", "task.write"})
+    assert cp.store.get_binding(member_id, "tenant")["assistant_actor_id"] == "assistant-default"
+    cp.store.connection.execute("UPDATE actors SET capabilities_json = '[]' WHERE actor_id = ?", (member_id,))
+    state = gateway.issue_state(browser_session_ref="browser-second")
+    gateway.complete(state=state, code="code", browser_session_ref="browser-second")
+    assert cp._actor(member_id).capabilities == frozenset()
+
+
+def test_previous_auto_joined_member_gets_default_once(tmp_path):
+    transport = FakeOAuthTransport(open_id="ou_second")
+    cp, gateway, _ = setup_oauth(tmp_path, transport=transport)
+    state = gateway.issue_state(browser_session_ref="browser-second")
+    member_id = gateway.complete(state=state, code="code", browser_session_ref="browser-second").actor_id
+    cp.register_actor(Actor("assistant-default", "tenant", ActorType.PERSONAL_ASSISTANT))
+    upgraded = FeishuOAuthIdentityGateway(
+        cp, transport, tenant_id="tenant", expected_tenant_key="tenant-key",
+        default_assistant_actor_id="assistant-default",
+        default_member_capabilities=frozenset({"doc.read", "task.write"}), clock=lambda: 1000,
+    )
+    state = upgraded.issue_state(browser_session_ref="browser-second")
+    assert upgraded.complete(state=state, code="code", browser_session_ref="browser-second").actor_id == member_id
+    assert cp._actor(member_id).capabilities == frozenset({"doc.read", "task.write"})
+    assert cp.store.get_binding(member_id, "tenant")["assistant_actor_id"] == "assistant-default"
+    cp.store.connection.execute("UPDATE actors SET capabilities_json = '[]' WHERE actor_id = ?", (member_id,))
+    state = upgraded.issue_state(browser_session_ref="browser-second")
+    upgraded.complete(state=state, code="code", browser_session_ref="browser-second")
+    assert cp._actor(member_id).capabilities == frozenset()
+
+
+def test_startup_migration_binds_existing_members_without_overwriting_custom_binding(tmp_path):
+    cp, _, _ = setup_oauth(tmp_path)
+    transport = FakeOAuthTransport(open_id="ou_auto_joined")
+    gateway = FeishuOAuthIdentityGateway(
+        cp, transport, tenant_id="tenant", expected_tenant_key="tenant-key", clock=lambda: 1000,
+    )
+    state = gateway.issue_state(browser_session_ref="browser-auto")
+    auto_member_id = gateway.complete(state=state, code="code", browser_session_ref="browser-auto").actor_id
+    cp.register_actor(Actor("assistant-default", "tenant", ActorType.PERSONAL_ASSISTANT,
+                            frozenset({"doc.read", "task.write"})))
+    cp.register_actor(Actor("assistant-custom", "tenant", ActorType.PERSONAL_ASSISTANT,
+                            frozenset({"doc.read"})))
+    cp.register_actor(Actor("custom-member", "tenant", ActorType.USER,
+                            frozenset({"doc.read"}), external_ref_hash="custom-subject"))
+    cp.bind_assistant(AssistantBinding("custom-binding", "tenant", "custom-member", "assistant-custom"))
+    result = cp.store.ensure_default_assistant_members(
+        "tenant", "assistant-default", frozenset({"doc.read", "task.write"}),
+    )
+    assert result == {"bound": 2, "granted": 1}
+    assert cp.store.get_binding("member", "tenant")["assistant_actor_id"] == "assistant-default"
+    assert cp.store.get_binding(auto_member_id, "tenant")["assistant_actor_id"] == "assistant-default"
+    assert cp.store.get_binding("custom-member", "tenant")["assistant_actor_id"] == "assistant-custom"
+    assert cp._actor("member").capabilities == frozenset()
+    assert cp._actor(auto_member_id).capabilities == frozenset({"doc.read", "task.write"})
+    assert cp._actor("custom-member").capabilities == frozenset({"doc.read"})
+    cp.store.connection.execute("UPDATE actors SET capabilities_json = '[]' WHERE actor_id = ?", (auto_member_id,))
+    assert cp.store.ensure_default_assistant_members(
+        "tenant", "assistant-default", frozenset({"doc.read", "task.write"}),
+    ) == {"bound": 0, "granted": 0}
+    assert cp._actor(auto_member_id).capabilities == frozenset()
 
 
 def test_oauth_state_survives_control_plane_reopen(tmp_path):

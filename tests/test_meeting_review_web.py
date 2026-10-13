@@ -19,7 +19,7 @@ from fde_control_plane import (
     RiskLevel, ToolDefinition,
 )
 from fde_control_plane.meeting_review_web import MeetingReviewWebService, build_meeting_review_router
-from test_feishu_review import setup_review, DOCUMENT_ID, SUBJECT, CAPS
+from test_feishu_review import setup_review, DOCUMENT_ID, SUBJECT, CAPS, FailedRuntime
 
 
 def web_setup(tmp_path, revision="5", identity=None):
@@ -138,6 +138,66 @@ def test_start_meeting_web_requires_csrf_and_isolates_members(tmp_path):
     assert {record_id, "record"} <= member_a_records
     assert result_b["record_id"] not in member_a_records
     assert cp.store.get_binding("member-b", "tenant")["assistant_actor_id"] == "assistant-b"
+
+
+@pytest.mark.parametrize(
+    ("runtime_status", "task_status"),
+    [("FAILED", "FAILED"), ("UNKNOWN", "RECONCILING")],
+)
+def test_start_meeting_web_exposes_runtime_failure_without_creating_record(
+    tmp_path, runtime_status, task_status,
+):
+    cp, gateway, reader, owner, _, _ = setup_review(tmp_path)
+    gateway.orchestrator.runtime = FailedRuntime(runtime_status)
+    sessions = SQLiteOAuthSessionIssuer(cp, tenant_id="tenant")
+    app = FastAPI()
+    app.include_router(build_meeting_review_router(
+        MeetingReviewWebService(gateway, meeting_agent_id="agent"),
+        sessions, public_origin="https://example.test",
+    ))
+    client = TestClient(app)
+    client.cookies.set("fde_auth_session", sessions(owner))
+    index = client.get("/api/meetings").json()
+    headers = {"X-CSRF-Token": index["csrf_token"], "Origin": "https://example.test"}
+    response = client.post(
+        "/api/meetings/start",
+        json={"document_url": "https://tenant.feishu.cn/docx/test-docx-id"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert result["created"] is False
+    assert result["runtime_status"] == runtime_status
+    assert result["task_status"] == task_status
+    assert result["error_code"] == "TEST_RUNTIME_FAILURE"
+    assert cp.store.get_meeting_record(result["record_id"]) is None
+    assert reader.calls == [("read", DOCUMENT_ID)]
+
+
+def test_start_meeting_web_rejects_member_without_assistant_binding(tmp_path):
+    cp, gateway, reader, _, _, _ = setup_review(tmp_path)
+    subject = hashlib.sha256(b"ou_unbound").hexdigest()
+    cp.register_actor(Actor("unbound", "tenant", ActorType.USER, CAPS,
+                            external_ref_hash=subject))
+    sessions = SQLiteOAuthSessionIssuer(cp, tenant_id="tenant")
+    app = FastAPI()
+    app.include_router(build_meeting_review_router(
+        MeetingReviewWebService(gateway, meeting_agent_id="agent"),
+        sessions, public_origin="https://example.test",
+    ))
+    client = TestClient(app)
+    client.cookies.set("fde_auth_session", sessions(IdentityContext(
+        "tenant", "unbound", "user_oauth", subject,
+    )))
+    index = client.get("/api/meetings").json()
+    response = client.post(
+        "/api/meetings/start",
+        json={"document_url": "https://tenant.feishu.cn/docx/test-docx-id"},
+        headers={"X-CSRF-Token": index["csrf_token"], "Origin": "https://example.test"},
+    )
+    assert response.status_code == 403
+    assert "个人助手" in response.text
+    assert reader.calls == []
 
 
 def test_logout_revokes_session_and_clears_browser_cookies(tmp_path):

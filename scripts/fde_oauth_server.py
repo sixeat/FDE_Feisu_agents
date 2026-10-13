@@ -54,6 +54,7 @@ def create_app() -> FastAPI:
     tenant_key = _required("FEISHU_TENANT_KEY")
     tenant_id = os.environ.get("FDE_TENANT_ID", "sixeat")
     redirect_uri = _required("FDE_OAUTH_REDIRECT_URI")
+    meeting_agent_id = os.environ.get("FDE_MEETING_AGENT_ID", "meeting-agent").strip() or "meeting-agent"
     default_member_capabilities = frozenset(filter(None, (
         item.strip() for item in os.environ.get("FDE_DEFAULT_MEMBER_CAPABILITIES", "").split(",")
     )))
@@ -149,7 +150,7 @@ def create_app() -> FastAPI:
     )
     uri = urlsplit(redirect_uri)
     app.include_router(build_meeting_review_router(
-        MeetingReviewWebService(review_gateway), sessions,
+        MeetingReviewWebService(review_gateway, meeting_agent_id=meeting_agent_id), sessions,
         public_origin=f"{uri.scheme}://{uri.netloc}",
     ))
 

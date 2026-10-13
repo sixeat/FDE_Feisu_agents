@@ -111,6 +111,27 @@ async function loadOrganizerTasks() {
   catch(error){organizerNotice(error.message,"error");}
   finally{organizerState.busy=false;$("organizer-reload").disabled=false;$("organizer-task-list").setAttribute("aria-busy","false");}
 }
+async function submitMeetingStart(event) {
+  event.preventDefault();
+  if(organizerState.busy)return;
+  const url=$("meeting-document-url").value.trim();
+  if(!url)return;
+  organizerState.busy=true;$("meeting-document-url").disabled=true;
+  const panel=$("meeting-start-notice");panel.textContent="个人助手正在读取文档并调用会议 Agent…";panel.className="";panel.hidden=false;
+  try {
+    const result=await api("/api/meetings/start",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":organizerState.csrf},body:JSON.stringify({document_url:url})});
+    panel.textContent=`已创建会议任务：${result.title}。提取 ${result.todo_count} 项，其中 ${result.needs_confirmation} 项需要人工确认。`;
+    panel.className="success";
+    $("meeting-document-url").value="";
+    await loadOrganizerTasks();
+    await load();
+    if(result.record_id)showView("meetings");
+  } catch(error) {
+    panel.textContent=error.message;panel.className="error";
+  } finally {
+    organizerState.busy=false;$("meeting-document-url").disabled=false;
+  }
+}
 async function proposeOrganizerCorrection(task) {
   if(organizerState.busy)return;
   if(!window.confirm(`为这条任务提出日期修正？\n飞书当前日期：${task.remote_due_date}\n原批准日期：${task.approved_due_date}`))return;
@@ -521,6 +542,7 @@ $("logout").addEventListener("click",async()=>{
 window.addEventListener("beforeunload",event=>{if(state.dirty){event.preventDefault();event.returnValue="";}});
 $("owner-reload").addEventListener("click",loadOwnerTasks);
 $("organizer-reload").addEventListener("click",loadOrganizerTasks);
+$("meeting-start-form").addEventListener("submit",submitMeetingStart);
 $("follow-up-reload").addEventListener("click",refreshDigest);
 $("agents-reload").addEventListener("click",loadAgents);
 $("members-reload").addEventListener("click",loadMembers);

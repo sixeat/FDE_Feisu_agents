@@ -40,6 +40,15 @@ class FakeRevisionReader:
         self.calls.append(document_id)
         return self.revision
 
+    def read_document(self, document_id):
+        self.calls.append(("read", document_id))
+        return {
+            "document_id": document_id,
+            "revision_id": self.revision,
+            "title": "测试会议",
+            "blocks": [{"index": 2, "block_type": 2, "text": "张三整理部署文档"}],
+        }
+
 
 def setup_review(tmp_path, revision="5"):
     cp = ControlPlane(SQLiteStore(tmp_path / "review.sqlite3"))
@@ -73,6 +82,34 @@ def test_fresh_document_allows_submitter_to_create_pending_proposal(tmp_path):
     assert len(result.approval_ids) == 1
     assert cp._task(task_id).status == TaskRunStatus.WAITING_APPROVAL
     assert cp.store.list_tool_calls(task_id) == []
+
+
+def test_start_meeting_routes_document_through_bound_personal_assistant(tmp_path):
+    cp, _, reader, identity, _, _ = setup_review(tmp_path)
+    gateway = FeishuMeetingReviewGateway(cp, AgentOrchestrator(cp, FakeRuntime()), reader)
+    result = gateway.start_meeting(
+        document_url="https://tenant.feishu.cn/docx/test-docx-id?from=copy",
+        requester_identity=identity,
+        agent_id="agent",
+    )
+    assert result["runtime_status"] == "SUCCEEDED"
+    assert result["contract_status"] == "NEEDS_HUMAN_REVIEW"
+    assert result["todo_count"] == 1
+    assert result["record_id"].startswith("meeting-")
+    assert reader.calls == [("read", DOCUMENT_ID)]
+    task = cp.store.get_task_run(result["task_run_id"])
+    assert task["requested_by"] == "member"
+    assert task["assistant_actor_id"] == "assistant"
+    assert cp.store.get_meeting_source(result["record_id"])["document_id"] == DOCUMENT_ID
+
+
+def test_start_meeting_rejects_non_feishu_document_before_read(tmp_path):
+    cp, _, reader, identity, _, _ = setup_review(tmp_path)
+    gateway = FeishuMeetingReviewGateway(cp, AgentOrchestrator(cp, FakeRuntime()), reader)
+    with pytest.raises(ValueError, match="飞书 docx"):
+        gateway.start_meeting(document_url="https://example.com/docx/test-docx-id", requester_identity=identity,
+                              agent_id="agent")
+    assert reader.calls == []
 
 
 def test_stale_document_blocks_review_without_changing_drafts(tmp_path):

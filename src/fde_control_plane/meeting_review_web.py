@@ -46,6 +46,11 @@ class ReviewRequest(BaseModel):
     updates: dict[str, ReviewEdit] = Field(max_length=200)
 
 
+class MeetingStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    document_url: StrictStr = Field(min_length=20, max_length=1000)
+
+
 class OwnerDecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     event_id: StrictStr = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_-]+$")
@@ -131,10 +136,25 @@ class DueCorrectionApproval(BaseModel):
 
 
 class MeetingReviewWebService:
-    def __init__(self, gateway: FeishuMeetingReviewGateway) -> None:
+    def __init__(self, gateway: FeishuMeetingReviewGateway, *, meeting_agent_id: str = "meeting-agent") -> None:
         self.gateway = gateway
         self.cp = gateway.control_plane
+        self.meeting_agent_id = meeting_agent_id
         self.lock = RLock()
+
+    def start_meeting(self, identity: IdentityContext, body: MeetingStartRequest) -> dict[str, Any]:
+        try:
+            return self.gateway.start_meeting(
+                document_url=body.document_url,
+                requester_identity=identity,
+                agent_id=self.meeting_agent_id,
+            )
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(503, "会议文档暂时无法读取，请稍后重试") from exc
 
     def agent_registry(self, identity: IdentityContext) -> dict[str, Any]:
         """Return a tenant-scoped, read-only directory of managed agents."""
@@ -825,6 +845,13 @@ def build_meeting_review_router(
     def get_digest(business_date: str | None = None, identity: IdentityContext = Depends(require_identity)):
         with service.lock:
             return service.daily_follow_up_digest(identity, business_date)
+
+    @router.post("/start")
+    def start_meeting(body: MeetingStartRequest, request: Request,
+                      identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        with service.lock:
+            return service.start_meeting(identity, body)
 
     @router.get("/agents")
     def get_agents(identity: IdentityContext = Depends(require_identity)):

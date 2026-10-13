@@ -42,6 +42,14 @@
       </section>
       <section id="view-organizer-tasks" class="view-panel" role="tabpanel" aria-labelledby="module-organizer-tasks" hidden>
         <div class="heading"><div><p class="eyebrow">任务中心</p><h1>我发起的任务</h1></div><button id="organizer-reload" type="button">刷新状态</button></div>
+        <section class="agent-draft-editor" aria-labelledby="start-meeting-title">
+          <div class="owner-heading"><h2 id="start-meeting-title">提交会议文档</h2><span class="muted">个人助手会调用会议 Agent 提取待办，结果先进入人工审核。</span></div>
+          <form id="meeting-start-form">
+            <div class="fields"><label class="field title-field"><span>飞书文档链接</span><input id="meeting-document-url" type="url" required maxlength="1000" placeholder="https://你的租户.feishu.cn/docx/..." autocomplete="off"></label></div>
+            <div class="commands"><button class="primary" type="submit">交给个人助手</button></div>
+          </form>
+          <div id="meeting-start-notice" role="status" aria-live="polite" hidden></div>
+        </section>
         <section id="organizer-tasks" class="owner-tasks" aria-labelledby="organizer-tasks-title"><div class="owner-heading"><h2 id="organizer-tasks-title">任务处理</h2></div><div id="organizer-notice" role="status" aria-live="polite" hidden></div><div id="organizer-task-list" aria-busy="true"><p class="muted">正在加载任务…</p></div></section>
       </section>
       <section id="view-follow-up" class="view-panel" role="tabpanel" aria-labelledby="module-follow-up" hidden>

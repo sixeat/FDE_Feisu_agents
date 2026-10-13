@@ -8,6 +8,7 @@ import pytest
 from fde_control_plane import (
     Actor,
     ActorType,
+    AssistantBinding,
     AgentVersion,
     Delegation,
     IdentityContext,
@@ -18,7 +19,7 @@ from fde_control_plane import (
     RiskLevel, ToolDefinition,
 )
 from fde_control_plane.meeting_review_web import MeetingReviewWebService, build_meeting_review_router
-from test_feishu_review import setup_review, DOCUMENT_ID, SUBJECT
+from test_feishu_review import setup_review, DOCUMENT_ID, SUBJECT, CAPS
 
 
 def web_setup(tmp_path, revision="5", identity=None):
@@ -80,6 +81,63 @@ def test_other_bound_member_and_logged_out_user_cannot_read_meeting(tmp_path):
     client.cookies.set("fde_auth_session", sessions(IdentityContext("tenant", "admin", "user_oauth", "admin-subject")))
     assert client.get("/api/meetings").json()["meetings"] == []
     assert client.get("/api/meetings/record").status_code == 404
+
+
+def test_start_meeting_web_requires_csrf_and_isolates_members(tmp_path):
+    cp, gateway, reader, owner, _, _ = setup_review(tmp_path)
+    member_b_subject = hashlib.sha256(b"ou_member_b").hexdigest()
+    cp.register_actor(Actor("member-b", "tenant", ActorType.USER, CAPS,
+                            external_ref_hash=member_b_subject))
+    cp.register_actor(Actor("assistant-b", "tenant", ActorType.PERSONAL_ASSISTANT, CAPS))
+    cp.bind_assistant(AssistantBinding("binding-b", "tenant", "member-b", "assistant-b"))
+
+    sessions = SQLiteOAuthSessionIssuer(cp, tenant_id="tenant")
+    app = FastAPI()
+    app.include_router(build_meeting_review_router(
+        MeetingReviewWebService(gateway, meeting_agent_id="agent"),
+        sessions, public_origin="https://example.test",
+    ))
+    client = TestClient(app)
+    client.cookies.set("fde_auth_session", sessions(owner))
+    index = client.get("/api/meetings").json()
+    headers_a = {"X-CSRF-Token": index["csrf_token"], "Origin": "https://example.test"}
+    payload = {"document_url": "https://tenant.feishu.cn/docx/test-docx-id?from=copy"}
+
+    assert client.post("/api/meetings/start", json=payload).status_code == 403
+    assert client.post("/api/meetings/start", json={
+        "document_url": "https://example.com/docx/test-docx-id",
+    }, headers=headers_a).status_code == 422
+    assert reader.calls == []
+
+    started = client.post("/api/meetings/start", json=payload, headers=headers_a)
+    assert started.status_code == 200
+    result = started.json()
+    assert result["created"] is True
+    assert result["task_status"] == "WAITING_REVIEW"
+    assert cp.store.get_task_run(result["task_run_id"])["assistant_actor_id"] == "assistant"
+    record_id = result["record_id"]
+    member_a_detail = client.get(f"/api/meetings/{record_id}")
+    assert member_a_detail.status_code == 200
+
+    headers_b = switch_user(cp, client, "member-b", member_b_subject)
+    assert client.get("/api/meetings").json()["meetings"] == []
+    assert client.get(f"/api/meetings/{record_id}").status_code == 404
+    assert client.post(
+        f"/api/meetings/{record_id}/submit",
+        json={"snapshot": member_a_detail.json()["snapshot"], "updates": {}},
+        headers=headers_b,
+    ).status_code == 404
+
+    started_b = client.post("/api/meetings/start", json=payload, headers=headers_b)
+    assert started_b.status_code == 200
+    result_b = started_b.json()
+    assert result_b["created"] is True
+    assert cp.store.get_task_run(result_b["task_run_id"])["assistant_actor_id"] == "assistant-b"
+    headers_a = switch_user(cp, client, "member", SUBJECT)
+    member_a_records = {item["record_id"] for item in client.get("/api/meetings").json()["meetings"]}
+    assert {record_id, "record"} <= member_a_records
+    assert result_b["record_id"] not in member_a_records
+    assert cp.store.get_binding("member-b", "tenant")["assistant_actor_id"] == "assistant-b"
 
 
 def test_logout_revokes_session_and_clears_browser_cookies(tmp_path):

@@ -185,11 +185,17 @@ class FeishuMeetingReviewGateway:
             })
         record = self.control_plane.store.get_meeting_record(record_id)
         drafts = self.control_plane.store.list_meeting_todos(record_id) if record else []
+        task_row = self.control_plane.store.get_task_run(execution.task_run_id) or {}
+        runtime_status = execution.runtime_result.status
+        created = bool(record is not None and task_row.get("status") == "WAITING_REVIEW")
         return {
             "record_id": record_id,
             "task_run_id": execution.task_run_id,
             "title": source.get("title") or "会议纪要",
-            "runtime_status": execution.runtime_result.status,
+            "runtime_status": runtime_status,
+            "task_status": task_row.get("status"),
+            "error_code": execution.runtime_result.error_code,
+            "created": created,
             "contract_status": record.get("contract_status") if record else None,
             "todo_count": len(drafts),
             "needs_confirmation": sum(d["status"] == "NEEDS_CONFIRMATION" for d in drafts),

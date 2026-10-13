@@ -120,12 +120,22 @@ async function submitMeetingStart(event) {
   const panel=$("meeting-start-notice");panel.textContent="个人助手正在读取文档并调用会议 Agent…";panel.className="";panel.hidden=false;
   try {
     const result=await api("/api/meetings/start",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":organizerState.csrf},body:JSON.stringify({document_url:url})});
-    panel.textContent=`已创建会议任务：${result.title}。提取 ${result.todo_count} 项，其中 ${result.needs_confirmation} 项需要人工确认。`;
-    panel.className="success";
-    $("meeting-document-url").value="";
-    await loadOrganizerTasks();
-    await load();
-    if(result.record_id)showView("meetings");
+    if(result.created) {
+      panel.textContent=`已创建会议任务：${result.title}。提取 ${result.todo_count} 项，其中 ${result.needs_confirmation} 项需要人工确认。`;
+      panel.className="success";
+      $("meeting-document-url").value="";
+      await loadOrganizerTasks();
+      await load();
+      if(result.record_id)showView("meetings");
+    } else if(result.runtime_status==="UNKNOWN" || result.task_status==="RECONCILING") {
+      panel.textContent=`会议任务已进入待核验状态，暂未生成审核草稿。错误标识：${result.error_code||"UNKNOWN"}。请稍后刷新或查看审计日志。`;
+      panel.className="error";
+      await loadOrganizerTasks();
+    } else {
+      panel.textContent=`会议 Agent 执行失败，未创建审核草稿。错误标识：${result.error_code||"RUNTIME_FAILED"}。`;
+      panel.className="error";
+      await loadOrganizerTasks();
+    }
   } catch(error) {
     panel.textContent=error.message;panel.className="error";
   } finally {

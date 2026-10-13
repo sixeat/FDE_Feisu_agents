@@ -31,6 +31,14 @@ class FakeRuntime:
         }, None)
 
 
+class FailedRuntime:
+    def __init__(self, status="FAILED"):
+        self.status = status
+
+    def run_once(self, request):
+        return RuntimeResult(self.status, None, None, error_code="TEST_RUNTIME_FAILURE")
+
+
 class FakeRevisionReader:
     def __init__(self, revision="5"):
         self.revision = revision
@@ -110,6 +118,23 @@ def test_start_meeting_rejects_non_feishu_document_before_read(tmp_path):
         gateway.start_meeting(document_url="https://example.com/docx/test-docx-id", requester_identity=identity,
                               agent_id="agent")
     assert reader.calls == []
+
+
+@pytest.mark.parametrize("status,task_status", [("FAILED", "FAILED"), ("UNKNOWN", "RECONCILING")])
+def test_start_meeting_exposes_runtime_failure_without_claiming_created(tmp_path, status, task_status):
+    cp, _, reader, identity, _, _ = setup_review(tmp_path)
+    gateway = FeishuMeetingReviewGateway(cp, AgentOrchestrator(cp, FailedRuntime(status)), reader)
+    result = gateway.start_meeting(
+        document_url="https://tenant.feishu.cn/docx/test-docx-id?from=copy",
+        requester_identity=identity,
+        agent_id="agent",
+    )
+    assert result["created"] is False
+    assert result["runtime_status"] == status
+    assert result["task_status"] == task_status
+    assert result["error_code"] == "TEST_RUNTIME_FAILURE"
+    assert result["todo_count"] == 0
+    assert cp.store.get_meeting_record(result["record_id"]) is None
 
 
 def test_stale_document_blocks_review_without_changing_drafts(tmp_path):

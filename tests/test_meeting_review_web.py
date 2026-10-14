@@ -200,6 +200,42 @@ def test_start_meeting_web_rejects_member_without_assistant_binding(tmp_path):
     assert reader.calls == []
 
 
+def test_start_meeting_web_replays_same_document_revision_idempotently(tmp_path):
+    cp, gateway, reader, owner, _, _ = setup_review(tmp_path)
+    original_runtime = gateway.orchestrator.runtime
+    runtime_calls = []
+
+    class CountingRuntime:
+        def run_once(self, request):
+            runtime_calls.append(request)
+            return original_runtime.run_once(request)
+
+    gateway.orchestrator.runtime = CountingRuntime()
+    sessions = SQLiteOAuthSessionIssuer(cp, tenant_id="tenant")
+    app = FastAPI()
+    app.include_router(build_meeting_review_router(
+        MeetingReviewWebService(gateway, meeting_agent_id="agent"),
+        sessions, public_origin="https://example.test",
+    ))
+    client = TestClient(app)
+    client.cookies.set("fde_auth_session", sessions(owner))
+    index = client.get("/api/meetings").json()
+    headers = {"X-CSRF-Token": index["csrf_token"], "Origin": "https://example.test"}
+    payload = {"document_url": "https://tenant.feishu.cn/docx/test-docx-id"}
+
+    first = client.post("/api/meetings/start", json=payload, headers=headers)
+    replay = client.post("/api/meetings/start", json=payload, headers=headers)
+    assert first.status_code == replay.status_code == 200
+    first_result, replay_result = first.json(), replay.json()
+    assert first_result["record_id"] == replay_result["record_id"]
+    assert first_result["task_run_id"] == replay_result["task_run_id"]
+    assert first_result["deduplicated"] is False
+    assert replay_result["deduplicated"] is True
+    assert len(runtime_calls) == 1
+    assert len(cp.store.list_member_meetings("tenant", owner.actor_id)) == 2
+    assert reader.calls == [("read", DOCUMENT_ID), ("read", DOCUMENT_ID)]
+
+
 def test_logout_revokes_session_and_clears_browser_cookies(tmp_path):
     cp, _, client, headers, _, _, _ = web_setup(tmp_path)
     token = client.cookies.get("fde_auth_session")

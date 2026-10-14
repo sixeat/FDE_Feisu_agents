@@ -76,6 +76,13 @@ Runtime：Hermes CLI 已用于会议 Agent 语义执行；线上控制平面现�
 
 ## 最近一次讨论记录
 
+### 2026-10-14 第二成员真实会议提取与 H5 超时误报修正
+
+- 现象与事实：测试号提交新的 `/docx/` 文档版本后，H5 在 15 秒时提示“响应超时”；线上 SQLite 随后显示该成员的 `TaskRun=WAITING_REVIEW`、来源版本 7、`MeetingRecord` 已生成并有 2 条待办草稿，合约状态为 `NEEDS_HUMAN_REVIEW`。这说明文档读取和 Hermes 提取成功，页面超时不等于任务失败；此前失败版本仍按原幂等记录保留。
+- 修正：只有 `POST /api/meetings/start` 的浏览器等待时限提升至 150 秒，Nginx 同一路径的 `proxy_read_timeout` 调至 160 秒；其他接口仍保留 15 秒。入口提示长推理可能需 1–2 分钟，若仍超时则先到“会议审核”核对结果。提交成功后强制刷新“发起的任务”列表，避免入口 busy 状态阻止刷新；随后进入会议审核。
+- 验证与发布：本地 `node --check`、`git diff --check` 和全量 `pytest` 均通过（215 项、4 项第三方弃用警告）。服务器备份 SQLite、Compose、Nginx 配置与原 H5 脚本到 `data/backups/20261014-meeting-h5-timeout/`，备份 `quick_check=ok`。基于已验证 Hermes 镜像构建 `fde-control-plane:meeting-ui-timeout-20261014`；Nginx 配置测试通过并重载，仅重建控制平面。新容器 healthy、重启数 0、`/health` 正常，线上静态脚本已更新；审批监听器和只读无网络 Worker 未重启。会议记录仍为 2、草稿 9、outbox 5，未触发飞书业务写入。
+- 尚待验收：测试号刷新“会议审核”实看两条草稿；管理员账号再验证无法看见、读取或提交该成员记录。同步执行与进程内请求锁仍可能在并发或超长推理时阻塞其他请求，后续转持久化异步任务时必须设计领取租约、UNKNOWN 对账和状态查询。
+
 ### 2026-10-14 线上 Hermes 启动失败修复与第二成员文档排障
 
 - 现象：测试号在“文档库”建立的真实文档分享地址为 `/wiki/<token>`，H5 当前入口只接受 `/docx/<document_id>`，故被输入校验拦截；后来取得 `/docx/` 链接，文档读取通过，但显示 `RUNTIME_START_FAILED`，未创建审核草稿。不能把这两种错误混为文档权限问题，也不能直接替换 URL 路径里的 token。

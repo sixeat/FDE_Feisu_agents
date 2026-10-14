@@ -104,8 +104,8 @@ function renderOrganizerTasks() {
     panel.append(card);
   });
 }
-async function loadOrganizerTasks() {
-  if(organizerState.busy)return;organizerState.busy=true;$("organizer-reload").disabled=true;
+async function loadOrganizerTasks(force=false) {
+  if(organizerState.busy&&!force)return;organizerState.busy=true;$("organizer-reload").disabled=true;
   $("organizer-task-list").setAttribute("aria-busy","true");
   try{const data=await api("/api/meetings/organizer-tasks");organizerState.csrf=data.csrf_token;organizerState.tasks=data.tasks;renderOrganizerTasks();}
   catch(error){organizerNotice(error.message,"error");}
@@ -117,27 +117,28 @@ async function submitMeetingStart(event) {
   const url=$("meeting-document-url").value.trim();
   if(!url)return;
   organizerState.busy=true;$("meeting-document-url").disabled=true;
-  const panel=$("meeting-start-notice");panel.textContent="个人助手正在读取文档并调用会议 Agent…";panel.className="";panel.hidden=false;
+  const panel=$("meeting-start-notice");panel.textContent="个人助手正在读取文档并调用会议 Agent，可能需要 1–2 分钟，请勿重复提交…";panel.className="";panel.hidden=false;
   try {
-    const result=await api("/api/meetings/start",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":organizerState.csrf},body:JSON.stringify({document_url:url})});
+    const result=await api("/api/meetings/start",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":organizerState.csrf},body:JSON.stringify({document_url:url})},150000);
     if(result.created) {
       panel.textContent=`已创建会议任务：${result.title}。提取 ${result.todo_count} 项，其中 ${result.needs_confirmation} 项需要人工确认。`;
       panel.className="success";
       $("meeting-document-url").value="";
-      await loadOrganizerTasks();
-      await load();
+      await loadOrganizerTasks(true);
       if(result.record_id)showView("meetings");
     } else if(result.runtime_status==="UNKNOWN" || result.task_status==="RECONCILING") {
       panel.textContent=`会议任务已进入待核验状态，暂未生成审核草稿。错误标识：${result.error_code||"UNKNOWN"}。请稍后刷新或查看审计日志。`;
       panel.className="error";
-      await loadOrganizerTasks();
+      await loadOrganizerTasks(true);
     } else {
       panel.textContent=`会议 Agent 执行失败，未创建审核草稿。错误标识：${result.error_code||"RUNTIME_FAILED"}。`;
       panel.className="error";
-      await loadOrganizerTasks();
+      await loadOrganizerTasks(true);
     }
   } catch(error) {
-    panel.textContent=error.message;panel.className="error";
+    panel.textContent=error.code==="REQUEST_TIMEOUT"
+      ? "等待响应超时，后台可能已经生成草稿。请进入“会议审核”刷新查看，再决定是否重试。"
+      : error.message;panel.className="error";
   } finally {
     organizerState.busy=false;$("meeting-document-url").disabled=false;
   }
@@ -411,8 +412,8 @@ async function submitAgentDraft(event) {
   }catch(error){agentNotice(error.message,"error");}
   finally{agentState.busy=false;$("agent-draft-form").querySelectorAll("input,select,textarea,button").forEach(el=>el.disabled=false);}
 }
-async function api(path, options={}) {
-  const controller=new AbortController(), timer=setTimeout(()=>controller.abort(),15000);
+async function api(path, options={}, timeoutMs=15000) {
+  const controller=new AbortController(), timer=setTimeout(()=>controller.abort(),timeoutMs);
   try {
     const response=await fetch(path,{credentials:"same-origin",...options,signal:controller.signal});
     if(response.status===401) { window.location.assign("/oauth/start"); throw new Error("登录已过期，请重新登录"); }
@@ -421,7 +422,7 @@ async function api(path, options={}) {
     if(!response.ok) throw new Error(typeof result.detail==="string"?result.detail:"请求未通过校验，请核对后重试");
     return result;
   } catch(error) {
-    if(error.name==="AbortError") throw new Error("响应超时，请重新加载确认当前状态。");
+    if(error.name==="AbortError") {const timeoutError=new Error("响应超时，请重新加载确认当前状态。");timeoutError.code="REQUEST_TIMEOUT";throw timeoutError;}
     if(error instanceof TypeError) throw new Error("暂时无法连接服务，请稍后重新加载。");
     throw error;
   } finally {clearTimeout(timer);}

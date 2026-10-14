@@ -21,3 +21,4 @@ RUN python -m pip install --no-cache-dir --timeout 90 --retries 2 \
 RUN python -c "from toolsets import resolve_toolset; assert not resolve_toolset('context_engine')"
 
 COPY src/fde_control_plane/runtime.py /app/src/fde_control_plane/runtime.py
+COPY src/fde_control_plane/static/meeting_review.js /app/src/fde_control_plane/static/meeting_review.js

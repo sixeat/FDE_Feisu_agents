@@ -1877,10 +1877,12 @@ UNKNOWN 卡片不能自动重发，仍需远端核实工具。部署保留数据
 
 ### 2026-10-14 会议重放结果与健康探针可靠性
 
-- 状态：本地实现与全量回归完成；线上发布待验收。
+- 状态：本地实现、全量回归与线上增量发布完成。
 - 功能 ID：R-01、M-02、H-01。
 - 完成内容：重复提交已失败或超时的同一会议任务时，从 SQLite 中的 `TaskRun` 恢复 `FAILED` 或 `UNKNOWN` 分类与原错误码，不再将 `DEDUPLICATED` 当作用户看到的运行结论。Hermes 结果未知时把受控错误码保存在任务状态中。`/health` 绕开长时间会议执行占用的 Web 请求锁，使容器健康探针能独立响应。
 - 验收结果：跨 SQLite 重新打开后的失败/未知重放不再次调用 Runtime，且保留原任务、状态和错误码；阻塞请求持有锁期间健康探针仍能返回 `200`。全项目测试 `215 passed`、4 项第三方弃用警告；`git diff --check` 通过。
 - 边界：会议入口仍同步等待 Hermes，浏览器或反向代理超时尚未解决。持久化异步执行必须另行设计领取租约、进程重启后的结果核验和成员可见的状态查询，不能用进程内后台任务冒充可恢复执行。
-- 下一步：备份线上 SQLite 并仅发布控制平面镜像；随后完成第二成员真实 OAuth 验收。
+- 线上发布：发布前以 SQLite 在线备份保存 `/opt/fde-agent-stage/deploy/data/backups/20261014-meeting-replay-health/control_plane.sqlite3`，`quick_check=ok`，同目录备份 Compose。基于 `fde-control-plane:meeting-status-20261013` 离线构建固定镜像 `fde-control-plane:meeting-replay-health-20261014`，容器内 Python 编译检查通过；仅重建 `fde-control-plane`，没有重启审批监听器或 Worker。
+- 线上复核：控制平面 `healthy`，`/health` 返回 `status=ok`，匿名 `GET /api/meetings` 返回 `401`。发布前后数据库计数保持为会议 1、来源 1、待办 7、审批 7、工具调用 5、outbox 5，`quick_check=ok`；Worker 保持 `network=none`、只读数据卷和原有 `--dry-run` 命令。原镜像和 Compose 备份保留用于回滚，本轮未触发飞书业务写入。
+- 下一步：完成第二成员真实 OAuth 与会议隔离验收；再设计持久化异步执行和成员可查询的运行状态。
 

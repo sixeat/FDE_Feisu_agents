@@ -1,7 +1,11 @@
 import json
 import runpy
+import threading
+import time
 from pathlib import Path
 
+from concurrent.futures import ThreadPoolExecutor
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import fde_control_plane
@@ -79,3 +83,40 @@ def test_prebound_admin_hash_assigns_explicit_admin_role(tmp_path, monkeypatch):
             "SELECT roles_json FROM actors WHERE actor_id = 'member-primary'"
         ).fetchone()[0]
     assert "admin" in json.loads(roles_json)
+
+
+def test_health_remains_responsive_while_database_request_lock_is_held(tmp_path, monkeypatch):
+    config = {
+        "FEISHU_APP_ID": "cli_test",
+        "FEISHU_APP_SECRET": "test-secret",
+        "FEISHU_TENANT_KEY": "tenant-test",
+        "FDE_OAUTH_REDIRECT_URI": "https://example.test/oauth/callback",
+        "FDE_DB_PATH": str(tmp_path / "server.sqlite3"),
+        "FDE_PREBOUND_OPEN_ID_HASH": "",
+    }
+    for name, value in config.items():
+        monkeypatch.setenv(name, value)
+    app: FastAPI = runpy.run_path(str(Path(__file__).parents[1] / "scripts" / "fde_oauth_server.py"))["app"]
+    entered = threading.Event()
+    release = threading.Event()
+
+    @app.get("/slow-test-request")
+    def slow_request():
+        entered.set()
+        release.wait(timeout=5)
+        return {"done": True}
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            slow = pool.submit(lambda: TestClient(app).get("/slow-test-request"))
+            assert entered.wait(timeout=2)
+            started = time.monotonic()
+            response = TestClient(app).get("/health")
+            elapsed = time.monotonic() - started
+            release.set()
+            assert slow.result(timeout=2).status_code == 200
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+        assert elapsed < 2
+    finally:
+        release.set()

@@ -124,7 +124,7 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def serialize_database_requests(request: Request, call_next):
-        if request.url.path.startswith("/assets/"):
+        if request.url.path.startswith("/assets/") or request.url.path == "/health":
             return await call_next(request)
         # One demo process shares one SQLite connection, including OAuth writes.
         async with request_lock:

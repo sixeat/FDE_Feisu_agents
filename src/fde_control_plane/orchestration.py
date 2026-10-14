@@ -109,8 +109,15 @@ class AgentOrchestrator:
         prior_events = self.control_plane.store.list_runtime_events(task.task_run_id)
         if existing_dispatch and (task.status not in {TaskRunStatus.QUEUED, TaskRunStatus.PLANNING} or prior_events):
             delegation_id = str(delegations[0].get("delegation_id")) if delegations else ""
+            replay_status = {
+                TaskRunStatus.WAITING_REVIEW: "SUCCEEDED",
+                TaskRunStatus.FAILED: "FAILED",
+                TaskRunStatus.RECONCILING: "UNKNOWN",
+            }.get(task.status, "DEDUPLICATED")
             return AgentExecution(
-                task.task_run_id, delegation_id, RuntimeResult("DEDUPLICATED", None, None), None, deduplicated=True
+                task.task_run_id, delegation_id,
+                RuntimeResult(replay_status, None, None, error_code=task.failure_reason if replay_status in {"FAILED", "UNKNOWN"} else None),
+                None, deduplicated=True,
             )
         if task.status == TaskRunStatus.QUEUED:
             self.control_plane.transition_task(task.task_run_id, TaskRunStatus.PLANNING)
@@ -182,7 +189,8 @@ class AgentOrchestrator:
                     "MEETING_INGEST_FAILED", str(exc)[:300],
                 )
         elif result.status == "UNKNOWN":
-            self.control_plane.transition_task(task.task_run_id, TaskRunStatus.RECONCILING, "runtime result unknown")
+            self.control_plane.transition_task(task.task_run_id, TaskRunStatus.RECONCILING,
+                                               result.error_code or "RUNTIME_RESULT_UNKNOWN")
         else:
             self.control_plane.transition_task(
                 task.task_run_id,

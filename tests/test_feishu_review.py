@@ -137,6 +137,30 @@ def test_start_meeting_exposes_runtime_failure_without_claiming_created(tmp_path
     assert cp.store.get_meeting_record(result["record_id"]) is None
 
 
+@pytest.mark.parametrize("status", ["FAILED", "UNKNOWN"])
+def test_failed_meeting_replay_preserves_runtime_result_after_store_reopen(tmp_path, status):
+    cp, _, reader, identity, _, _ = setup_review(tmp_path)
+    url = "https://tenant.feishu.cn/docx/test-docx-id"
+    first = FeishuMeetingReviewGateway(cp, AgentOrchestrator(cp, FailedRuntime(status)), reader).start_meeting(
+        document_url=url, requester_identity=identity, agent_id="agent",
+    )
+
+    class UnexpectedRuntime:
+        def run_once(self, request):
+            raise AssertionError("a replay must not invoke the runtime")
+
+    reopened = ControlPlane(SQLiteStore(tmp_path / "review.sqlite3"))
+    replay = FeishuMeetingReviewGateway(
+        reopened, AgentOrchestrator(reopened, UnexpectedRuntime()), FakeRevisionReader(),
+    ).start_meeting(document_url=url, requester_identity=identity, agent_id="agent")
+    assert replay["deduplicated"] is True
+    assert replay["task_run_id"] == first["task_run_id"]
+    assert replay["runtime_status"] == first["runtime_status"]
+    assert replay["task_status"] == first["task_status"]
+    assert replay["error_code"] == first["error_code"]
+    assert replay["created"] is False
+
+
 def test_stale_document_blocks_review_without_changing_drafts(tmp_path):
     cp, gateway, reader, identity, task_id, edits = setup_review(tmp_path, revision="6")
     before = cp.store.list_meeting_todos("record")

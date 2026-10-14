@@ -1,0 +1,23 @@
+ARG FDE_BASE_IMAGE=fde-control-plane:meeting-replay-health-20261014
+FROM ${FDE_BASE_IMAGE}
+
+# Pin the Hermes commit previously validated by the meeting contract probe.
+# This upstream version supports editable installs, but blocks wheel builds.
+RUN mkdir -p /opt/hermes-agent && \
+    python -c "import urllib.request; urllib.request.urlretrieve('https://codeload.github.com/NousResearch/hermes-agent/tar.gz/e3dd27ee2d8b011737a4eea8e3eb3d711ab78690', '/tmp/hermes-agent.tar.gz')" && \
+    tar -xzf /tmp/hermes-agent.tar.gz -C /opt/hermes-agent --strip-components=1 && \
+    rm /tmp/hermes-agent.tar.gz && \
+    python -m pip install --no-cache-dir --timeout 90 --retries 2 \
+        --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+        -e /opt/hermes-agent
+
+# Hermes 0.21.5 imports its Bedrock adapter while starting even when DeepSeek
+# is selected. Preinstall this optional dependency to prevent startup-time pip.
+RUN python -m pip install --no-cache-dir --timeout 90 --retries 2 \
+    --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+    "boto3==1.42.89"
+
+# Fail the build if the pinned upstream version ever gives this profile tools.
+RUN python -c "from toolsets import resolve_toolset; assert not resolve_toolset('context_engine')"
+
+COPY src/fde_control_plane/runtime.py /app/src/fde_control_plane/runtime.py

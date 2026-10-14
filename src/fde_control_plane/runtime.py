@@ -210,6 +210,10 @@ class HermesRuntimeAdapter:
             "--safe-mode",
             "--ignore-user-config",
             "--ignore-rules",
+            # In pinned Hermes v2026.9.24 this built-in selection resolves to
+            # zero tools. Omitting --toolsets enables Hermes' default tools.
+            "--toolsets",
+            "context_engine",
             "--source",
             "fde-control-plane",
         ]
@@ -222,6 +226,22 @@ class HermesRuntimeAdapter:
     def run_once(self, request: RunRequest) -> RuntimeResult:
         prompt = _meeting_prompt(request)
         events = [_event(request, 1, "accepted", "Hermes run accepted")]
+        # A model subprocess must not inherit Feishu OAuth, app, or task-write
+        # credentials from the API process. Only the selected model provider
+        # receives its own key and the process variables needed to launch.
+        provider_keys = {
+            "deepseek": "DEEPSEEK_API_KEY",
+            "openrouter": "OPENROUTER_API_KEY",
+            "openai": "OPENAI_API_KEY",
+        }
+        child_env = {
+            name: os.environ[name]
+            for name in ("PATH", "HOME", "LANG", "LC_ALL", "PYTHONPATH", "SSL_CERT_FILE")
+            if name in os.environ
+        }
+        key_name = provider_keys.get((self.provider or "").lower())
+        if key_name and key_name in os.environ:
+            child_env[key_name] = os.environ[key_name]
         try:
             completed = self._runner(
                 self._command(),
@@ -229,6 +249,7 @@ class HermesRuntimeAdapter:
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
+                env=child_env,
                 timeout=self.timeout_seconds,
                 check=False,
             )

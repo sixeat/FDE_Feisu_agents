@@ -32,13 +32,16 @@ def request() -> RunRequest:
     )
 
 
-def test_hermes_adapter_returns_contract_and_disables_tools():
+def test_hermes_adapter_returns_contract_and_disables_tools(monkeypatch):
     seen = {}
+    monkeypatch.setenv("FEISHU_APP_SECRET", "must-not-reach-hermes")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-model-key")
 
     def runner(command, **kwargs):
         seen["command"] = command
         seen["input"] = kwargs["input"]
         seen["encoding"] = kwargs["encoding"]
+        seen["env"] = kwargs["env"]
         return subprocess.CompletedProcess(
             command,
             0,
@@ -46,7 +49,7 @@ def test_hermes_adapter_returns_contract_and_disables_tools():
             stderr="",
         )
 
-    result = HermesRuntimeAdapter(executable="hermes-test", runner=runner).run_once(request())
+    result = HermesRuntimeAdapter(executable="hermes-test", provider="deepseek", runner=runner).run_once(request())
 
     assert result.status == "SUCCEEDED"
     assert result.payload["schema_version"] == "meeting-agent.v1"
@@ -54,11 +57,13 @@ def test_hermes_adapter_returns_contract_and_disables_tools():
     assert "--safe-mode" in seen["command"]
     assert "--ignore-user-config" in seen["command"]
     assert "--ignore-rules" in seen["command"]
-    assert "--toolsets" not in seen["command"]
+    assert seen["command"][seen["command"].index("--toolsets") + 1] == "context_engine"
     assert "doc-hash" in seen["input"]
     assert "Do not silently omit an action item" in seen["input"]
     assert "access_token" not in seen["input"]
     assert seen["encoding"] == "utf-8"
+    assert seen["env"]["DEEPSEEK_API_KEY"] == "test-model-key"
+    assert "FEISHU_APP_SECRET" not in seen["env"]
 
 
 def test_hermes_adapter_fails_closed_on_invalid_json():

@@ -8,10 +8,12 @@ import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
+from urllib.parse import urlsplit, urlunsplit
 
-from .approval_card import build_meeting_intake_card
+from .approval_card import build_meeting_intake_card, build_meeting_intake_failure_card
 from .feishu_review import FeishuMeetingReviewGateway
 from .models import ActorType, IdentityContext
+from .user_document_access import UserDocumentAuthorizationRequired
 
 
 _DOC_LINK = re.compile(
@@ -123,16 +125,20 @@ class FeishuPersonalAssistantGateway:
         )
         try:
             result = self.meeting_gateway.start_meeting(document_url=links[0], requester_identity=identity)
+        except UserDocumentAuthorizationRequired:
+            return self._notify_failure(event, identity, authorization_required=True)
         except (KeyError, PermissionError, ValueError, RuntimeError):
-            return {"accepted": False, "status": "MEETING_INTAKE_FAILED"}
+            return self._notify_failure(event, identity, authorization_required=False)
         response = {"accepted": True, "status": "MEETING_STARTED", **result}
+        if not result["created"] and result.get("task_status") == "FAILED":
+            return {**response, **self._notify_failure(event, identity, authorization_required=False)}
         if not result["created"] or self.sender is None or not self.review_url:
             return response
         store = self.control_plane.store
         key = str(uuid.uuid5(uuid.NAMESPACE_URL, f"fde:assistant-intake:{result['record_id']}"))
         if not store.claim_assistant_card_delivery(result["record_id"], identity.actor_id, key):
             prior = store.get_assistant_card_delivery(result["record_id"])
-            response["card_status"] = "SENT" if prior and prior["status"] == "SENT" else "UNKNOWN"
+            response["card_status"] = "SENT" if prior["status"] == "SENT" else "UNKNOWN"
             return response
         todos = self.control_plane.store.list_meeting_todos(result["record_id"])
         card = build_meeting_intake_card(
@@ -145,6 +151,48 @@ class FeishuPersonalAssistantGateway:
             response["card_status"] = "SENT"
         except Exception:
             store.finish_assistant_card_delivery(result["record_id"], status="UNKNOWN")
+            response["card_status"] = "UNKNOWN"
+        return response
+
+    def _notify_failure(self, event: PersonalAssistantMessage, identity: IdentityContext,
+                        *, authorization_required: bool) -> dict[str, Any]:
+        response: dict[str, Any] = {
+            "accepted": False,
+            "status": "DOCUMENT_AUTH_REQUIRED" if authorization_required else "MEETING_INTAKE_FAILED",
+        }
+        if self.sender is None:
+            return response
+        key = "assistant-intake-failure:" + _hash(f"{identity.tenant_id}:{event.message_id}")
+        delivery_key = str(uuid.uuid5(uuid.NAMESPACE_URL, key))
+        store = self.control_plane.store
+        if not store.claim_notification(
+            key, tenant_id=identity.tenant_id, recipient_actor_id=identity.actor_id,
+            channel="FEISHU_CARD", claim_token=delivery_key,
+            data={"reason": response["status"]},
+        ):
+            prior = store.get_notification(key)
+            if (prior is None or prior["tenant_id"] != identity.tenant_id
+                    or prior["recipient_actor_id"] != identity.actor_id
+                    or prior["channel"] != "FEISHU_CARD"):
+                raise ValueError("assistant failure notice conflicts with prior recipient")
+            response["card_status"] = "SENT" if prior and prior["status"] == "SENT" else "UNKNOWN"
+            return response
+        authorization_url = None
+        if authorization_required and self.review_url:
+            parsed = urlsplit(self.review_url)
+            if parsed.scheme == "https" and parsed.hostname:
+                authorization_url = urlunsplit((parsed.scheme, parsed.netloc, "/oauth/start", "", ""))
+        card = build_meeting_intake_failure_card(
+            authorization_required=authorization_required, authorization_url=authorization_url,
+        )
+        try:
+            message_id = self.sender.send(event.sender_open_id, card, delivery_key)
+            if not message_id:
+                raise TimeoutError("Feishu failure card returned no message id")
+            store.complete_notification(key, delivery_key, "SENT", {"message_id": message_id})
+            response["card_status"] = "SENT"
+        except Exception:
+            store.complete_notification(key, delivery_key, "UNKNOWN")
             response["card_status"] = "UNKNOWN"
         return response
 

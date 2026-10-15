@@ -71,6 +71,8 @@ def process_one(*, db_path: str, tenant_id: str, tenant_key: str,
     with SQLiteStore(db_path) as store:
         if event_access_verifier is None and token_key and user_client is not None:
             event_access_verifier = FeishuUserDocumentReader(UserTokenVault(store, token_key), user_client)
+        if event_access_verifier is None:
+            raise RuntimeError("assistant worker requires a user-scoped document reader")
         token = uuid.uuid4().hex
         item = store.claim_assistant_message(tenant_id, token)
         if item is None:
@@ -86,7 +88,7 @@ def process_one(*, db_path: str, tenant_id: str, tenant_key: str,
         )
         try:
             result = gateway.receive(item["data"])
-            status = "DONE" if result.get("created") and result.get("card_status") == "SENT" else (
+            status = "DONE" if result.get("card_status") == "SENT" else (
                 "UNKNOWN" if result.get("task_status") in {"RUNNING", "RECONCILING"}
                 or result.get("card_status") == "UNKNOWN" else "REJECTED"
             )

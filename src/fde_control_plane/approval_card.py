@@ -11,6 +11,25 @@ from .service import ControlPlane
 ACTION = "meeting_task_approval"
 
 
+def build_meeting_intake_failure_card(*, authorization_required: bool, authorization_url: str | None = None) -> dict[str, Any]:
+    """Give a member an actionable failure without exposing document or runtime data."""
+    if authorization_required:
+        message = "当前账号的文档读取授权缺失或已过期。请重新授权，然后重新发送文档链接。"
+    else:
+        message = "会议暂未处理成功，未创建任务。请确认当前账号能查看该文档；如需排查，请联系管理员核对运行记录。"
+    elements: list[dict[str, Any]] = [{"tag": "div", "text": {"tag": "plain_text", "content": message}}]
+    if authorization_required and authorization_url:
+        elements.append({"tag": "action", "actions": [{
+            "tag": "button", "text": {"tag": "plain_text", "content": "重新授权"},
+            "type": "primary", "url": authorization_url,
+        }]})
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text", "content": "会议助手需要你处理"}},
+        "elements": elements,
+    }
+
+
 def build_meeting_intake_card(
     *, title: str, todos: list[dict[str, Any]], review_url: str,
 ) -> dict[str, Any]:
@@ -140,4 +159,4 @@ def handle_meeting_approval_action(
     )
 
 
-__all__ = ["build_meeting_approval_card", "build_meeting_decided_card", "build_meeting_intake_card", "handle_meeting_approval_action"]
+__all__ = ["build_meeting_approval_card", "build_meeting_decided_card", "build_meeting_intake_card", "build_meeting_intake_failure_card", "handle_meeting_approval_action"]

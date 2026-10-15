@@ -11,6 +11,7 @@ from fde_control_plane import (
     ControlPlane, FeishuMeetingReviewGateway, FeishuPersonalAssistantGateway,
     RuntimeResult, SQLiteStore,
 )
+from fde_control_plane.user_document_access import UserDocumentAuthorizationRequired
 
 
 DOC_ID = "test-docx-id"
@@ -152,7 +153,68 @@ def test_event_without_user_document_access_proof_fails_before_app_read(tmp_path
     gateway.meeting_gateway.event_access_verifier = None
     assert gateway.receive(callback())["status"] == "MEETING_INTAKE_FAILED"
     assert runtime.calls == reader.calls == 0
-    assert sender.calls == []
+    assert len(sender.calls) == 1
+    assert sender.calls[0][0] == "ou_member"
+    assert "test-docx-id" not in json.dumps(sender.calls[0][1])
+    assert "actions" not in sender.calls[0][1]["elements"][-1]
+
+
+def test_expired_grant_prompts_bound_member_once_without_app_read(tmp_path):
+    cp, gateway, runtime, reader, sender = setup_gateway(tmp_path)
+
+    class ExpiredGrant:
+        def read_document(self, identity, document_id):
+            assert identity.auth_mode == "feishu_event"
+            raise UserDocumentAuthorizationRequired("expired")
+
+    gateway.meeting_gateway.event_access_verifier = ExpiredGrant()
+    first = gateway.receive(callback())
+    second = gateway.receive(callback())
+    assert first["status"] == second["status"] == "DOCUMENT_AUTH_REQUIRED"
+    assert first["card_status"] == second["card_status"] == "SENT"
+    assert runtime.calls == reader.calls == 0
+    assert len(sender.calls) == 1
+    recipient, card, _ = sender.calls[0]
+    assert recipient == "ou_member"
+    assert card["elements"][-1]["actions"][0]["url"] == "https://fde.example.test/oauth/start"
+    assert "test-docx-id" not in json.dumps(card)
+    notices = cp.store.connection.execute("SELECT * FROM notification_deliveries").fetchall()
+    assert len(notices) == 1 and notices[0]["status"] == "SENT"
+
+
+def test_failure_card_unknown_result_is_not_resent(tmp_path):
+    cp, gateway, runtime, reader, sender = setup_gateway(tmp_path)
+    gateway.meeting_gateway.event_access_verifier = None
+    calls = []
+
+    def timeout(*args):
+        calls.append(args)
+        raise TimeoutError("reply lost")
+
+    sender.send = timeout
+    assert gateway.receive(callback())["card_status"] == "UNKNOWN"
+    assert gateway.receive(callback())["card_status"] == "UNKNOWN"
+    assert len(calls) == 1
+    notice = cp.store.connection.execute("SELECT status FROM notification_deliveries").fetchone()
+    assert notice["status"] == "UNKNOWN"
+
+
+def test_failed_runtime_informs_member_without_creating_draft_or_task(tmp_path):
+    cp, gateway, runtime, reader, sender = setup_gateway(tmp_path)
+
+    def failed_run(request):
+        runtime.calls += 1
+        return RuntimeResult("FAILED", None, "MODEL_UNAVAILABLE")
+
+    runtime.run_once = failed_run
+    result = gateway.receive(callback())
+    assert result["status"] == "MEETING_INTAKE_FAILED"
+    assert result["task_status"] == "FAILED"
+    assert result["card_status"] == "SENT"
+    assert runtime.calls == 1 and reader.calls == 0
+    assert cp.store.get_meeting_record(result["record_id"]) is None
+    assert cp.store.list_tool_calls(result["task_run_id"]) == []
+    assert "MODEL_UNAVAILABLE" not in json.dumps(sender.calls[0][1])
 
 
 def test_event_document_access_denial_never_reads_as_application(tmp_path):
@@ -167,7 +229,8 @@ def test_event_document_access_denial_never_reads_as_application(tmp_path):
     gateway.meeting_gateway.event_access_verifier = DeniedUserReader()
     assert gateway.receive(callback())["status"] == "MEETING_INTAKE_FAILED"
     assert runtime.calls == reader.calls == 0
-    assert sender.calls == []
+    assert len(sender.calls) == 1
+    assert "actions" not in sender.calls[0][1]["elements"][-1]
 
 
 def test_ambiguous_or_unrelated_messages_do_not_start_meeting(tmp_path):
@@ -217,12 +280,40 @@ def test_inbox_worker_without_user_access_verifier_does_not_read_document(tmp_pa
     monkeypatch.setattr(personal_assistant_intake, "HermesRuntimeAdapter", lambda: runtime)
     monkeypatch.setattr(personal_assistant_intake, "FeishuDocumentRevisionReader", lambda _: reader)
     monkeypatch.setattr(personal_assistant_intake, "FeishuCardSender", lambda _: sender)
+    with pytest.raises(RuntimeError, match="user-scoped document reader"):
+        personal_assistant_intake.process_one(
+            db_path=str(tmp_path / "assistant.sqlite3"), tenant_id="tenant", tenant_key="tenant-key",
+            app_id="cli_app", client=object(), review_url="https://fde.example.test/h5#meetings",
+        )
+    assert runtime.calls == reader.calls == 0
+    assert sender.calls == []
+    row = cp.store.connection.execute("SELECT status FROM assistant_message_inbox").fetchone()
+    assert row["status"] == "PENDING"
+
+
+def test_inbox_worker_missing_grant_sends_auth_notice_and_clears_event(tmp_path, monkeypatch):
+    cp, gateway, runtime, reader, sender = setup_gateway(tmp_path)
+    assert personal_assistant_intake.enqueue_callback(
+        cp.store, callback(), app_id="cli_app", tenant_key="tenant-key", tenant_id="tenant",
+    ) == "QUEUED"
+
+    class ExpiredGrant:
+        def read_document(self, identity, document_id):
+            raise UserDocumentAuthorizationRequired("expired")
+
+    monkeypatch.setattr(personal_assistant_intake, "HermesRuntimeAdapter", lambda: runtime)
+    monkeypatch.setattr(personal_assistant_intake, "FeishuDocumentRevisionReader", lambda _: reader)
+    monkeypatch.setattr(personal_assistant_intake, "FeishuCardSender", lambda _: sender)
     assert personal_assistant_intake.process_one(
         db_path=str(tmp_path / "assistant.sqlite3"), tenant_id="tenant", tenant_key="tenant-key",
         app_id="cli_app", client=object(), review_url="https://fde.example.test/h5#meetings",
-    ) == "REJECTED"
+        event_access_verifier=ExpiredGrant(),
+    ) == "DONE"
+    assert len(sender.calls) == 1
     assert runtime.calls == reader.calls == 0
-    assert sender.calls == []
+    row = cp.store.connection.execute("SELECT status, data_json, result_json FROM assistant_message_inbox").fetchone()
+    assert row["status"] == "DONE" and row["data_json"] == "{}"
+    assert "ou_member" not in row["result_json"] and "test-docx-id" not in row["result_json"]
 
 
 def test_invalid_token_key_does_not_claim_inbox_message(tmp_path):

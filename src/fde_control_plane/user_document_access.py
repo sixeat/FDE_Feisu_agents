@@ -20,6 +20,10 @@ from .store import SQLiteStore
 DOC_READ_SCOPE = "docx:document:readonly"
 
 
+class UserDocumentAuthorizationRequired(PermissionError):
+    """The member must renew the short-lived document-read grant."""
+
+
 class UserTokenVault:
     """Store only a short-lived encrypted access token; no refresh token."""
 
@@ -67,7 +71,7 @@ class UserTokenVault:
                 or row["subject_ref_hash"] != identity.subject_ref_hash
                 or DOC_READ_SCOPE not in json.loads(row["scopes_json"])
                 or int(row["expires_at"]) <= int(self.clock()) + 30):
-            raise PermissionError("user document authorization is missing or expired")
+            raise UserDocumentAuthorizationRequired("user document authorization is missing or expired")
         try:
             payload = base64.urlsafe_b64decode(row["token_ciphertext"])
             nonce, tag, ciphertext = payload[:12], payload[12:28], payload[28:]
@@ -78,7 +82,7 @@ class UserTokenVault:
                 raise ValueError("empty user access token")
             return token
         except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
-            raise PermissionError("user document authorization cannot be verified") from exc
+            raise UserDocumentAuthorizationRequired("user document authorization cannot be verified") from exc
 
     def revoke(self, actor_id: str) -> None:
         self.store.delete_user_oauth_token(actor_id)
@@ -98,4 +102,4 @@ class FeishuUserDocumentReader:
         return FeishuDocumentRevisionReader(self.client, user_access_token=token).read_document(document_id)
 
 
-__all__ = ["DOC_READ_SCOPE", "FeishuUserDocumentReader", "UserTokenVault"]
+__all__ = ["DOC_READ_SCOPE", "FeishuUserDocumentReader", "UserDocumentAuthorizationRequired", "UserTokenVault"]

@@ -24,6 +24,25 @@ def _hash(value: Any) -> str:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
+def _unique_assignee_suggestions(payload: dict[str, Any], members: list[dict[str, Any]]) -> dict[str, str]:
+    """Prefill exact unique display-name matches; a person still confirms."""
+    names: dict[str, list[str]] = {}
+    for member in members:
+        name = str(member.get("name") or "").strip()
+        if name:
+            names.setdefault(name, []).append(str(member["actor_id"]))
+    matched = {}
+    for todo in payload.get("todos") or []:
+        candidate = todo.get("assignee_candidate") or {}
+        if candidate.get("status") not in {"candidate", "confirmed"}:
+            continue
+        name = str(candidate.get("display_name") or "").strip()
+        matches = names.get(name, [])
+        if name and len(matches) == 1:
+            matched[str(todo["todo_id"])] = matches[0]
+    return matched
+
+
 @dataclass(frozen=True)
 class AgentExecution:
     task_run_id: str
@@ -178,6 +197,9 @@ class AgentOrchestrator:
                 self.meeting.build_drafts(
                     record_id=meeting_result.record.record_id,
                     payload=result.payload,
+                    assignee_actor_by_todo=_unique_assignee_suggestions(
+                        result.payload, self.control_plane.store.list_bound_members(task.tenant_id),
+                    ),
                 )
                 self.control_plane.transition_task(task.task_run_id, TaskRunStatus.WAITING_REVIEW)
             except Exception as exc:

@@ -88,9 +88,11 @@ def test_document_reader_uses_user_token_for_metadata_and_blocks(tmp_path):
 
     client = SimpleNamespace(config=SimpleNamespace(enable_set_token=True), docx=SimpleNamespace(v1=SimpleNamespace(
         document=Document(), document_block_children=Blocks())))
-    source = FeishuUserDocumentReader(vault, client).read_document(identity(), "doc123")
+    reader = FeishuUserDocumentReader(vault, client)
+    source = reader.read_document(identity(), "doc123")
     assert source["blocks"][0]["text"] == "张三负责整理文档"
-    assert [option.user_access_token for option in options] == ["user-doc-token", "user-doc-token"]
+    assert reader.get_revision(identity(), "doc123") == "5"
+    assert [option.user_access_token for option in options] == ["user-doc-token"] * 3
     assert all(option.tenant_access_token is None for option in options)
 
 

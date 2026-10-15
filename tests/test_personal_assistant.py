@@ -1,17 +1,21 @@
 import hashlib
 import json
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
 
-from scripts import personal_assistant_intake
+from scripts import meeting_approval_bridge, personal_assistant_intake
 
 from fde_control_plane import (
     Actor, ActorType, AgentOrchestrator, AgentVersion, AssistantBinding,
     ControlPlane, FeishuMeetingReviewGateway, FeishuPersonalAssistantGateway,
-    RuntimeResult, SQLiteStore,
+    MeetingTodoDraft, RuntimeResult, SQLiteStore,
 )
+from fde_control_plane.personal_assistant import _form_review_todos
 from fde_control_plane.user_document_access import UserDocumentAuthorizationRequired
+from fde_control_plane.meeting_card_review import FeishuMeetingCardReviewGateway
+from fde_control_plane.orchestration import _unique_assignee_suggestions
 
 
 DOC_ID = "test-docx-id"
@@ -51,20 +55,30 @@ class FakeReader:
 class FakeAccessVerifier:
     def __init__(self):
         self.calls = []
+        self.revision_calls = []
+        self.revision = "5"
 
     def read_document(self, identity, document_id):
         self.calls.append((identity.actor_id, document_id))
         return {"document_id": document_id, "revision_id": "5", "title": "例会纪要",
                 "blocks": [{"index": 2, "block_type": 2, "text": "张三整理部署文档"}]}
 
+    def get_revision(self, identity, document_id):
+        self.revision_calls.append((identity.actor_id, document_id))
+        return self.revision
+
 
 class FakeSender:
     def __init__(self):
         self.calls = []
+        self.updates = []
 
     def send(self, open_id, card, idempotency_key):
         self.calls.append((open_id, card, idempotency_key))
         return "om_card"
+
+    def update(self, message_id, card):
+        self.updates.append((message_id, card))
 
 
 def callback(*, open_id="ou_member", tenant_key="tenant-key", app_id="cli_app", message_id="om_source",
@@ -94,6 +108,7 @@ def setup_gateway(tmp_path):
     gateway = FeishuPersonalAssistantGateway(
         review, app_id="cli_app", tenant_key="tenant-key", tenant_id="tenant",
         sender=sender, review_url="https://fde.example.test/h5#meetings",
+        card_review_enabled=True,
     )
     return cp, gateway, runtime, reader, sender
 
@@ -109,7 +124,229 @@ def test_p2p_message_routes_through_bound_assistant_and_returns_draft_card(tmp_p
     assert len(cp.store.list_meeting_todos(result["record_id"])) == 1
     assert cp.store.list_tool_calls(result["task_run_id"]) == []
     assert sender.calls[0][0] == "ou_member"
+    assert result["card_mode"] == "FORM"
+    assert sender.calls[0][1]["schema"] == "2.0"
+    assert sender.calls[0][1]["body"]["elements"][1]["tag"] == "form"
+    delivery = cp.store.get_assistant_card_delivery(result["record_id"])
+    assert len(delivery["review_snapshot"]) == 64
+
+
+def test_card_review_flag_off_keeps_existing_h5_card(tmp_path):
+    cp, gateway, runtime, reader, sender = setup_gateway(tmp_path)
+    gateway.card_review_enabled = False
+    result = gateway.receive(callback())
+    assert result["card_mode"] == "H5_REVIEW"
     assert sender.calls[0][1]["elements"][-1]["actions"][0]["url"].endswith("#meetings")
+    assert cp.store.get_assistant_card_delivery(result["record_id"])["review_snapshot"] is None
+
+
+def test_existing_assistant_card_table_gains_review_snapshot_column(tmp_path):
+    path = tmp_path / "old.sqlite3"
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "CREATE TABLE assistant_card_deliveries ("
+            "record_id TEXT PRIMARY KEY, recipient_actor_id TEXT NOT NULL, "
+            "idempotency_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL, "
+            "message_id TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with SQLiteStore(path) as store:
+        columns = {row["name"] for row in store.connection.execute(
+            "PRAGMA table_info(assistant_card_deliveries)").fetchall()}
+        assert "review_snapshot" in columns
+
+
+def review_callback(*, open_id="ou_member", message_id="om_card", app_id="cli_app",
+                    tenant_key="tenant-key", values=None):
+    return SimpleNamespace(
+        header=SimpleNamespace(app_id=app_id, event_id="review-event"),
+        event=SimpleNamespace(
+            context=SimpleNamespace(open_message_id=message_id),
+            operator=SimpleNamespace(open_id=open_id, tenant_key=tenant_key),
+            action=SimpleNamespace(tag="button", name="meeting_review_submit",
+                                   form_value=values if values is not None else {
+                                       "assignee_0": "member", "due_0": "2026-10-20",
+                                   }),
+        ),
+    )
+
+
+def test_bound_form_review_creates_proposals_without_remote_task_write(tmp_path):
+    cp, gateway, runtime, reader, sender = setup_gateway(tmp_path)
+    intake = gateway.receive(callback())
+    card_review = FeishuMeetingCardReviewGateway(gateway.meeting_gateway, app_id="cli_app",
+                                                 tenant_id="tenant", tenant_key="tenant-key")
+    result = card_review.receive(review_callback())
+    assert result["accepted"] is True and result["status"] == "WAITING_APPROVAL"
+    assert result["approval_count"] == 1
+    assert gateway.meeting_gateway.event_access_verifier.revision_calls == [("member", DOC_ID)]
+    assert cp.store.get_task_run(intake["task_run_id"])["status"] == "WAITING_APPROVAL"
+    assert cp.store.list_meeting_todos(intake["record_id"])[0]["status"] == "READY_FOR_APPROVAL"
+    assert cp.store.list_tool_calls(intake["task_run_id"]) == []
+    assert card_review.receive(review_callback())["status"] == "ALREADY_SUBMITTED"
+    assert len(cp.store.list_approvals(intake["task_run_id"])) == 1
+
+
+def test_card_callback_queues_before_remote_revision_and_worker_recovers(tmp_path):
+    cp, gateway, runtime, reader, sender = setup_gateway(tmp_path)
+    intake = gateway.receive(callback())
+    verifier = gateway.meeting_gateway.event_access_verifier
+    card_review = FeishuMeetingCardReviewGateway(gateway.meeting_gateway, app_id="cli_app",
+                                                 tenant_id="tenant", tenant_key="tenant-key")
+    assert card_review.enqueue(review_callback()) == {"accepted": True, "status": "QUEUED"}
+    assert card_review.enqueue(review_callback()) == {"accepted": True, "status": "DUPLICATE"}
+    assert verifier.revision_calls == []
+    assert cp.store.list_approvals(intake["task_run_id"]) == []
+    dispatched = []
+    path = str(tmp_path / "assistant.sqlite3")
+    assert meeting_approval_bridge.process_review_one(
+        db_path=path, tenant_id="tenant", tenant_key="tenant-key", app_id="cli_app",
+        client=object(), user_client=object(), token_key="unused", review_url="https://fde.example.test/h5",
+        user_reader=verifier, sender=sender, dispatch=lambda *args: dispatched.append(args),
+    ) == "DONE"
+    assert verifier.revision_calls == [("member", DOC_ID)]
+    assert len(cp.store.list_approvals(intake["task_run_id"])) == 1
+    assert dispatched == [(intake["record_id"], "member", "ou_member")]
+    assert sender.updates[0][1]["header"]["title"]["content"] == "会议审核已提交"
+    assert meeting_approval_bridge.process_review_one(
+        db_path=path, tenant_id="tenant", tenant_key="tenant-key", app_id="cli_app",
+        client=object(), user_client=object(), token_key="unused", review_url="https://fde.example.test/h5",
+        user_reader=verifier, sender=sender,
+    ) == "EMPTY"
+
+
+def test_reclaimed_card_review_does_not_create_duplicate_proposals(tmp_path):
+    cp, gateway, runtime, reader, sender = setup_gateway(tmp_path)
+    intake = gateway.receive(callback())
+    card_review = FeishuMeetingCardReviewGateway(gateway.meeting_gateway, app_id="cli_app",
+                                                 tenant_id="tenant", tenant_key="tenant-key")
+    assert card_review.enqueue(review_callback())["accepted"] is True
+    cp.store.claim_meeting_card_review("tenant", "dead-worker", lease_seconds=1)
+    cp.store.connection.execute(
+        "UPDATE meeting_card_review_inbox SET lease_until = 0 WHERE message_id = 'om_card'"
+    )
+    # Simulate a worker that committed the review before losing its inbox ack.
+    assert card_review.receive(review_callback())["accepted"] is True
+    dispatched = []
+    assert meeting_approval_bridge.process_review_one(
+        db_path=str(tmp_path / "assistant.sqlite3"), tenant_id="tenant", tenant_key="tenant-key",
+        app_id="cli_app", client=object(), user_client=object(), token_key="unused",
+        review_url="https://fde.example.test/h5",
+        user_reader=gateway.meeting_gateway.event_access_verifier, sender=sender,
+        dispatch=lambda *args: dispatched.append(args),
+    ) == "DONE"
+    assert len(cp.store.list_approvals(intake["task_run_id"])) == 1
+    assert len(dispatched) == 1
+
+
+def test_card_review_queue_rejects_wrong_operator_and_worker_rejects_stale_snapshot(tmp_path):
+    cp, gateway, runtime, reader, sender = setup_gateway(tmp_path)
+    intake = gateway.receive(callback())
+    card_review = FeishuMeetingCardReviewGateway(gateway.meeting_gateway, app_id="cli_app",
+                                                 tenant_id="tenant", tenant_key="tenant-key")
+    assert card_review.enqueue(review_callback(open_id="ou_other"))["status"] == "UNBOUND_OPERATOR"
+    assert card_review.enqueue(review_callback())["status"] == "QUEUED"
+    draft = cp.store.list_meeting_todos(intake["record_id"])[0]
+    cp.store.save_meeting_todo(MeetingTodoDraft(**{**draft, "title": "更新后的标题"}))
+    dispatched = []
+    assert meeting_approval_bridge.process_review_one(
+        db_path=str(tmp_path / "assistant.sqlite3"), tenant_id="tenant", tenant_key="tenant-key",
+        app_id="cli_app", client=object(), user_client=object(), token_key="unused",
+        review_url="https://fde.example.test/h5",
+        user_reader=gateway.meeting_gateway.event_access_verifier, sender=sender,
+        dispatch=lambda *args: dispatched.append(args),
+    ) == "REJECTED"
+    assert dispatched == [] and cp.store.list_approvals(intake["task_run_id"]) == []
+    assert sender.updates[0][1]["header"]["title"]["content"] == "会议审核未通过核对"
+
+
+def test_form_delivery_survives_store_restart(tmp_path):
+    cp, gateway, runtime, reader, sender = setup_gateway(tmp_path)
+    intake = gateway.receive(callback())
+    path = cp.store.path
+    cp.store.close()
+    reopened = ControlPlane(SQLiteStore(path))
+    review = FeishuMeetingReviewGateway(
+        reopened, AgentOrchestrator(reopened, FakeRuntime()), FakeReader(), FakeAccessVerifier(),
+    )
+    card_review = FeishuMeetingCardReviewGateway(review, app_id="cli_app",
+                                                 tenant_id="tenant", tenant_key="tenant-key")
+    assert card_review.receive(review_callback())["accepted"] is True
+    assert reopened.store.get_task_run(intake["task_run_id"])["status"] == "WAITING_APPROVAL"
+    reopened.store.close()
+
+
+def test_card_review_rejects_other_operator_message_stale_draft_and_invalid_fields(tmp_path):
+    cp, gateway, runtime, reader, sender = setup_gateway(tmp_path)
+    intake = gateway.receive(callback())
+    card_review = FeishuMeetingCardReviewGateway(gateway.meeting_gateway, app_id="cli_app",
+                                                 tenant_id="tenant", tenant_key="tenant-key")
+    assert card_review.receive(review_callback(open_id="ou_other"))["accepted"] is False
+    assert card_review.receive(review_callback(message_id="other_card"))["status"] == "UNBOUND_CARD"
+    assert card_review.receive(review_callback(app_id="other_app"))["status"] == "INVALID_ACTION"
+    assert card_review.receive(review_callback(tenant_key="other"))["status"] == "TENANT_MISMATCH"
+    assert card_review.receive(review_callback(values={"assignee_0": "member", "due_0": "not-a-date"}))["status"] == "REVIEW_REJECTED"
+    assert card_review.receive(review_callback(values={"assignee_0": "member", "due_0": "2026-10-20", "extra": "x"}))["status"] == "INVALID_FIELDS"
+    assert cp.store.list_approvals(intake["task_run_id"]) == []
+    draft = cp.store.list_meeting_todos(intake["record_id"])[0]
+    cp.store.save_meeting_todo(MeetingTodoDraft(
+        **{**draft, "title": "人工修改的标题"},
+    ))
+    assert card_review.receive(review_callback())["status"] == "STALE_REVIEW"
+    assert cp.store.list_approvals(intake["task_run_id"]) == []
+
+
+def test_card_review_rejects_source_revision_change_without_app_fallback(tmp_path):
+    cp, gateway, runtime, reader, sender = setup_gateway(tmp_path)
+    intake = gateway.receive(callback())
+    gateway.meeting_gateway.event_access_verifier.revision = "6"
+    card_review = FeishuMeetingCardReviewGateway(gateway.meeting_gateway, app_id="cli_app",
+                                                 tenant_id="tenant", tenant_key="tenant-key")
+    assert card_review.receive(review_callback())["status"] == "REVIEW_REJECTED"
+    assert reader.calls == 0
+    assert cp.store.list_approvals(intake["task_run_id"]) == []
+
+
+def test_conflicted_or_large_review_stays_on_h5_path():
+    source = {"evidence": [{"block_id": 2, "text": "带证据的会议结论"}]}
+    member = [{"actor_id": "member", "name": "张三"}]
+    draft = {"title": "整理文档", "status": "NEEDS_CONFIRMATION", "visibility_scope": "assignee",
+             "evidence_block_ids": [2], "confirmation_reasons": ["date_missing"]}
+    assert _form_review_todos([draft], source, member) is not None
+    assert _form_review_todos([{**draft, "confirmation_reasons": ["POSSIBLE_DUPLICATE_OR_CONFLICT"]}],
+                              source, member) is None
+    assert _form_review_todos([draft] * 4, source, member) is None
+    assert _form_review_todos([{**draft, "evidence_block_ids": [999]}], source, member) is None
+
+
+def test_exact_unique_member_name_prefills_candidate_but_duplicate_name_does_not():
+    payload = {"todos": [{"todo_id": "todo-1", "assignee_candidate": {
+        "display_name": "张三", "status": "candidate",
+    }}]}
+    assert _unique_assignee_suggestions(payload, [{"actor_id": "a", "name": "张三"}]) == {"todo-1": "a"}
+    assert _unique_assignee_suggestions(payload, [
+        {"actor_id": "a", "name": "张三"}, {"actor_id": "b", "name": "张三"},
+    ]) == {}
+    payload["todos"][0]["assignee_candidate"]["status"] = "missing"
+    assert _unique_assignee_suggestions(payload, [{"actor_id": "a", "name": "张三"}]) == {}
+
+
+def test_unique_member_name_is_prefilled_in_card_but_still_requires_submission(tmp_path):
+    cp, gateway, runtime, reader, sender = setup_gateway(tmp_path)
+    cp.store.connection.execute(
+        "INSERT INTO member_profiles(actor_id, tenant_id, display_name) VALUES (?, ?, ?)",
+        ("member", "tenant", "张三"),
+    )
+    intake = gateway.receive(callback())
+    draft = cp.store.list_meeting_todos(intake["record_id"])[0]
+    assert draft["assignee_actor_id"] == "member"
+    form = sender.calls[0][1]["body"]["elements"][1]
+    select = next(field for field in form["elements"] if field.get("tag") == "select_static")
+    assert select["initial_option"] == "member"
+    assert cp.store.list_approvals(intake["task_run_id"]) == []
 
 
 def test_duplicate_message_does_not_repeat_runtime_or_card(tmp_path):

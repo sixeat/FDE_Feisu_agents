@@ -101,5 +101,9 @@ class FeishuUserDocumentReader:
         token = self.vault.get(identity)
         return FeishuDocumentRevisionReader(self.client, user_access_token=token).read_document(document_id)
 
+    def get_revision(self, identity: IdentityContext, document_id: str) -> str:
+        token = self.vault.get(identity)
+        return FeishuDocumentRevisionReader(self.client, user_access_token=token).get_revision(document_id)
+
 
 __all__ = ["DOC_READ_SCOPE", "FeishuUserDocumentReader", "UserDocumentAuthorizationRequired", "UserTokenVault"]

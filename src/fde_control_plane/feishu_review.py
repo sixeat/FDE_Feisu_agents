@@ -23,6 +23,7 @@ class EventDocumentAccessVerifier(Protocol):
     """Read using the bot-event sender's current user authorization."""
 
     def read_document(self, identity: IdentityContext, document_id: str) -> dict[str, Any]: ...
+    def get_revision(self, identity: IdentityContext, document_id: str) -> str: ...
 
 
 class FeishuDocumentRevisionReader:
@@ -240,7 +241,7 @@ class FeishuMeetingReviewGateway:
             or record["submitted_by"] != task.requested_by
             or reviewer.actor_type != ActorType.USER
             or reviewer.actor_id != task.requested_by
-            or reviewer_identity.auth_mode != "user_oauth"
+            or reviewer_identity.auth_mode not in {"user_oauth", "feishu_event"}
             or not reviewer.external_ref_hash
             or reviewer.external_ref_hash != reviewer_identity.subject_ref_hash
         ):
@@ -250,7 +251,12 @@ class FeishuMeetingReviewGateway:
         if len(expected_hash) not in {12, 64} or actual_hash[:len(expected_hash)] != expected_hash:
             raise PermissionError("source document does not match the meeting record")
         try:
-            current_revision = self.revision_reader.get_revision(document_id)
+            if reviewer_identity.auth_mode == "feishu_event":
+                if self.event_access_verifier is None or not hasattr(self.event_access_verifier, "get_revision"):
+                    raise PermissionError("card review requires user-scoped document revision reader")
+                current_revision = self.event_access_verifier.get_revision(reviewer_identity, document_id)
+            else:
+                current_revision = self.revision_reader.get_revision(document_id)
         except Exception:
             self.control_plane._audit(
                 "FEISHU_DOCUMENT_REVISION_CHECK", task.tenant_id, reviewer.actor_id,

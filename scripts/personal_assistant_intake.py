@@ -67,7 +67,8 @@ def enqueue_callback(store: SQLiteStore, callback: object, *, app_id: str,
 def process_one(*, db_path: str, tenant_id: str, tenant_key: str,
                 app_id: str, client: object, review_url: str,
                 event_access_verifier: object | None = None,
-                token_key: str | None = None, user_client: object | None = None) -> str:
+                token_key: str | None = None, user_client: object | None = None,
+                card_review_enabled: bool = False) -> str:
     with SQLiteStore(db_path) as store:
         if event_access_verifier is None and token_key and user_client is not None:
             event_access_verifier = FeishuUserDocumentReader(UserTokenVault(store, token_key), user_client)
@@ -85,6 +86,7 @@ def process_one(*, db_path: str, tenant_id: str, tenant_key: str,
                 event_access_verifier,
             ), app_id=app_id, tenant_key=tenant_key, tenant_id=tenant_id,
             sender=FeishuCardSender(client), review_url=review_url,
+            card_review_enabled=card_review_enabled,
         )
         try:
             result = gateway.receive(item["data"])
@@ -120,7 +122,8 @@ def main() -> int:
                    .enable_set_token(True).build()) if token_key else None
     process_one(db_path=args.db, tenant_id=tenant_id, tenant_key=tenant_key,
                 app_id=app_id, client=client, review_url=review_url,
-                token_key=token_key, user_client=user_client)
+                token_key=token_key, user_client=user_client,
+                card_review_enabled=os.environ.get("FDE_ASSISTANT_CARD_REVIEW_ENABLED") == "1")
     return 0
 
 

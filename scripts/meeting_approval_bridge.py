@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -16,10 +17,18 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from fde_control_plane import ControlPlane, FeishuApprovalGateway, FeishuCardSender, SQLiteStore
-from fde_control_plane.approval_card import build_meeting_decided_card
+from fde_control_plane import (
+    AgentOrchestrator, ControlPlane, FeishuApprovalGateway, FeishuCardSender,
+    FeishuMeetingReviewGateway, HermesRuntimeAdapter, SQLiteStore,
+)
+from fde_control_plane.approval_card import MEETING_REVIEW_FORM_ACTION, build_meeting_decided_card
 from fde_control_plane.feishu_review import FeishuDocumentRevisionReader
+from fde_control_plane.meeting_card_review import (
+    FeishuMeetingCardReviewGateway, build_review_processing_card,
+    build_review_rejected_card, build_review_submitted_card,
+)
 from fde_control_plane.meeting_approval_bridge import MeetingApprovalBridge
+from fde_control_plane.user_document_access import FeishuUserDocumentReader, UserTokenVault
 from personal_assistant_intake import enqueue_callback, process_one
 
 
@@ -72,6 +81,57 @@ def report(items):
               f"status={item['status']} card={item['card_status']} task_write=0", flush=True)
 
 
+def process_review_one(*, db_path, tenant_id, tenant_key, app_id, client,
+                       user_client, token_key, review_url,
+                       user_reader=None, sender=None, dispatch=None):
+    """Process one durable form outside the card callback; never execute tasks."""
+    with SQLiteStore(db_path) as review_store:
+        review_cp = ControlPlane(review_store)
+        reader = user_reader or FeishuUserDocumentReader(UserTokenVault(review_store, token_key), user_client)
+        card_sender = sender or FeishuCardSender(client)
+        claim = str(uuid.uuid4())
+        item = review_store.claim_meeting_card_review(tenant_id, claim, lease_seconds=120)
+        if item is None:
+            return "EMPTY"
+        review_gateway = FeishuMeetingReviewGateway(
+            review_cp, AgentOrchestrator(review_cp, HermesRuntimeAdapter()),
+            FeishuDocumentRevisionReader(client), reader,
+        )
+        result = FeishuMeetingCardReviewGateway(
+            review_gateway, app_id=app_id, tenant_id=tenant_id, tenant_key=tenant_key,
+        ).receive(item["data"])
+        status = "DONE" if result.get("accepted") else "REJECTED"
+        if not review_store.finish_meeting_card_review(item["message_id"], claim, status, {
+            "status": result.get("status"), "accepted": bool(result.get("accepted")),
+        }):
+            raise RuntimeError("meeting review claim was lost")
+        card = (build_review_submitted_card(int(result["todo_count"]), review_url) if result.get("accepted")
+                else build_review_rejected_card(review_url))
+        try:
+            card_sender.update(item["message_id"], card)
+        except Exception as exc:
+            print(f"MEETING_CARD_REVIEW_UPDATE status=UNKNOWN message_hash={short_hash(item['message_id'])} "
+                  f"error_type={type(exc).__name__} task_write=0", flush=True)
+        if result.get("accepted"):
+            delivery = review_store.get_assistant_card_delivery_by_message(item["message_id"])
+            record_id = result["record_id"]
+            recipient = item["data"]["event"]["operator"]["open_id"]
+            try:
+                if dispatch is not None:
+                    dispatch(record_id, delivery["recipient_actor_id"], recipient)
+                else:
+                    approval_bridge = MeetingApprovalBridge(
+                        review_cp, FeishuApprovalGateway(review_cp, card_sender, app_id=app_id),
+                        FeishuDocumentRevisionReader(client), tenant_id=tenant_id,
+                    )
+                    approval_bridge.send_pending(record_id, delivery["recipient_actor_id"], recipient)
+            except Exception as exc:
+                print(f"MEETING_CARD_REVIEW_DISPATCH status=RETRY_REQUIRED record_hash={short_hash(record_id)} "
+                      f"error_type={type(exc).__name__} task_write=0", flush=True)
+                return "DISPATCH_RETRY_REQUIRED"
+        return status
+
+
 def main() -> int:
     args = arguments()
     with SQLiteStore(args.db) as store:
@@ -118,8 +178,10 @@ def main() -> int:
                       f"status=RETRY_REQUIRED error_type={type(exc).__name__} task_write=0", flush=True)
 
         assistant_enabled = os.environ.get("FDE_ASSISTANT_INTAKE_ENABLED") == "1"
+        card_review_enabled = assistant_enabled and os.environ.get("FDE_ASSISTANT_CARD_REVIEW_ENABLED") == "1"
         assistant_stop = threading.Event()
         assistant_thread = None
+        review_thread = None
         if assistant_enabled:
             tenant_key = os.environ.get("FEISHU_TENANT_KEY", "").strip()
             review_url = os.environ.get("FDE_ASSISTANT_REVIEW_URL", "").strip()
@@ -139,6 +201,7 @@ def main() -> int:
                             db_path=args.db, tenant_id=args.tenant, tenant_key=tenant_key,
                             app_id=app_id, client=worker_client, review_url=review_url,
                             token_key=token_key, user_client=user_client,
+                            card_review_enabled=card_review_enabled,
                         )
                         if status == "EMPTY":
                             assistant_stop.wait(2)
@@ -147,6 +210,24 @@ def main() -> int:
                         assistant_stop.wait(5)
 
             assistant_thread = threading.Thread(target=assistant_worker, name="assistant-intake", daemon=True)
+
+            if card_review_enabled:
+                def review_worker():
+                    while not assistant_stop.is_set():
+                        try:
+                            status = process_review_one(
+                                db_path=args.db, tenant_id=args.tenant, tenant_key=tenant_key,
+                                app_id=app_id, client=worker_client, user_client=user_client,
+                                token_key=token_key, review_url=review_url,
+                            )
+                            if status == "EMPTY":
+                                assistant_stop.wait(2)
+                        except Exception as exc:
+                            print(f"MEETING_CARD_REVIEW_WORKER status=ERROR "
+                                  f"error_type={type(exc).__name__} task_write=0", flush=True)
+                            assistant_stop.wait(5)
+
+                review_thread = threading.Thread(target=review_worker, name="meeting-card-review", daemon=True)
 
             def on_message(callback):
                 try:
@@ -161,7 +242,35 @@ def main() -> int:
 
         with quiet_sdk_logs(), ThreadPoolExecutor(max_workers=1) as updater:
             def on_card_action(data):
-                value = getattr(getattr(getattr(data, "event", None), "action", None), "value", None) or {}
+                action = getattr(getattr(data, "event", None), "action", None)
+                if card_review_enabled and getattr(action, "name", None) == MEETING_REVIEW_FORM_ACTION:
+                    try:
+                        with SQLiteStore(args.db) as review_store:
+                            review_cp = ControlPlane(review_store)
+                            review_gateway = FeishuMeetingReviewGateway(
+                                review_cp, AgentOrchestrator(review_cp, HermesRuntimeAdapter()),
+                                FeishuDocumentRevisionReader(client),
+                            )
+                            result = FeishuMeetingCardReviewGateway(
+                                review_gateway, app_id=app_id, tenant_id=args.tenant,
+                                tenant_key=tenant_key,
+                            ).enqueue(data)
+                    except Exception as exc:
+                        print(f"MEETING_CARD_REVIEW status=ERROR error_type={type(exc).__name__} task_write=0", flush=True)
+                        return P2CardActionTriggerResponse({"toast": {"type": "warning", "content": "审核暂时无法核对，请稍后重试"}})
+                    print(f"MEETING_CARD_REVIEW_ENQUEUE accepted={result.get('accepted', False)} "
+                          f"status={result.get('status')} task_write=0", flush=True)
+                    if not result.get("accepted"):
+                        return P2CardActionTriggerResponse({"toast": {"type": "warning", "content": "审核未通过校验，请刷新或打开审核页"}})
+                    if result["status"] == "DUPLICATE":
+                        return P2CardActionTriggerResponse({
+                            "toast": {"type": "success", "content": "已收到该卡片的提交，请查看审核状态"},
+                        })
+                    return P2CardActionTriggerResponse({
+                        "toast": {"type": "success", "content": "提交已接收，正在核对"},
+                        "card": {"type": "raw", "data": build_review_processing_card(review_url)},
+                    })
+                value = getattr(action, "value", None) or {}
                 approval_id = value.get("approval_id") if isinstance(value, dict) else None
                 row = store.get_approval(approval_id) if isinstance(approval_id, str) else None
                 if row is None or cp._task(row["task_run_id"]).tenant_id != args.tenant:
@@ -188,12 +297,16 @@ def main() -> int:
             connection.on_reconnected = lambda: print("MEETING_APPROVAL_CONNECTION status=CONNECTED task_write=0", flush=True)
             if assistant_thread is not None:
                 assistant_thread.start()
+            if review_thread is not None:
+                review_thread.start()
             try:
                 connection.start()
             finally:
                 assistant_stop.set()
                 if assistant_thread is not None:
                     assistant_thread.join(timeout=5)
+                if review_thread is not None:
+                    review_thread.join(timeout=5)
     return 0
 
 

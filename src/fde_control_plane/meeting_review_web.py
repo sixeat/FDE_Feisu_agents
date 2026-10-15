@@ -20,7 +20,7 @@ from .follow_up import (
     OwnerDecisionEvent, apply_owner_decision_event, build_daily_follow_up_digest, confirmed_task_bindings,
     remote_due_mismatch,
 )
-from .meeting import review_todo_ref
+from .meeting import meeting_review_snapshot, review_todo_ref
 from .models import ActorType, AuditEvent, IdentityContext, TaskRunStatus
 from .task_due_correction import (
     approve_due_correction, correction_for_task, latest_remote_observation, propose_due_correction,
@@ -511,10 +511,7 @@ class MeetingReviewWebService:
         drafts = self.cp.store.list_meeting_todos(record_id)
         source = self.cp.store.get_meeting_source(record_id)
         evidence = {int(b["block_id"]): b["text"] for b in (source or {}).get("evidence", [])}
-        snapshot = hashlib.sha256(json.dumps(
-            {"record": record, "task_status": task.status, "drafts": drafts},
-            sort_keys=True, ensure_ascii=True,
-        ).encode()).hexdigest()
+        snapshot = meeting_review_snapshot(record, task.status, drafts)
         return {
             "record_id": record_id,
             "title": (source or {}).get("title", "会议纪要"),

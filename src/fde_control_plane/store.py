@@ -222,7 +222,8 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS assistant_card_deliveries (
                 record_id TEXT PRIMARY KEY, recipient_actor_id TEXT NOT NULL,
                 idempotency_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL,
-                message_id TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                message_id TEXT, review_snapshot TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS assistant_message_inbox (
                 message_hash TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
@@ -232,6 +233,14 @@ class SQLiteStore:
             );
             CREATE INDEX IF NOT EXISTS idx_assistant_message_inbox_status
                 ON assistant_message_inbox(tenant_id, status, created_at);
+            CREATE TABLE IF NOT EXISTS meeting_card_review_inbox (
+                message_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                status TEXT NOT NULL, data_json TEXT NOT NULL,
+                claim_token TEXT, lease_until REAL, result_json TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_meeting_card_review_inbox_status
+                ON meeting_card_review_inbox(tenant_id, status, created_at);
             CREATE TABLE IF NOT EXISTS approval_actions (
                 action_key TEXT PRIMARY KEY, approval_id TEXT NOT NULL,
                 action_version INTEGER NOT NULL, decision TEXT NOT NULL,
@@ -281,6 +290,10 @@ class SQLiteStore:
         for name, statement in migrations.items():
             if name not in columns:
                 self.connection.execute(statement)
+        card_columns = {row["name"] for row in self.connection.execute(
+            "PRAGMA table_info(assistant_card_deliveries)").fetchall()}
+        if "review_snapshot" not in card_columns:
+            self.connection.execute("ALTER TABLE assistant_card_deliveries ADD COLUMN review_snapshot TEXT")
         self.connection.commit()
 
     @staticmethod
@@ -1374,12 +1387,13 @@ class SQLiteStore:
         )
 
     def claim_assistant_card_delivery(self, record_id: str, recipient_actor_id: str,
-                                      idempotency_key: str) -> bool:
+                                      idempotency_key: str, review_snapshot: str | None = None) -> bool:
         """Persist the send fence before contacting Feishu."""
         row = self.connection.execute(
             "INSERT OR IGNORE INTO assistant_card_deliveries "
-            "(record_id, recipient_actor_id, idempotency_key, status) VALUES (?, ?, ?, 'SENDING')",
-            (record_id, recipient_actor_id, idempotency_key),
+            "(record_id, recipient_actor_id, idempotency_key, status, review_snapshot) "
+            "VALUES (?, ?, ?, 'SENDING', ?)",
+            (record_id, recipient_actor_id, idempotency_key, review_snapshot),
         )
         return row.rowcount == 1
 
@@ -1387,6 +1401,12 @@ class SQLiteStore:
         return self.connection.execute(
             "SELECT * FROM assistant_card_deliveries WHERE record_id = ?", (record_id,),
         ).fetchone()
+
+    def get_assistant_card_delivery_by_message(self, message_id: str) -> sqlite3.Row | None:
+        rows = self.connection.execute(
+            "SELECT * FROM assistant_card_deliveries WHERE message_id = ? LIMIT 2", (message_id,),
+        ).fetchall()
+        return rows[0] if len(rows) == 1 else None
 
     def finish_assistant_card_delivery(self, record_id: str, *, status: str,
                                        message_id: str | None = None) -> None:
@@ -1444,6 +1464,50 @@ class SQLiteStore:
             "data_json = CASE WHEN ? IN ('DONE', 'REJECTED') THEN '{}' ELSE data_json END "
             "WHERE message_hash = ? AND claim_token = ? AND status = 'CLAIMED'",
             (status, self._json(result), status, message_hash, claim_token),
+        )
+        return row.rowcount == 1
+
+    def enqueue_meeting_card_review(self, message_id: str, tenant_id: str,
+                                    data: dict[str, Any]) -> bool:
+        row = self.connection.execute(
+            "INSERT OR IGNORE INTO meeting_card_review_inbox "
+            "(message_id, tenant_id, status, data_json) VALUES (?, ?, 'PENDING', ?)",
+            (message_id, tenant_id, self._json(data)),
+        )
+        return row.rowcount == 1
+
+    def claim_meeting_card_review(self, tenant_id: str, claim_token: str,
+                                  *, lease_seconds: int = 300) -> dict[str, Any] | None:
+        now = time.time()
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT * FROM meeting_card_review_inbox WHERE tenant_id = ? AND "
+                "(status = 'PENDING' OR (status = 'CLAIMED' AND lease_until < ?)) "
+                "ORDER BY created_at, rowid LIMIT 1", (tenant_id, now),
+            ).fetchone()
+            if row is None:
+                self.connection.execute("COMMIT")
+                return None
+            self.connection.execute(
+                "UPDATE meeting_card_review_inbox SET status = 'CLAIMED', claim_token = ?, lease_until = ? "
+                "WHERE message_id = ?", (claim_token, now + lease_seconds, row["message_id"]),
+            )
+            self.connection.execute("COMMIT")
+            return {"message_id": row["message_id"], "data": json.loads(row["data_json"])}
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def finish_meeting_card_review(self, message_id: str, claim_token: str,
+                                   status: str, result: dict[str, Any]) -> bool:
+        if status not in {"DONE", "REJECTED"}:
+            raise ValueError("invalid meeting card review result")
+        row = self.connection.execute(
+            "UPDATE meeting_card_review_inbox SET status = ?, claim_token = NULL, "
+            "lease_until = NULL, result_json = ?, data_json = '{}' "
+            "WHERE message_id = ? AND claim_token = ? AND status = 'CLAIMED'",
+            (status, self._json(result), message_id, claim_token),
         )
         return row.rowcount == 1
 

@@ -47,6 +47,15 @@ def review_todo_ref(todo_id: str) -> str:
     return hashlib.sha256(str(todo_id).encode("utf-8")).hexdigest()[:12]
 
 
+def meeting_review_snapshot(record: dict[str, Any], task_status: Any,
+                            drafts: list[dict[str, Any]]) -> str:
+    """Bind either review surface to the same stored draft and task state."""
+    return hashlib.sha256(json.dumps(
+        {"record": record, "task_status": task_status, "drafts": drafts},
+        sort_keys=True, ensure_ascii=True,
+    ).encode()).hexdigest()
+
+
 MEETING_TASK_TOOL = ToolDefinition(
     tool_name="feishu.task.create",
     required_capabilities=frozenset({"task.write"}),

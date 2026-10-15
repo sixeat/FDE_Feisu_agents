@@ -9,6 +9,7 @@ from .service import ControlPlane
 
 
 ACTION = "meeting_task_approval"
+MEETING_REVIEW_FORM_ACTION = "meeting_review_submit"
 
 
 def build_meeting_intake_failure_card(*, authorization_required: bool, authorization_url: str | None = None) -> dict[str, Any]:
@@ -52,6 +53,51 @@ def build_meeting_intake_card(
         "config": {"wide_screen_mode": True},
         "header": {"title": {"tag": "plain_text", "content": "会议 Agent 已完成提取"}},
         "elements": elements,
+    }
+
+
+def build_meeting_review_form_card(
+    *, title: str, todos: list[dict[str, Any]], members: list[dict[str, str]], review_url: str,
+) -> dict[str, Any]:
+    """Bounded Card 2.0 form for simple meeting drafts; caller stores its snapshot."""
+    if not 1 <= len(todos) <= 3 or not members:
+        raise ValueError("card review requires one to three todos and a member directory")
+    options = [{
+        "text": {"tag": "plain_text", "content": member["name"]},
+        "value": member["actor_id"],
+    } for member in members]
+    fields: list[dict[str, Any]] = []
+    for index, todo in enumerate(todos):
+        fields.extend([
+            {"tag": "div", "text": {"tag": "plain_text", "content": f"{index + 1}. {todo['title']}"}},
+            {"tag": "div", "text": {"tag": "plain_text", "content": f"来源：{todo['evidence']}"}},
+            {"tag": "div", "text": {"tag": "plain_text", "content": "选择责任人"}},
+            {"tag": "select_static", "name": f"assignee_{index}",
+             "placeholder": {"tag": "plain_text", "content": "选择企业成员"},
+             "options": options, "required": True},
+            {"tag": "div", "text": {"tag": "plain_text", "content": "选择截止日期"}},
+            {"tag": "date_picker", "name": f"due_{index}",
+             "placeholder": {"tag": "plain_text", "content": "选择日期"}, "required": True},
+        ])
+        if todo.get("assignee_actor_id"):
+            fields[-3]["initial_option"] = todo["assignee_actor_id"]
+        if todo.get("due_date"):
+            fields[-1]["initial_date"] = todo["due_date"]
+    fields.append({
+        "tag": "button", "name": MEETING_REVIEW_FORM_ACTION,
+        "text": {"tag": "plain_text", "content": "提交会议审核"},
+        "type": "primary_filled", "form_action_type": "submit",
+    })
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": False, "enable_forward": False},
+        "header": {"title": {"tag": "plain_text", "content": f"会议待办审核 · {title}"}},
+        "body": {"elements": [
+            {"tag": "div", "text": {"tag": "plain_text", "content": "请核对标题和来源证据，补齐责任人与日期。提交后只生成待审批提案，不会立即创建飞书任务。"}},
+            {"tag": "form", "name": "meeting_review", "elements": fields},
+            {"tag": "button", "text": {"tag": "plain_text", "content": "需要修改标题或处理冲突？打开审核页"},
+             "type": "default", "url": review_url},
+        ]},
     }
 
 
@@ -159,4 +205,4 @@ def handle_meeting_approval_action(
     )
 
 
-__all__ = ["build_meeting_approval_card", "build_meeting_decided_card", "build_meeting_intake_card", "build_meeting_intake_failure_card", "handle_meeting_approval_action"]
+__all__ = ["MEETING_REVIEW_FORM_ACTION", "build_meeting_approval_card", "build_meeting_decided_card", "build_meeting_intake_card", "build_meeting_intake_failure_card", "build_meeting_review_form_card", "handle_meeting_approval_action"]

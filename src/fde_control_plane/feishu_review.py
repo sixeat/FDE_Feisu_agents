@@ -20,22 +20,29 @@ class DocumentContentReader(DocumentRevisionReader, Protocol):
 
 
 class EventDocumentAccessVerifier(Protocol):
-    """Prove a bot-event sender can read this document as that member."""
+    """Read using the bot-event sender's current user authorization."""
 
-    def verify(self, identity: IdentityContext, document_id: str) -> None: ...
+    def read_document(self, identity: IdentityContext, document_id: str) -> dict[str, Any]: ...
 
 
 class FeishuDocumentRevisionReader:
-    """Read only docx metadata; the SDK client owns Feishu credentials."""
+    """Read docx metadata and content with an explicit or SDK-managed token."""
 
-    def __init__(self, client: Any) -> None:
+    def __init__(self, client: Any, *, user_access_token: str | None = None) -> None:
         self.client = client
+        self.user_access_token = user_access_token
+
+    def _option(self) -> Any:
+        if self.user_access_token is None:
+            return None
+        import lark_oapi as lark
+        return lark.RequestOption.builder().user_access_token(self.user_access_token).build()
 
     def get_revision(self, document_id: str) -> str:
         import lark_oapi as lark
 
         request = lark.api.docx.v1.model.GetDocumentRequest.builder().document_id(document_id).build()
-        response = self.client.docx.v1.document.get(request)
+        response = self.client.docx.v1.document.get(request, self._option())
         code = getattr(response, "code", None)
         if code != 0:
             raise RuntimeError(f"FEISHU_DOCUMENT_READ_{code if code is not None else 'UNKNOWN'}")
@@ -50,7 +57,7 @@ class FeishuDocumentRevisionReader:
         import lark_oapi as lark
 
         meta_request = lark.api.docx.v1.model.GetDocumentRequest.builder().document_id(document_id).build()
-        meta = self.client.docx.v1.document.get(meta_request)
+        meta = self.client.docx.v1.document.get(meta_request, self._option())
         if getattr(meta, "code", None) != 0:
             raise RuntimeError(f"FEISHU_DOCUMENT_READ_{getattr(meta, 'code', 'UNKNOWN')}")
         document = getattr(getattr(meta, "data", None), "document", None)
@@ -83,7 +90,7 @@ class FeishuDocumentRevisionReader:
             )
             if page_token:
                 builder = builder.page_token(page_token)
-            response = self.client.docx.v1.document_block_children.get(builder.build())
+            response = self.client.docx.v1.document_block_children.get(builder.build(), self._option())
             if getattr(response, "code", None) != 0:
                 raise RuntimeError(f"FEISHU_DOCUMENT_BLOCKS_READ_{getattr(response, 'code', 'UNKNOWN')}")
             data = getattr(response, "data", None)
@@ -161,11 +168,12 @@ class FeishuMeetingReviewGateway:
         if requester_identity.auth_mode == "feishu_event":
             if self.event_access_verifier is None:
                 raise PermissionError("用户级文档访问尚未验证")
-            self.event_access_verifier.verify(requester_identity, document_id)
-        reader = self.revision_reader
-        if not hasattr(reader, "read_document"):
-            raise RuntimeError("会议文档读取器未配置")
-        source = reader.read_document(document_id)  # type: ignore[attr-defined]
+            source = self.event_access_verifier.read_document(requester_identity, document_id)
+        else:
+            reader = self.revision_reader
+            if not hasattr(reader, "read_document"):
+                raise RuntimeError("会议文档读取器未配置")
+            source = reader.read_document(document_id)  # type: ignore[attr-defined]
         revision_id = str(source["revision_id"])
         document_hash = hashlib.sha256(document_id.encode("utf-8")).hexdigest()[:12]
         dispatch_key = hashlib.sha256(

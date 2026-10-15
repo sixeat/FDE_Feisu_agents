@@ -17,6 +17,7 @@ from .service import ControlPlane
 class OAuthGrant:
     access_token: str
     scope: str = ""
+    expires_in: int | None = None
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,10 @@ class OAuthTransport(Protocol):
     def get_user(self, access_token: str) -> OAuthUser: ...
 
 
+class UserTokenStore(Protocol):
+    def replace(self, identity: IdentityContext, grant: OAuthGrant) -> None: ...
+
+
 class FeishuOAuthTransport:
     """Keep the short-lived user token inside the SDK boundary."""
 
@@ -51,7 +56,8 @@ class FeishuOAuthTransport:
         token = getattr(result, "access_token", None)
         if not token:
             raise RuntimeError("FEISHU_OAUTH_TOKEN_MISSING")
-        return OAuthGrant(str(token), str(getattr(result, "scope", "") or ""))
+        return OAuthGrant(str(token), str(getattr(result, "scope", "") or ""),
+                          getattr(result, "expires_in", None))
 
     def get_user(self, access_token: str) -> OAuthUser:
         import lark_oapi as lark
@@ -78,6 +84,7 @@ class FeishuOAuthIdentityGateway:
         default_assistant_actor_id: str | None = None,
         default_member_capabilities: frozenset[str] = frozenset(),
         state_ttl_seconds: int = 300, clock: Callable[[], float] = time.time,
+        user_token_store: UserTokenStore | None = None,
     ) -> None:
         if state_ttl_seconds < 1 or not tenant_id or not expected_tenant_key:
             raise ValueError("tenant identity and positive state lifetime are required")
@@ -89,6 +96,7 @@ class FeishuOAuthIdentityGateway:
         self.default_member_capabilities = default_member_capabilities
         self.state_ttl_seconds = state_ttl_seconds
         self.clock = clock
+        self.user_token_store = user_token_store
 
     def issue_state(self, *, browser_session_ref: str) -> str:
         if not browser_session_ref:
@@ -131,10 +139,12 @@ class FeishuOAuthIdentityGateway:
         scopes = frozenset(filter(None, re.split(r"[\s,]+", grant.scope)))
         identity = IdentityContext(self.tenant_id, actor.actor_id, "user_oauth", subject_hash, scopes)
         self.control_plane.verify_identity(identity)
+        if self.user_token_store is not None:
+            self.user_token_store.replace(identity, grant)
         return identity
 
 
 __all__ = [
     "FeishuOAuthIdentityGateway", "FeishuOAuthTransport", "MemberAccessPending",
-    "OAuthGrant", "OAuthTransport", "OAuthUser",
+    "OAuthGrant", "OAuthTransport", "OAuthUser", "UserTokenStore",
 ]

@@ -126,6 +126,11 @@ def main() -> int:
             if not tenant_key or not review_url:
                 raise ValueError("assistant intake requires tenant key and review URL")
             worker_client = client_from_environment()[2]
+            token_key = os.environ.get("FDE_USER_TOKEN_KEY", "").strip()
+            if not token_key:
+                raise ValueError("assistant intake requires user token encryption key")
+            user_client = (lark.Client.builder().app_id(app_id).app_secret(secret).timeout(12)
+                           .enable_set_token(True).build())
 
             def assistant_worker():
                 while not assistant_stop.is_set():
@@ -133,6 +138,7 @@ def main() -> int:
                         status = process_one(
                             db_path=args.db, tenant_id=args.tenant, tenant_key=tenant_key,
                             app_id=app_id, client=worker_client, review_url=review_url,
+                            token_key=token_key, user_client=user_client,
                         )
                         if status == "EMPTY":
                             assistant_stop.wait(2)

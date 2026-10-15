@@ -22,6 +22,7 @@ from fde_control_plane import (
     FeishuDocumentRevisionReader, FeishuMeetingReviewGateway,
     FeishuPersonalAssistantGateway, HermesRuntimeAdapter, PersonalAssistantMessage, SQLiteStore,
 )
+from fde_control_plane.user_document_access import FeishuUserDocumentReader, UserTokenVault
 
 
 def _required(name: str) -> str:
@@ -65,8 +66,11 @@ def enqueue_callback(store: SQLiteStore, callback: object, *, app_id: str,
 
 def process_one(*, db_path: str, tenant_id: str, tenant_key: str,
                 app_id: str, client: object, review_url: str,
-                event_access_verifier: object | None = None) -> str:
+                event_access_verifier: object | None = None,
+                token_key: str | None = None, user_client: object | None = None) -> str:
     with SQLiteStore(db_path) as store:
+        if event_access_verifier is None and token_key and user_client is not None:
+            event_access_verifier = FeishuUserDocumentReader(UserTokenVault(store, token_key), user_client)
         token = uuid.uuid4().hex
         item = store.claim_assistant_message(tenant_id, token)
         if item is None:
@@ -109,8 +113,12 @@ def main() -> int:
     import lark_oapi as lark
 
     client = lark.Client.builder().app_id(app_id).app_secret(secret).timeout(12).build()
+    token_key = os.environ.get("FDE_USER_TOKEN_KEY", "").strip()
+    user_client = (lark.Client.builder().app_id(app_id).app_secret(secret).timeout(12)
+                   .enable_set_token(True).build()) if token_key else None
     process_one(db_path=args.db, tenant_id=tenant_id, tenant_key=tenant_key,
-                app_id=app_id, client=client, review_url=review_url)
+                app_id=app_id, client=client, review_url=review_url,
+                token_key=token_key, user_client=user_client)
     return 0
 
 

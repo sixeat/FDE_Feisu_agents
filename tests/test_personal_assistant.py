@@ -2,6 +2,8 @@ import hashlib
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from scripts import personal_assistant_intake
 
 from fde_control_plane import (
@@ -49,8 +51,10 @@ class FakeAccessVerifier:
     def __init__(self):
         self.calls = []
 
-    def verify(self, identity, document_id):
+    def read_document(self, identity, document_id):
         self.calls.append((identity.actor_id, document_id))
+        return {"document_id": document_id, "revision_id": "5", "title": "例会纪要",
+                "blocks": [{"index": 2, "block_type": 2, "text": "张三整理部署文档"}]}
 
 
 class FakeSender:
@@ -98,7 +102,7 @@ def test_p2p_message_routes_through_bound_assistant_and_returns_draft_card(tmp_p
     result = gateway.receive(callback())
     assert result["created"] is True
     assert result["card_status"] == "SENT"
-    assert runtime.calls == reader.calls == 1
+    assert runtime.calls == 1 and reader.calls == 0
     assert cp.store.get_task_run(result["task_run_id"])["assistant_actor_id"] == "assistant"
     assert cp.store.get_meeting_record(result["record_id"])["submitted_by"] == "member"
     assert len(cp.store.list_meeting_todos(result["record_id"])) == 1
@@ -151,6 +155,21 @@ def test_event_without_user_document_access_proof_fails_before_app_read(tmp_path
     assert sender.calls == []
 
 
+def test_event_document_access_denial_never_reads_as_application(tmp_path):
+    cp, gateway, runtime, reader, sender = setup_gateway(tmp_path)
+
+    class DeniedUserReader:
+        def read_document(self, identity, document_id):
+            assert identity.auth_mode == "feishu_event"
+            assert document_id == DOC_ID
+            raise RuntimeError("FEISHU_DOCUMENT_READ_403")
+
+    gateway.meeting_gateway.event_access_verifier = DeniedUserReader()
+    assert gateway.receive(callback())["status"] == "MEETING_INTAKE_FAILED"
+    assert runtime.calls == reader.calls == 0
+    assert sender.calls == []
+
+
 def test_ambiguous_or_unrelated_messages_do_not_start_meeting(tmp_path):
     cp, gateway, runtime, reader, sender = setup_gateway(tmp_path)
     assert gateway.receive(callback(text="你好"))["status"] == "NO_DOCUMENT_LINK"
@@ -181,7 +200,7 @@ def test_verified_callback_is_durably_queued_and_processed_off_callback(tmp_path
         client=object(), review_url="https://fde.example.test/h5#meetings",
         event_access_verifier=FakeAccessVerifier(),
     ) == "DONE"
-    assert runtime.calls == reader.calls == 1
+    assert runtime.calls == 1 and reader.calls == 0
     assert len(sender.calls) == 1
     assert personal_assistant_intake.process_one(
         db_path=db_path, tenant_id="tenant", tenant_key="tenant-key", app_id="cli_app",
@@ -204,6 +223,22 @@ def test_inbox_worker_without_user_access_verifier_does_not_read_document(tmp_pa
     ) == "REJECTED"
     assert runtime.calls == reader.calls == 0
     assert sender.calls == []
+
+
+def test_invalid_token_key_does_not_claim_inbox_message(tmp_path):
+    cp, _, _, _, _ = setup_gateway(tmp_path)
+    assert personal_assistant_intake.enqueue_callback(
+        cp.store, callback(), app_id="cli_app", tenant_key="tenant-key", tenant_id="tenant",
+    ) == "QUEUED"
+    with pytest.raises(ValueError, match="encryption key"):
+        personal_assistant_intake.process_one(
+            db_path=str(tmp_path / "assistant.sqlite3"), tenant_id="tenant",
+            tenant_key="tenant-key", app_id="cli_app", client=object(),
+            review_url="https://fde.example.test/h5#meetings", token_key="invalid",
+            user_client=SimpleNamespace(config=SimpleNamespace(enable_set_token=True)),
+        )
+    row = cp.store.connection.execute("SELECT status FROM assistant_message_inbox").fetchone()
+    assert row["status"] == "PENDING"
 
 
 def test_reclaimed_inbox_message_keeps_single_agent_execution(tmp_path, monkeypatch):

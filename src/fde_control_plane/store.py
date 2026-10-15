@@ -135,6 +135,12 @@ class SQLiteStore:
                 session_hash TEXT PRIMARY KEY, data_json TEXT NOT NULL,
                 expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS user_oauth_tokens (
+                actor_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                subject_ref_hash TEXT NOT NULL, scopes_json TEXT NOT NULL,
+                token_ciphertext TEXT NOT NULL, expires_at INTEGER NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS task_runs (
                 task_run_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
                 data_json TEXT NOT NULL
@@ -869,6 +875,27 @@ class SQLiteStore:
             "SELECT * FROM assistant_bindings WHERE member_actor_id = ? AND tenant_id = ? AND is_default = 1 LIMIT 1",
             (member_actor_id, tenant_id),
         ).fetchone()
+
+    def save_user_oauth_token(self, *, actor_id: str, tenant_id: str,
+                              subject_ref_hash: str, scopes: frozenset[str],
+                              token_ciphertext: str, expires_at: int) -> None:
+        self.connection.execute(
+            "INSERT INTO user_oauth_tokens "
+            "(actor_id, tenant_id, subject_ref_hash, scopes_json, token_ciphertext, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(actor_id) DO UPDATE SET "
+            "tenant_id = excluded.tenant_id, subject_ref_hash = excluded.subject_ref_hash, "
+            "scopes_json = excluded.scopes_json, token_ciphertext = excluded.token_ciphertext, "
+            "expires_at = excluded.expires_at, updated_at = CURRENT_TIMESTAMP",
+            (actor_id, tenant_id, subject_ref_hash, self._json(sorted(scopes)), token_ciphertext, expires_at),
+        )
+
+    def get_user_oauth_token(self, actor_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM user_oauth_tokens WHERE actor_id = ?", (actor_id,),
+        ).fetchone()
+
+    def delete_user_oauth_token(self, actor_id: str) -> None:
+        self.connection.execute("DELETE FROM user_oauth_tokens WHERE actor_id = ?", (actor_id,))
 
     def save_task_run(self, task_run: Any) -> None:
         data = asdict(task_run)

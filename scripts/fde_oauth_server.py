@@ -22,6 +22,7 @@ from fde_control_plane.feishu_review import FeishuDocumentRevisionReader, Feishu
 from fde_control_plane.meeting_review_web import MeetingReviewWebService, build_meeting_review_router
 from fde_control_plane.orchestration import AgentOrchestrator
 from fde_control_plane.runtime import HermesRuntimeAdapter
+from fde_control_plane.user_document_access import UserTokenVault
 
 from fde_control_plane import (
     Actor,
@@ -101,6 +102,8 @@ def create_app() -> FastAPI:
         .enable_set_token(True)
         .build()
     )
+    user_token_key = os.environ.get("FDE_USER_TOKEN_KEY", "").strip()
+    user_token_store = UserTokenVault(control_plane.store, user_token_key) if user_token_key else None
     gateway = FeishuOAuthIdentityGateway(
         control_plane,
         FeishuOAuthTransport(client, redirect_uri=redirect_uri),
@@ -108,6 +111,7 @@ def create_app() -> FastAPI:
         expected_tenant_key=tenant_key,
         default_assistant_actor_id=os.environ.get("FDE_DEFAULT_ASSISTANT_ACTOR_ID") or None,
         default_member_capabilities=default_member_capabilities,
+        user_token_store=user_token_store,
     )
     flow = FeishuOAuthWebFlow(
         gateway,

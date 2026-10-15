@@ -19,6 +19,12 @@ class DocumentContentReader(DocumentRevisionReader, Protocol):
     def read_document(self, document_id: str) -> dict[str, Any]: ...
 
 
+class EventDocumentAccessVerifier(Protocol):
+    """Prove a bot-event sender can read this document as that member."""
+
+    def verify(self, identity: IdentityContext, document_id: str) -> None: ...
+
+
 class FeishuDocumentRevisionReader:
     """Read only docx metadata; the SDK client owns Feishu credentials."""
 
@@ -111,10 +117,12 @@ class FeishuMeetingReviewGateway:
     def __init__(
         self, control_plane: ControlPlane, orchestrator: AgentOrchestrator,
         revision_reader: DocumentRevisionReader,
+        event_access_verifier: EventDocumentAccessVerifier | None = None,
     ) -> None:
         self.control_plane = control_plane
         self.orchestrator = orchestrator
         self.revision_reader = revision_reader
+        self.event_access_verifier = event_access_verifier
 
     @staticmethod
     def document_id_from_url(value: str) -> str:
@@ -136,7 +144,7 @@ class FeishuMeetingReviewGateway:
     ) -> dict[str, Any]:
         """Read one document and route it through the member's assistant."""
         member = self.control_plane.verify_identity(requester_identity)
-        if requester_identity.auth_mode != "user_oauth" or member.actor_type != ActorType.USER:
+        if requester_identity.auth_mode not in {"user_oauth", "feishu_event"} or member.actor_type != ActorType.USER:
             raise PermissionError("会议任务必须由飞书成员身份发起")
         binding = self.control_plane.store.get_binding(member.actor_id, member.tenant_id)
         if binding is None:
@@ -150,6 +158,10 @@ class FeishuMeetingReviewGateway:
             raise PermissionError("会议 Agent 当前不可用")
         version = int(version_rows[0]["version"])
         document_id = self.document_id_from_url(document_url)
+        if requester_identity.auth_mode == "feishu_event":
+            if self.event_access_verifier is None:
+                raise PermissionError("用户级文档访问尚未验证")
+            self.event_access_verifier.verify(requester_identity, document_id)
         reader = self.revision_reader
         if not hasattr(reader, "read_document"):
             raise RuntimeError("会议文档读取器未配置")
@@ -254,4 +266,4 @@ class FeishuMeetingReviewGateway:
         )
 
 
-__all__ = ["DocumentRevisionReader", "DocumentContentReader", "FeishuDocumentRevisionReader", "FeishuMeetingReviewGateway"]
+__all__ = ["DocumentRevisionReader", "DocumentContentReader", "EventDocumentAccessVerifier", "FeishuDocumentRevisionReader", "FeishuMeetingReviewGateway"]

@@ -7,17 +7,20 @@ import hashlib
 import logging
 import os
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "scripts"))
 
 from fde_control_plane import ControlPlane, FeishuApprovalGateway, FeishuCardSender, SQLiteStore
 from fde_control_plane.approval_card import build_meeting_decided_card
 from fde_control_plane.feishu_review import FeishuDocumentRevisionReader
 from fde_control_plane.meeting_approval_bridge import MeetingApprovalBridge
+from personal_assistant_intake import enqueue_callback, process_one
 
 
 def short_hash(value: str) -> str:
@@ -114,6 +117,42 @@ def main() -> int:
                 print(f"MEETING_APPROVAL_REFRESH approval_hash={short_hash(approval_id)} "
                       f"status=RETRY_REQUIRED error_type={type(exc).__name__} task_write=0", flush=True)
 
+        assistant_enabled = os.environ.get("FDE_ASSISTANT_INTAKE_ENABLED") == "1"
+        assistant_stop = threading.Event()
+        assistant_thread = None
+        if assistant_enabled:
+            tenant_key = os.environ.get("FEISHU_TENANT_KEY", "").strip()
+            review_url = os.environ.get("FDE_ASSISTANT_REVIEW_URL", "").strip()
+            if not tenant_key or not review_url:
+                raise ValueError("assistant intake requires tenant key and review URL")
+            worker_client = client_from_environment()[2]
+
+            def assistant_worker():
+                while not assistant_stop.is_set():
+                    try:
+                        status = process_one(
+                            db_path=args.db, tenant_id=args.tenant, tenant_key=tenant_key,
+                            app_id=app_id, client=worker_client, review_url=review_url,
+                        )
+                        if status == "EMPTY":
+                            assistant_stop.wait(2)
+                    except Exception as exc:
+                        print(f"ASSISTANT_WORKER status=ERROR error_type={type(exc).__name__} task_write=0", flush=True)
+                        assistant_stop.wait(5)
+
+            assistant_thread = threading.Thread(target=assistant_worker, name="assistant-intake", daemon=True)
+
+            def on_message(callback):
+                try:
+                    with SQLiteStore(args.db) as inbox_store:
+                        status = enqueue_callback(
+                            inbox_store, callback, app_id=app_id,
+                            tenant_key=tenant_key, tenant_id=args.tenant,
+                        )
+                    print(f"ASSISTANT_INTAKE status={status} task_write=0", flush=True)
+                except Exception as exc:
+                    print(f"ASSISTANT_INTAKE status=ERROR error_type={type(exc).__name__} task_write=0", flush=True)
+
         with quiet_sdk_logs(), ThreadPoolExecutor(max_workers=1) as updater:
             def on_card_action(data):
                 value = getattr(getattr(getattr(data, "event", None), "action", None), "value", None) or {}
@@ -133,12 +172,22 @@ def main() -> int:
                     updater.submit(patch_decision, approval_id)
                 return P2CardActionTriggerResponse(response)
 
-            handler = lark.EventDispatcherHandler.builder("", "").register_p2_card_action_trigger(on_card_action).build()
-            print("MEETING_APPROVAL_LISTENING task_worker=OFF task_write=0", flush=True)
+            builder = lark.EventDispatcherHandler.builder("", "").register_p2_card_action_trigger(on_card_action)
+            if assistant_enabled:
+                builder = builder.register_p2_im_message_receive_v1(on_message)
+            handler = builder.build()
+            print(f"MEETING_APPROVAL_LISTENING task_worker=OFF assistant_intake={'ON' if assistant_enabled else 'OFF'} task_write=0", flush=True)
             connection = lark.ws.Client(app_id, secret, event_handler=handler, log_level=lark.LogLevel.ERROR)
             connection.on_reconnecting = lambda: print("MEETING_APPROVAL_CONNECTION status=RECONNECTING task_write=0", flush=True)
             connection.on_reconnected = lambda: print("MEETING_APPROVAL_CONNECTION status=CONNECTED task_write=0", flush=True)
-            connection.start()
+            if assistant_thread is not None:
+                assistant_thread.start()
+            try:
+                connection.start()
+            finally:
+                assistant_stop.set()
+                if assistant_thread is not None:
+                    assistant_thread.join(timeout=5)
     return 0
 
 

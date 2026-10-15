@@ -40,9 +40,10 @@ from .runtime import (
     RuntimeResult,
 )
 from .orchestration import AgentExecution, AgentOrchestrator, ReviewSubmission
-from .approval_card import build_meeting_approval_card, build_meeting_decided_card, handle_meeting_approval_action
+from .approval_card import build_meeting_approval_card, build_meeting_decided_card, build_meeting_intake_card, handle_meeting_approval_action
 from .feishu_approval import FeishuApprovalGateway, FeishuCardSender
 from .feishu_review import FeishuDocumentRevisionReader, FeishuMeetingReviewGateway
+from .personal_assistant import FeishuPersonalAssistantGateway, PersonalAssistantMessage
 from .feishu_oauth import FeishuOAuthIdentityGateway, FeishuOAuthTransport
 from .feishu_oauth_web import (
     FeishuOAuthWebFlow, OAuthSessionIssuer, OAuthWebConfig, SQLiteOAuthSessionIssuer, build_oauth_router,
@@ -100,11 +101,14 @@ __all__ = [
     "ReviewSubmission",
     "build_meeting_approval_card",
     "build_meeting_decided_card",
+    "build_meeting_intake_card",
     "handle_meeting_approval_action",
     "FeishuApprovalGateway",
     "FeishuCardSender",
     "FeishuDocumentRevisionReader",
     "FeishuMeetingReviewGateway",
+    "FeishuPersonalAssistantGateway",
+    "PersonalAssistantMessage",
     "FeishuOAuthIdentityGateway",
     "FeishuOAuthTransport",
     "FeishuOAuthWebFlow",

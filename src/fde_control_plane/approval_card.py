@@ -11,6 +11,31 @@ from .service import ControlPlane
 ACTION = "meeting_task_approval"
 
 
+def build_meeting_intake_card(
+    *, title: str, todos: list[dict[str, Any]], review_url: str,
+) -> dict[str, Any]:
+    """Show Agent draft output without offering a premature write approval."""
+    elements: list[dict[str, Any]] = [
+        {"tag": "div", "text": {"tag": "plain_text", "content": f"{title}：提取 {len(todos)} 条待办，请核对后提交。"}},
+    ]
+    for index, todo in enumerate(todos[:8], 1):
+        label = str(todo.get("title") or "未命名待办")
+        due = str(todo.get("due_date") or "待确认")
+        assignee = "已匹配" if todo.get("assignee_actor_id") else "待确认"
+        elements.append({"tag": "div", "text": {"tag": "plain_text", "content": f"{index}. {label}｜负责人：{assignee}｜截止：{due}"}})
+    if len(todos) > 8:
+        elements.append({"tag": "div", "text": {"tag": "plain_text", "content": f"另有 {len(todos) - 8} 条，请在审核页查看。"}})
+    elements.append({"tag": "action", "actions": [{
+        "tag": "button", "text": {"tag": "plain_text", "content": "审核待办"},
+        "type": "primary", "url": review_url,
+    }]})
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text", "content": "会议 Agent 已完成提取"}},
+        "elements": elements,
+    }
+
+
 def build_meeting_approval_card(
     approval: ApprovalRequest,
     *,
@@ -115,4 +140,4 @@ def handle_meeting_approval_action(
     )
 
 
-__all__ = ["build_meeting_approval_card", "build_meeting_decided_card", "handle_meeting_approval_action"]
+__all__ = ["build_meeting_approval_card", "build_meeting_decided_card", "build_meeting_intake_card", "handle_meeting_approval_action"]

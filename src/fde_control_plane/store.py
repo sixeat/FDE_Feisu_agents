@@ -213,6 +213,19 @@ class SQLiteStore:
                 proposal_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
                 status TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS assistant_card_deliveries (
+                record_id TEXT PRIMARY KEY, recipient_actor_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL,
+                message_id TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS assistant_message_inbox (
+                message_hash TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                status TEXT NOT NULL, data_json TEXT NOT NULL,
+                claim_token TEXT, lease_until REAL, result_json TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_assistant_message_inbox_status
+                ON assistant_message_inbox(tenant_id, status, created_at);
             CREATE TABLE IF NOT EXISTS approval_actions (
                 action_key TEXT PRIMARY KEY, approval_id TEXT NOT NULL,
                 action_version INTEGER NOT NULL, decision TEXT NOT NULL,
@@ -1332,6 +1345,80 @@ class SQLiteStore:
             "UPDATE approval_delivery_attempts SET status = ? WHERE approval_id = ? AND status = 'SENDING'",
             (status, approval_id),
         )
+
+    def claim_assistant_card_delivery(self, record_id: str, recipient_actor_id: str,
+                                      idempotency_key: str) -> bool:
+        """Persist the send fence before contacting Feishu."""
+        row = self.connection.execute(
+            "INSERT OR IGNORE INTO assistant_card_deliveries "
+            "(record_id, recipient_actor_id, idempotency_key, status) VALUES (?, ?, ?, 'SENDING')",
+            (record_id, recipient_actor_id, idempotency_key),
+        )
+        return row.rowcount == 1
+
+    def get_assistant_card_delivery(self, record_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM assistant_card_deliveries WHERE record_id = ?", (record_id,),
+        ).fetchone()
+
+    def finish_assistant_card_delivery(self, record_id: str, *, status: str,
+                                       message_id: str | None = None) -> None:
+        if status not in {"SENT", "UNKNOWN"} or (status == "SENT" and not message_id):
+            raise ValueError("invalid assistant card delivery result")
+        updated = self.connection.execute(
+            "UPDATE assistant_card_deliveries SET status = ?, message_id = ? "
+            "WHERE record_id = ? AND status = 'SENDING'",
+            (status, message_id, record_id),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("assistant card delivery is not pending")
+
+    def enqueue_assistant_message(self, message_hash: str, tenant_id: str,
+                                  data: dict[str, Any]) -> bool:
+        row = self.connection.execute(
+            "INSERT OR IGNORE INTO assistant_message_inbox "
+            "(message_hash, tenant_id, status, data_json) VALUES (?, ?, 'PENDING', ?)",
+            (message_hash, tenant_id, self._json(data)),
+        )
+        return row.rowcount == 1
+
+    def claim_assistant_message(self, tenant_id: str, claim_token: str,
+                                *, lease_seconds: int = 300) -> dict[str, Any] | None:
+        now = time.time()
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT * FROM assistant_message_inbox WHERE tenant_id = ? AND "
+                "(status = 'PENDING' OR (status = 'CLAIMED' AND lease_until < ?)) "
+                "ORDER BY created_at, rowid LIMIT 1", (tenant_id, now),
+            ).fetchone()
+            if row is None:
+                self.connection.execute("COMMIT")
+                return None
+            self.connection.execute(
+                "UPDATE assistant_message_inbox SET status = 'CLAIMED', claim_token = ?, lease_until = ? "
+                "WHERE message_hash = ?",
+                (claim_token, now + lease_seconds, row["message_hash"]),
+            )
+            self.connection.execute("COMMIT")
+            return {"message_hash": row["message_hash"], "data": json.loads(row["data_json"]),
+                    "reclaimed": row["status"] == "CLAIMED"}
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def finish_assistant_message(self, message_hash: str, claim_token: str,
+                                 status: str, result: dict[str, Any]) -> bool:
+        if status not in {"DONE", "REJECTED", "UNKNOWN"}:
+            raise ValueError("invalid assistant inbox result")
+        row = self.connection.execute(
+            "UPDATE assistant_message_inbox SET status = ?, claim_token = NULL, "
+            "lease_until = NULL, result_json = ?, "
+            "data_json = CASE WHEN ? IN ('DONE', 'REJECTED') THEN '{}' ELSE data_json END "
+            "WHERE message_hash = ? AND claim_token = ? AND status = 'CLAIMED'",
+            (status, self._json(result), status, message_hash, claim_token),
+        )
+        return row.rowcount == 1
 
     def list_approvals(self, task_run_id: str | None = None) -> list[sqlite3.Row]:
         if task_run_id is None:

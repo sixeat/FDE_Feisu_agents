@@ -122,7 +122,7 @@ class ControlPlane:
         actor = self._actor(context.actor_id)
         if not actor.active or actor.tenant_id != context.tenant_id:
             raise PermissionError("identity is inactive or belongs to another tenant")
-        if context.auth_mode not in {"user_oauth", "application"}:
+        if context.auth_mode not in {"user_oauth", "application", "feishu_event"}:
             raise PermissionError("unsupported authentication mode")
         if actor.external_ref_hash and actor.external_ref_hash != context.subject_ref_hash:
             raise PermissionError("identity subject does not match actor binding")

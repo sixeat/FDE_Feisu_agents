@@ -126,6 +126,7 @@ def test_p2p_message_routes_through_bound_assistant_and_returns_draft_card(tmp_p
     assert sender.calls[0][0] == "ou_member"
     assert result["card_mode"] == "FORM"
     assert sender.calls[0][1]["schema"] == "2.0"
+    assert sender.calls[0][1]["config"]["update_multi"] is True
     assert sender.calls[0][1]["body"]["elements"][1]["tag"] == "form"
     submit_button = sender.calls[0][1]["body"]["elements"][1]["elements"][-1]
     assert submit_button["action_type"] == "form_submit"

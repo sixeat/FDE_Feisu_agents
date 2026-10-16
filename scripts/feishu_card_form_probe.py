@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import uuid
 from pathlib import Path
@@ -15,7 +16,6 @@ from pathlib import Path
 import lark_oapi as lark
 
 from fde_control_plane.approval_card import build_meeting_review_form_card
-from fde_control_plane.feishu_approval import FeishuCardSender
 
 
 def main() -> int:
@@ -43,7 +43,18 @@ def main() -> int:
         raise ValueError("recipient file is empty")
     client = lark.Client.builder().app_id(app_id).app_secret(secret).timeout(12).build()
     key = str(uuid.uuid4())
-    message_id = FeishuCardSender(client).send(open_id, card, key)
+    body = (lark.api.im.v1.model.CreateMessageRequestBody.builder()
+            .receive_id(open_id).msg_type("interactive")
+            .content(json.dumps(card, ensure_ascii=False)).uuid(key).build())
+    request = (lark.api.im.v1.model.CreateMessageRequest.builder()
+               .receive_id_type("open_id").request_body(body).build())
+    response = client.im.v1.message.create(request)
+    if response.code != 0:
+        print(f"CARD_FORM_PROBE_REJECTED code={response.code} msg={str(response.msg)[:500]}")
+        return 1
+    message_id = getattr(getattr(response, "data", None), "message_id", None)
+    if not message_id:
+        raise RuntimeError("Card send returned no message id")
     print("CARD_FORM_PROBE_SENT message_hash="
           + hashlib.sha256(message_id.encode()).hexdigest()[:12] + " task_write=0")
     return 0

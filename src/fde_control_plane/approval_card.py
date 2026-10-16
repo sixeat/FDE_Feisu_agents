@@ -90,7 +90,7 @@ def build_meeting_review_form_card(
     })
     return {
         "schema": "2.0",
-        "config": {"update_multi": False, "enable_forward": False},
+        "config": {"update_multi": True, "enable_forward": False},
         "header": {"title": {"tag": "plain_text", "content": f"会议待办审核 · {title}"}},
         "body": {"elements": [
             {"tag": "div", "text": {"tag": "plain_text", "content": "请核对标题和来源证据，补齐责任人与日期。提交后只生成待审批提案，不会立即创建飞书任务。"}},

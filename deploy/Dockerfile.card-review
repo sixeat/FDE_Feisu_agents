@@ -1,0 +1,10 @@
+ARG BASE_IMAGE=fde-control-plane:meeting-ui-timeout-20261014
+FROM ${BASE_IMAGE}
+
+# Reuse the already validated runtime/dependency image on the single-node host.
+# This image only replaces application source; it does not download packages.
+COPY src /app/src
+COPY scripts /app/scripts
+
+ENV PYTHONPATH=/app/src
+ENV PYTHONUNBUFFERED=1

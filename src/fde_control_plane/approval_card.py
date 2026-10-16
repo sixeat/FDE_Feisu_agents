@@ -86,7 +86,7 @@ def build_meeting_review_form_card(
     fields.append({
         "tag": "button", "name": MEETING_REVIEW_FORM_ACTION,
         "text": {"tag": "plain_text", "content": "提交会议审核"},
-        "type": "primary_filled", "form_action_type": "submit",
+        "type": "primary", "action_type": "form_submit",
     })
     return {
         "schema": "2.0",

@@ -11,6 +11,15 @@ from fde_control_plane.meeting_approval_bridge import MeetingApprovalBridge
 from test_feishu_review import DOCUMENT_ID, setup_review
 
 
+def test_card_form_probe_accepts_only_two_named_text_fields():
+    from scripts.meeting_approval_bridge import card_form_probe_result
+
+    valid = SimpleNamespace(form_value={"assignee_0": "probe-member", "due_0": "2026-10-20"})
+    assert card_form_probe_result(valid) == {"accepted": True, "field_count": 2}
+    assert card_form_probe_result(SimpleNamespace(form_value={"assignee_0": "probe-member"}))["accepted"] is False
+    assert card_form_probe_result(SimpleNamespace(form_value=None))["accepted"] is False
+
+
 class Sender:
     def __init__(self):
         self.calls = []

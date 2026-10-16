@@ -36,6 +36,16 @@ def short_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()[:12]
 
 
+def card_form_probe_result(action):
+    """Inspect only the shape of a test form callback; no business mutation."""
+    values = getattr(action, "form_value", None)
+    if not isinstance(values, dict) or set(values) != {"assignee_0", "due_0"}:
+        return {"accepted": False, "field_count": 0}
+    if any(not isinstance(value, str) or not value or len(value) > 128 for value in values.values()):
+        return {"accepted": False, "field_count": 0}
+    return {"accepted": True, "field_count": len(values)}
+
+
 @contextmanager
 def quiet_sdk_logs():
     # Connection exceptions can include a credential-bearing websocket URL.
@@ -243,6 +253,16 @@ def main() -> int:
         with quiet_sdk_logs(), ThreadPoolExecutor(max_workers=1) as updater:
             def on_card_action(data):
                 action = getattr(getattr(data, "event", None), "action", None)
+                if (os.environ.get("FDE_CARD_FORM_PROBE_ENABLED") == "1"
+                        and getattr(action, "name", None) == "fde_card_form_probe"):
+                    result = card_form_probe_result(action)
+                    print(f"CARD_FORM_PROBE accepted={result['accepted']} "
+                          f"field_count={result['field_count']} task_write=0", flush=True)
+                    return P2CardActionTriggerResponse({
+                        "toast": {"type": "success" if result["accepted"] else "warning",
+                                  "content": "测试表单回调已收到，不会创建任务" if result["accepted"]
+                                             else "测试表单字段不完整"},
+                    })
                 if card_review_enabled and getattr(action, "name", None) == MEETING_REVIEW_FORM_ACTION:
                     try:
                         with SQLiteStore(args.db) as review_store:

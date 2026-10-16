@@ -18,6 +18,7 @@ services:
       start_period: 30s
     env_file:
       - .env.fde
+      - .env.hermes
     ports:
       - "127.0.0.1:8210:8210"
     volumes:
@@ -36,7 +37,7 @@ services:
     stop_grace_period: 30s
     mem_limit: 256m
     pids_limit: 64
-    env_file: [.env.fde]
+    env_file: [.env.fde, .env.hermes]
     command: ["python", "-u", "scripts/meeting_approval_bridge.py", "listen", "--db", "/var/lib/fde-agent/control_plane.sqlite3"]
     volumes:
       - ./data:/var/lib/fde-agent

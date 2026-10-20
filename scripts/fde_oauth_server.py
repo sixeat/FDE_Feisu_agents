@@ -22,7 +22,9 @@ from fde_control_plane.feishu_review import FeishuDocumentRevisionReader, Feishu
 from fde_control_plane.meeting_review_web import MeetingReviewWebService, build_meeting_review_router
 from fde_control_plane.orchestration import AgentOrchestrator
 from fde_control_plane.runtime import HermesRuntimeAdapter
-from fde_control_plane.user_document_access import UserTokenVault
+from fde_control_plane.user_document_access import FeishuUserDocumentReader, UserTokenVault
+from fde_control_plane.teaching import TeachingService
+from fde_control_plane.teaching_web import build_teaching_router
 
 from fde_control_plane import (
     Actor,
@@ -156,6 +158,11 @@ def create_app() -> FastAPI:
     app.include_router(build_meeting_review_router(
         MeetingReviewWebService(review_gateway, meeting_agent_id=meeting_agent_id), sessions,
         public_origin=f"{uri.scheme}://{uri.netloc}",
+    ))
+    app.include_router(build_teaching_router(
+        TeachingService(control_plane, FeishuUserDocumentReader(user_token_store, client)
+                        if user_token_store is not None else None),
+        sessions, public_origin=f"{uri.scheme}://{uri.netloc}",
     ))
 
     @app.get("/health")

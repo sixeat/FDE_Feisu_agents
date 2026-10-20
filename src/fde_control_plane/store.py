@@ -366,6 +366,36 @@ class SQLiteStore:
                 decided_by TEXT NOT NULL, resolution TEXT,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS teaching_courses (
+                tenant_id TEXT NOT NULL, course_id TEXT NOT NULL,
+                title TEXT NOT NULL, term TEXT NOT NULL, created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (tenant_id, course_id)
+            );
+            CREATE TABLE IF NOT EXISTS teaching_course_members (
+                tenant_id TEXT NOT NULL, course_id TEXT NOT NULL, actor_id TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('LEAD', 'TEACHER')),
+                active INTEGER NOT NULL CHECK(active IN (0, 1)),
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (tenant_id, course_id, actor_id),
+                FOREIGN KEY (tenant_id, course_id) REFERENCES teaching_courses(tenant_id, course_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_teaching_members_actor
+                ON teaching_course_members(tenant_id, actor_id, active);
+            CREATE TABLE IF NOT EXISTS teaching_sources (
+                source_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, course_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('SYLLABUS', 'WEEKLY_PLAN', 'LESSON_PLAN', 'MATERIAL')),
+                document_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+                content_hash TEXT NOT NULL, block_count INTEGER NOT NULL,
+                submitted_by TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (tenant_id, course_id) REFERENCES teaching_courses(tenant_id, course_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_teaching_sources_course
+                ON teaching_sources(tenant_id, course_id, created_at);
+            CREATE TRIGGER IF NOT EXISTS teaching_sources_no_update
+            BEFORE UPDATE ON teaching_sources BEGIN SELECT RAISE(ABORT, 'immutable teaching source'); END;
+            CREATE TRIGGER IF NOT EXISTS teaching_sources_no_delete
+            BEFORE DELETE ON teaching_sources BEGIN SELECT RAISE(ABORT, 'immutable teaching source'); END;
             CREATE INDEX IF NOT EXISTS idx_audit_triage_tenant
                 ON audit_triage(tenant_id, status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_approvals_task ON approvals(task_run_id);
@@ -2395,6 +2425,74 @@ class SQLiteStore:
             (event.audit_id, event.event_type, event.tenant_id, event.task_run_id, self._json(asdict(event))),
         )
         self.connection.commit()
+
+    @contextmanager
+    def teaching_transaction(self):
+        """Keep a teaching state change and its audit record atomic."""
+        with self._owner_decision_lock:
+            connection = self.connection
+            if self.path != ":memory:":
+                connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA foreign_keys = ON")
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    yield connection
+                    connection.execute("COMMIT")
+                except BaseException:
+                    connection.execute("ROLLBACK")
+                    raise
+            finally:
+                if connection is not self.connection:
+                    connection.close()
+
+    def teaching_audit_in_transaction(self, connection: sqlite3.Connection, event: Any) -> None:
+        connection.execute(
+            "INSERT INTO audit_events(audit_id, event_type, tenant_id, task_run_id, data_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (event.audit_id, event.event_type, event.tenant_id, event.task_run_id, self._json(asdict(event))),
+        )
+
+    def get_teaching_course(self, tenant_id: str, course_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM teaching_courses WHERE tenant_id = ? AND course_id = ?",
+            (tenant_id, course_id),
+        ).fetchone()
+
+    def get_teaching_member(self, tenant_id: str, course_id: str, actor_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM teaching_course_members WHERE tenant_id = ? AND course_id = ? AND actor_id = ?",
+            (tenant_id, course_id, actor_id),
+        ).fetchone()
+
+    def list_teaching_courses(self, tenant_id: str, actor_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT c.*, m.role FROM teaching_courses c JOIN teaching_course_members m "
+            "ON m.tenant_id = c.tenant_id AND m.course_id = c.course_id "
+            "WHERE c.tenant_id = ? AND m.actor_id = ? AND m.active = 1 ORDER BY c.course_id",
+            (tenant_id, actor_id),
+        ).fetchall()
+
+    def list_teaching_members(self, tenant_id: str, course_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT actor_id, role FROM teaching_course_members "
+            "WHERE tenant_id = ? AND course_id = ? AND active = 1 ORDER BY role, actor_id",
+            (tenant_id, course_id),
+        ).fetchall()
+
+    def get_teaching_source(self, tenant_id: str, course_id: str, source_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM teaching_sources WHERE tenant_id = ? AND course_id = ? AND source_id = ?",
+            (tenant_id, course_id, source_id),
+        ).fetchone()
+
+    def list_teaching_sources(self, tenant_id: str, course_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT source_id, kind, revision_id, block_count, submitted_by, created_at "
+            "FROM teaching_sources WHERE tenant_id = ? AND course_id = ? ORDER BY created_at, source_id",
+            (tenant_id, course_id),
+        ).fetchall()
 
     def list_audits(self) -> list[dict[str, Any]]:
         rows = self.connection.execute("SELECT data_json FROM audit_events ORDER BY rowid").fetchall()

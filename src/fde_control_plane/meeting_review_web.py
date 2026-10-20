@@ -291,6 +291,27 @@ class MeetingReviewWebService:
                           if run["task_run_id"] in reviews else None}
                          for run in runs]}
 
+    def agent_promotion_readiness(self, agent_id: str, identity: IdentityContext) -> dict[str, Any]:
+        if not self.can_confirm_agent_config(identity):
+            raise HTTPException(403, "只有管理员可以查看转正就绪情况")
+        route = self.cp.store.get_agent_route(identity.tenant_id, agent_id)
+        if route is None:
+            raise HTTPException(404, "Agent 不存在或尚无治理版本")
+        if route["status"] != "CANARY":
+            raise HTTPException(409, "Agent 当前没有灰度版本")
+        return {"agent_id": agent_id, **self.cp.store.agent_promotion_readiness(
+            identity.tenant_id, agent_id, identity.actor_id,
+        )}
+
+    def agent_promotion_history(self, agent_id: str, identity: IdentityContext) -> dict[str, Any]:
+        if not self.can_confirm_agent_config(identity):
+            raise HTTPException(403, "只有管理员可以查看转正证据历史")
+        actor = self.cp.store.get_actor(agent_id)
+        if actor is None or actor["tenant_id"] != identity.tenant_id:
+            raise HTTPException(404, "Agent 不存在")
+        return {"agent_id": agent_id,
+                "promotions": self.cp.store.list_agent_promotion_evidence(identity.tenant_id, agent_id)}
+
     def review_agent_canary_run(self, agent_id: str, task_run_id: str,
                                 identity: IdentityContext, body: AgentCanaryReviewRequest) -> dict[str, Any]:
         if not self.can_precheck_agent_config(identity):
@@ -1195,6 +1216,16 @@ def build_meeting_review_router(
     def agent_canary_runs(agent_id: str, identity: IdentityContext = Depends(require_identity)):
         with service.lock:
             return service.agent_canary_runs(agent_id, identity)
+
+    @router.get("/agents/{agent_id}/promotion-readiness")
+    def agent_promotion_readiness(agent_id: str, identity: IdentityContext = Depends(require_identity)):
+        with service.lock:
+            return service.agent_promotion_readiness(agent_id, identity)
+
+    @router.get("/agents/{agent_id}/promotion-history")
+    def agent_promotion_history(agent_id: str, identity: IdentityContext = Depends(require_identity)):
+        with service.lock:
+            return service.agent_promotion_history(agent_id, identity)
 
     @router.post("/agents/{agent_id}/canary-runs/{task_run_id}/review")
     def review_agent_canary_run(agent_id: str, task_run_id: str, body: AgentCanaryReviewRequest,

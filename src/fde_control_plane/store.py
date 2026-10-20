@@ -130,6 +130,15 @@ class SQLiteStore:
             );
             CREATE INDEX IF NOT EXISTS idx_agent_canary_reviews_agent
                 ON agent_canary_reviews(tenant_id, agent_id, agent_version);
+            CREATE TABLE IF NOT EXISTS agent_promotion_evidence (
+                audit_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+                stable_version INTEGER NOT NULL, candidate_version INTEGER NOT NULL,
+                canary_epoch INTEGER NOT NULL, approver_id TEXT NOT NULL,
+                observation_seconds INTEGER NOT NULL, evidence_json TEXT NOT NULL,
+                evidence_hash TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_promotion_evidence_agent
+                ON agent_promotion_evidence(tenant_id, agent_id, created_at);
             CREATE TRIGGER IF NOT EXISTS agent_version_config_immutable
             BEFORE UPDATE ON agent_versions
             WHEN NEW.agent_id IS NOT OLD.agent_id OR NEW.version IS NOT OLD.version
@@ -163,6 +172,12 @@ class SQLiteStore:
             CREATE TRIGGER IF NOT EXISTS agent_canary_review_no_delete
             BEFORE DELETE ON agent_canary_reviews
             BEGIN SELECT RAISE(ABORT, 'immutable canary review'); END;
+            CREATE TRIGGER IF NOT EXISTS agent_promotion_evidence_no_update
+            BEFORE UPDATE ON agent_promotion_evidence
+            BEGIN SELECT RAISE(ABORT, 'immutable promotion evidence'); END;
+            CREATE TRIGGER IF NOT EXISTS agent_promotion_evidence_no_delete
+            BEFORE DELETE ON agent_promotion_evidence
+            BEGIN SELECT RAISE(ABORT, 'immutable promotion evidence'); END;
             CREATE TABLE IF NOT EXISTS agent_pauses (
                 audit_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
                 expected_version INTEGER, decided_by TEXT NOT NULL, reason TEXT NOT NULL,
@@ -1003,6 +1018,88 @@ class SQLiteStore:
             self.connection.rollback()
             raise
 
+    def agent_promotion_readiness(self, tenant_id: str, agent_id: str,
+                                  approver_id: str) -> dict[str, Any]:
+        """Explain the same fail-closed evidence gate used by promotion."""
+        route = self.get_agent_route(tenant_id, agent_id)
+        if route is None or route["status"] != "CANARY":
+            return {"can_promote": False, "blockers": ["NO_ACTIVE_CANARY"]}
+        if route["canary_version"] is None:
+            return {"can_promote": False, "blockers": ["CANARY_VERSION_MISSING"]}
+        actor = self.connection.execute(
+            "SELECT active FROM actors WHERE actor_id = ? AND tenant_id = ?", (agent_id, tenant_id),
+        ).fetchone()
+        observed = self.connection.execute(
+            "SELECT (strftime('%s', 'now') - strftime('%s', updated_at)) AS seconds "
+            "FROM agent_routes WHERE tenant_id = ? AND agent_id = ?", (tenant_id, agent_id),
+        ).fetchone()
+        seconds = max(0, int(observed["seconds"])) if observed is not None and observed["seconds"] is not None else 0
+        runs = self.agent_canary_runs(tenant_id, agent_id)
+        reviews = self.list_agent_canary_reviews(tenant_id, agent_id,
+                                                 [run["task_run_id"] for run in runs])
+        missing = failed_reviews = self_reviews = failed_runs = incomplete_runs = 0
+        for run in runs:
+            if run.get("status") != "WAITING_REVIEW":
+                incomplete_runs += 1
+            if run.get("failure_reason") or run.get("status") in {"FAILED", "RECONCILING"}:
+                failed_runs += 1
+            review = reviews.get(run["task_run_id"])
+            if review is None:
+                missing += 1
+            else:
+                failed_reviews += review["outcome"] != "PASS"
+                self_reviews += review["reviewer_id"] == approver_id
+        blockers = []
+        if actor is None or not actor["active"]:
+            blockers.append("AGENT_INACTIVE")
+        if seconds < 60:
+            blockers.append("OBSERVATION_PERIOD")
+        if len(runs) < 2:
+            blockers.append("SAMPLE_COUNT")
+        if incomplete_runs:
+            blockers.append("RUN_NOT_WAITING_REVIEW")
+        if failed_runs:
+            blockers.append("RUN_FAILURE")
+        if missing:
+            blockers.append("REVIEW_MISSING")
+        if failed_reviews:
+            blockers.append("REVIEW_FAILED")
+        if self_reviews:
+            blockers.append("SELF_REVIEW_PROMOTION")
+        if self.get_agent_snapshot(tenant_id, agent_id, int(route["canary_version"])) is None:
+            blockers.append("CANDIDATE_SNAPSHOT_MISSING")
+        return {"can_promote": not blockers, "blockers": blockers,
+                "candidate_version": int(route["canary_version"]),
+                "canary_epoch": int(route["canary_epoch"]),
+                "observation_seconds": seconds, "required_observation_seconds": 60,
+                "sample_count": len(runs), "required_sample_count": 2,
+                "unreviewed_count": missing, "failed_review_count": failed_reviews,
+                "failed_run_count": failed_runs, "incomplete_run_count": incomplete_runs,
+                "self_review_count": self_reviews}
+
+    def list_agent_promotion_evidence(self, tenant_id: str, agent_id: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT audit_id, stable_version, candidate_version, canary_epoch, approver_id, "
+            "observation_seconds, evidence_json, evidence_hash, created_at "
+            "FROM agent_promotion_evidence WHERE tenant_id = ? AND agent_id = ? ORDER BY rowid DESC",
+            (tenant_id, agent_id),
+        ).fetchall()
+        items = []
+        for row in rows:
+            snapshot = json.loads(row["evidence_json"])
+            integrity_ok = (hashlib.sha256(row["evidence_json"].encode()).hexdigest() == row["evidence_hash"]
+                            and snapshot.get("agent_id") == agent_id
+                            and all(snapshot.get(key) == row[key] for key in (
+                                "audit_id", "stable_version", "candidate_version", "canary_epoch",
+                                "approver_id", "observation_seconds",
+                            )))
+            items.append({"audit_id": row["audit_id"], "stable_version": row["stable_version"],
+                          "candidate_version": row["candidate_version"], "canary_epoch": row["canary_epoch"],
+                          "approver_id": row["approver_id"], "observation_seconds": row["observation_seconds"],
+                          "evidence_hash": row["evidence_hash"], "created_at": row["created_at"],
+                          "integrity_ok": integrity_ok, "runs": snapshot["runs"]})
+        return items
+
     def latest_agent_evaluation(self, tenant_id: str, draft_id: str, input_hash: str) -> sqlite3.Row | None:
         return self.connection.execute(
             "SELECT * FROM agent_evaluations WHERE tenant_id = ? AND draft_id = ? AND input_hash = ? "
@@ -1257,25 +1354,32 @@ class SQLiteStore:
                 if not actor["active"] or route["status"] != "CANARY" or target_version != route["canary_version"]:
                     self.connection.rollback()
                     return False
-                observed = self.connection.execute(
-                    "SELECT (strftime('%s', 'now') - strftime('%s', updated_at)) AS seconds "
-                    "FROM agent_routes WHERE agent_id = ?", (agent_id,),
-                ).fetchone()
-                if observed is None or observed["seconds"] is None or observed["seconds"] < 60:
+                readiness = self.agent_promotion_readiness(tenant_id, agent_id, event.actor_id)
+                if not readiness["can_promote"]:
                     self.connection.rollback()
                     return False
                 samples = self.agent_canary_runs(tenant_id, agent_id)
                 reviews = self.list_agent_canary_reviews(
                     tenant_id, agent_id, [run["task_run_id"] for run in samples],
                 )
-                if (len(samples) < 2 or any(run.get("status") != "WAITING_REVIEW"
-                                            or run.get("failure_reason")
-                                            or run["task_run_id"] not in reviews
-                                            or reviews[run["task_run_id"]]["outcome"] != "PASS"
-                                            or reviews[run["task_run_id"]]["reviewer_id"] == event.actor_id
-                                            for run in samples)):
-                    self.connection.rollback()
-                    return False
+                evidence = {"audit_id": event.audit_id, "agent_id": agent_id,
+                            "stable_version": stable, "candidate_version": target_version,
+                            "canary_epoch": route["canary_epoch"], "approver_id": event.actor_id,
+                            "observation_seconds": readiness["observation_seconds"],
+                            "runs": [{"task_run_id": run["task_run_id"], "status": run["status"],
+                                      "reviewer_id": reviews[run["task_run_id"]]["reviewer_id"],
+                                      "outcome": reviews[run["task_run_id"]]["outcome"],
+                                      "evidence_ref": reviews[run["task_run_id"]]["evidence_ref"]}
+                                     for run in sorted(samples, key=lambda item: item["task_run_id"])]}
+                evidence_json = self._json(evidence)
+                self.connection.execute(
+                    "INSERT INTO agent_promotion_evidence(audit_id, tenant_id, agent_id, stable_version, "
+                    "candidate_version, canary_epoch, approver_id, observation_seconds, evidence_json, "
+                    "evidence_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (event.audit_id, tenant_id, agent_id, stable, target_version, route["canary_epoch"],
+                     event.actor_id, readiness["observation_seconds"], evidence_json,
+                     hashlib.sha256(evidence_json.encode()).hexdigest()),
+                )
                 snapshot = self.get_agent_snapshot(tenant_id, agent_id, target_version)
                 config = json.loads(snapshot["config_json"])
                 self.connection.execute(

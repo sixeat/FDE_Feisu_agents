@@ -146,6 +146,10 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
     assert client.post(route + "/canary", json=payload, headers=admin_headers).status_code == 409
     assert cp.store.select_agent_version("tenant", "sample-lifecycle-agent", "member") == 2
     assert cp.store.select_agent_version("tenant", "sample-lifecycle-agent", "admin") == 1
+    readiness_url = route + "/promotion-readiness"
+    initial_readiness = client.get(readiness_url).json()
+    assert not initial_readiness["can_promote"]
+    assert {"OBSERVATION_PERIOD", "SAMPLE_COUNT"} <= set(initial_readiness["blockers"])
     member_headers = switch_user(cp, client, "member", hashlib.sha256(b"ou_submitter").hexdigest())
     assert client.post(route + "/volunteer", json={**consent, "enroll": False},
                        headers=member_headers).status_code == 200
@@ -157,6 +161,7 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
     decision = cp.authorize_operation(run2.task_run_id, ToolDefinition(
         "read", frozenset({"doc.read"}), RiskLevel.LOW))
     assert not decision.allowed and "suggestion-only" in decision.reason
+    assert client.get(readiness_url).json()["sample_count"] == 1
     assert client.post(route + "/promote", json={**payload, "volunteer_ids": []},
                        headers=admin_headers).status_code == 409
     run2.status = TaskRunStatus.WAITING_REVIEW
@@ -168,9 +173,14 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
         "UPDATE agent_routes SET updated_at = datetime('now', '-2 minutes') WHERE agent_id = ?",
         ("sample-lifecycle-agent",),
     )
+    pending_readiness = client.get(readiness_url).json()
+    assert pending_readiness["blockers"] == ["REVIEW_MISSING"]
+    assert pending_readiness["sample_count"] == 2 and pending_readiness["unreviewed_count"] == 2
     assert client.post(route + "/promote", json={**payload, "volunteer_ids": []},
                        headers=admin_headers).status_code == 409
     reviewer_headers = switch_user(cp, client, "reviewer", "reviewer-subject")
+    assert client.get(readiness_url).status_code == 403
+    assert client.get(route + "/promotion-history").status_code == 403
     candidate_runs = client.get(route + "/canary-runs").json()["runs"]
     assert {item["task_run_id"] for item in candidate_runs} == {run2.task_run_id, run3.task_run_id}
     failed_review = {"expected_version": 2, "outcome": "FAIL", "evidence_ref": "fixture:badcase"}
@@ -194,11 +204,20 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
     reviewed_runs = client.get(route + "/canary-runs").json()["runs"]
     assert {run["reviewer_id"] for run in reviewed_runs} == {"reviewer"}
     assert {run["evidence_ref"] for run in reviewed_runs} == {"fixture:badcase", "fixture:reviewed"}
+    failed_readiness = client.get(readiness_url).json()
+    assert failed_readiness["blockers"] == ["REVIEW_FAILED"]
+    assert failed_readiness["failed_review_count"] == 1
+    run2.status = TaskRunStatus.FAILED
+    cp.store.save_task_run(run2)
+    assert {"RUN_NOT_WAITING_REVIEW", "RUN_FAILURE", "REVIEW_FAILED"} <= set(
+        client.get(readiness_url).json()["blockers"]
+    )
     assert client.post(route + "/promote", json={**payload, "volunteer_ids": []},
                        headers=admin_headers).status_code == 409
     first_epoch = run2.canary_epoch
     assert client.post(route + "/rollback", json={"expected_version": 1, "target_version": 1,
         "reason": "灰度失败后回到稳定版"}, headers=admin_headers).status_code == 200
+    assert client.get(readiness_url).status_code == 409
     member_headers = switch_user(cp, client, "member", hashlib.sha256(b"ou_submitter").hexdigest())
     assert client.post(route + "/volunteer", json=consent, headers=member_headers).status_code == 200
     admin_headers = switch_user(cp, client, "admin", "admin-subject")
@@ -226,8 +245,43 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
     assert diagnostics["total"] == 5 and diagnostics["versions"]["1"]["failures"] == 1
     comparison = client.get(route + "/compare?old_version=1&new_version=2").json()
     assert comparison["changes"]["description"]["old"] != comparison["changes"]["description"]["new"]
+    ready = client.get(readiness_url).json()
+    assert ready["can_promote"] and ready["blockers"] == []
+    assert ready["sample_count"] == 2 and ready["unreviewed_count"] == 0
+    assert "SELF_REVIEW_PROMOTION" in cp.store.agent_promotion_readiness(
+        "tenant", "sample-lifecycle-agent", "reviewer",
+    )["blockers"]
     assert client.post(route + "/promote", json={**payload, "volunteer_ids": []},
                        headers=admin_headers).status_code == 200
+    promotion_history = client.get(route + "/promotion-history").json()["promotions"]
+    assert len(promotion_history) == 1
+    promoted = promotion_history[0]
+    assert promoted["stable_version"] == 1 and promoted["candidate_version"] == 2
+    assert promoted["integrity_ok"] is True
+    assert promoted["canary_epoch"] == fresh_runs[0].canary_epoch
+    assert {run["task_run_id"] for run in promoted["runs"]} == {run.task_run_id for run in fresh_runs}
+    assert {run["outcome"] for run in promoted["runs"]} == {"PASS"}
+    evidence_snapshot = {key: promoted[key] for key in (
+        "audit_id", "stable_version", "candidate_version", "canary_epoch",
+        "approver_id", "observation_seconds", "runs",
+    )}
+    evidence_snapshot["agent_id"] = "sample-lifecycle-agent"
+    assert promoted["evidence_hash"] == hashlib.sha256(json.dumps(
+        evidence_snapshot, sort_keys=True, ensure_ascii=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+    assert promoted["audit_id"] in {event["audit_id"] for event in cp.store.list_audits()}
+    with pytest.raises(sqlite3.IntegrityError, match="immutable promotion evidence"):
+        cp.store.connection.execute(
+            "UPDATE agent_promotion_evidence SET evidence_hash = ? WHERE audit_id = ?",
+            ("0" * 64, promoted["audit_id"]),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="immutable promotion evidence"):
+        cp.store.connection.execute(
+            "DELETE FROM agent_promotion_evidence WHERE audit_id = ?", (promoted["audit_id"],),
+        )
+    fresh_runs[0].status = TaskRunStatus.FAILED
+    cp.store.save_task_run(fresh_runs[0])
+    assert client.get(route + "/promotion-history").json()["promotions"][0]["runs"] == promoted["runs"]
     assert cp.store.select_agent_version("tenant", "sample-lifecycle-agent", "admin") == 2
     assert not cp.authorize_operation(run2.task_run_id, ToolDefinition(
         "read", frozenset({"doc.read"}), RiskLevel.LOW)).allowed
@@ -240,6 +294,7 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
     assert next(agent for agent in client.get("/api/meetings/agents").json()["agents"]
                 if agent["agent_id"] == "sample-lifecycle-agent")["status"] == "ARCHIVED"
     assert dict(cp.store.get_agent_snapshot("tenant", "sample-lifecycle-agent", 1)) == snapshot1
+    assert len(client.get(route + "/promotion-history").json()["promotions"]) == 1
     events = [event["event_type"] for event in cp.store.list_audits()]
     assert all(name in events for name in ("AGENT_EVALUATED", "AGENT_CANARY", "AGENT_CANARY_REVIEWED", "AGENT_PROMOTE",
                                       "AGENT_ROLLBACK", "AGENT_ARCHIVE"))

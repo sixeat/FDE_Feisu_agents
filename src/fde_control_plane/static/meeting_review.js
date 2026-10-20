@@ -14,6 +14,7 @@ const reasonNames = {ASSIGNEE_UNMAPPED:"负责人待确认",ASSIGNEE_INVALID:"�
 const executionNames = {PREPARED:"待执行",DISPATCHED:"执行中",SUCCEEDED:"已创建",FAILED:"已阻断/失败",UNKNOWN:"结果待核验",RECONCILING:"结果待核验"};
 const agentTypeNames = {PERSONAL_ASSISTANT:"个人助手",BUSINESS_AGENT:"业务 Agent",MANAGEMENT_AGENT:"管理 Agent"};
 const agentStatusNames = {ACTIVE:"运行中",CANARY:"志愿者灰度",PAUSED:"已暂停",ARCHIVED:"已归档",UNVERSIONED:"待接入"};
+const promotionBlockerNames = {AGENT_INACTIVE:"Agent 已停用",OBSERVATION_PERIOD:"观察期不足 60 秒",SAMPLE_COUNT:"灰度样本不足 2 条",RUN_NOT_WAITING_REVIEW:"仍有运行未进入人工核对",RUN_FAILURE:"灰度运行有失败",REVIEW_MISSING:"仍有运行未评审",REVIEW_FAILED:"存在未通过评审",SELF_REVIEW_PROMOTION:"转正管理员不能批准自己的评审",CANDIDATE_SNAPSHOT_MISSING:"候选配置快照缺失"};
 const draftStatusNames = {PENDING_REVIEW:"待审核",APPROVED:"已批准",REJECTED:"已拒绝",PUBLISHED:"已发布"};
 const reviewStatusNames = {READY_FOR_ADMIN:"预审通过，待管理员确认",BLOCKED:"预审阻断"};
 function node(tag, text, cls) { const el=document.createElement(tag); if(text!==undefined) el.textContent=text; if(cls) el.className=cls; return el; }
@@ -202,14 +203,19 @@ function renderAgents() {
       const actions=node("div",undefined,"commands agent-review-actions");
       const add=(label,fn)=>{const button=node("button",label);button.type="button";button.addEventListener("click",()=>fn(button));actions.append(button);};
       add("运行诊断与版本对比",button=>inspectAgent(agent,button));
+      const history=node("div",undefined,"agent-draft-row");history.hidden=true;
+      add("查看转正证据历史",button=>loadPromotionHistory(agent,history,button));
       if(agent.status!=="ARCHIVED" && agent.current_version!=null){
         const candidates=agent.versions.filter(version=>version>agent.current_version);
         if(agent.status==="ACTIVE" && candidates.length)add("启动志愿者灰度",button=>changeAgentRoute(agent,"canary",button));
-        if(agent.status==="CANARY")add("人工转正",button=>changeAgentRoute(agent,"promote",button));
+        if(agent.status==="CANARY"){
+          add("检查转正条件",button=>inspectPromotionReadiness(agent,button));
+          add("人工转正",button=>changeAgentRoute(agent,"promote",button));
+        }
         if(agent.status==="CANARY" || agent.current_version>1)add("人工回退",button=>changeAgentRoute(agent,"rollback",button));
         add("下架归档",button=>changeAgentRoute(agent,"archive",button));
       }
-      card.append(actions);
+      card.append(actions,history);
     }
     panel.append(card);
   });
@@ -280,10 +286,46 @@ async function inspectAgent(agent,button){
   }catch(error){agentNotice(error.message,"error");}
   finally{button.disabled=false;}
 }
+function promotionReadinessText(readiness){
+  const counts=`灰度窗口 ${readiness.canary_epoch} · 观察 ${readiness.observation_seconds}/${readiness.required_observation_seconds} 秒 · 样本 ${readiness.sample_count}/${readiness.required_sample_count} 条 · 未评审 ${readiness.unreviewed_count} · 未通过评审 ${readiness.failed_review_count} · 失败运行 ${readiness.failed_run_count}`;
+  return readiness.can_promote?`${counts}\n已满足本地转正门槛，仍须管理员人工确认。`:
+    `${counts}\n待处理：${readiness.blockers.map(code=>promotionBlockerNames[code]||code).join("；")}`;
+}
+async function inspectPromotionReadiness(agent,button){
+  button.disabled=true;
+  try{
+    const result=await api(`/api/meetings/agents/${encodeURIComponent(agent.agent_id)}/promotion-readiness`);
+    window.alert(promotionReadinessText(result));
+  }catch(error){agentNotice(error.message,"error");}
+  finally{button.disabled=false;}
+}
+async function loadPromotionHistory(agent,panel,button){
+  button.disabled=true;panel.hidden=false;panel.replaceChildren(node("p","正在读取转正证据…","muted"));
+  try{
+    const result=await api(`/api/meetings/agents/${encodeURIComponent(agent.agent_id)}/promotion-history`);
+    panel.replaceChildren();
+    if(!result.promotions.length){panel.append(node("p","暂无转正记录。","muted"));return;}
+    result.promotions.forEach(item=>{
+      const entry=node("article",undefined,"agent-draft-row");
+      entry.append(node("h3",`v${item.stable_version} → v${item.candidate_version} · 灰度窗口 ${item.canary_epoch}`),
+        node("p",`批准人：${item.approver_id} · 观察 ${item.observation_seconds} 秒 · ${item.created_at}`,"muted"),
+        node("p",`审计编号：${item.audit_id} · 证据摘要：${item.evidence_hash} · ${item.integrity_ok?"摘要校验通过":"摘要不匹配，请停止后续发布并核验"}`,item.integrity_ok?"muted":"error"));
+      item.runs.forEach(run=>entry.append(node("p",`运行 ${run.task_run_id} · ${taskNames[run.status]||run.status} · ${run.outcome} · 审核人 ${run.reviewer_id} · 证据编号 ${run.evidence_ref}`,"muted")));
+      panel.append(entry);
+    });
+  }catch(error){panel.replaceChildren(node("p",error.message,"error"));}
+  finally{button.disabled=false;}
+}
 async function changeAgentRoute(agent,action,button){
   if(agentState.busy)return;
   const labels={canary:"志愿者灰度",promote:"人工转正",rollback:"人工回退",archive:"下架归档"};
   let target=null,volunteer_ids=[];
+  if(action==="promote"){
+    try{
+      const readiness=await api(`/api/meetings/agents/${encodeURIComponent(agent.agent_id)}/promotion-readiness`);
+      if(!readiness.can_promote){agentNotice(promotionReadinessText(readiness),"error");return;}
+    }catch(error){agentNotice(error.message,"error");return;}
+  }
   if(action==="canary"){
     target=Math.max(...agent.versions.filter(version=>version>agent.current_version));
     const input=window.prompt("志愿者成员编号（逗号分隔；灰度版只产出建议）：");if(input===null)return;

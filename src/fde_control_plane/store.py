@@ -14,6 +14,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any, Iterable
@@ -84,6 +85,64 @@ class SQLiteStore:
                 capabilities_json TEXT NOT NULL, active INTEGER NOT NULL,
                 skill_version TEXT, PRIMARY KEY (agent_id, version)
             );
+            CREATE TABLE IF NOT EXISTS agent_version_snapshots (
+                agent_id TEXT NOT NULL, version INTEGER NOT NULL, tenant_id TEXT NOT NULL,
+                draft_id TEXT NOT NULL, config_json TEXT NOT NULL, config_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (agent_id, version)
+            );
+            CREATE TABLE IF NOT EXISTS agent_evaluations (
+                evaluation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, draft_id TEXT NOT NULL,
+                input_hash TEXT NOT NULL, evaluator_id TEXT NOT NULL,
+                dataset_id TEXT NOT NULL, cases_json TEXT NOT NULL, status TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_evaluations_draft
+                ON agent_evaluations(tenant_id, draft_id, created_at);
+            CREATE TABLE IF NOT EXISTS agent_eval_datasets (
+                tenant_id TEXT NOT NULL, dataset_id TEXT NOT NULL, created_by TEXT NOT NULL,
+                cases_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (tenant_id, dataset_id)
+            );
+            CREATE TABLE IF NOT EXISTS agent_routes (
+                agent_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                stable_version INTEGER NOT NULL, canary_version INTEGER,
+                volunteer_ids_json TEXT NOT NULL, status TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS agent_volunteer_consents (
+                tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+                member_id TEXT NOT NULL, candidate_version INTEGER NOT NULL,
+                active INTEGER NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (tenant_id, agent_id, member_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS agent_version_config_immutable
+            BEFORE UPDATE ON agent_versions
+            WHEN NEW.agent_id IS NOT OLD.agent_id OR NEW.version IS NOT OLD.version
+              OR NEW.capabilities_json IS NOT OLD.capabilities_json
+              OR NEW.skill_version IS NOT OLD.skill_version
+            BEGIN SELECT RAISE(ABORT, 'immutable agent version config'); END;
+            CREATE TRIGGER IF NOT EXISTS agent_version_no_delete
+            BEFORE DELETE ON agent_versions
+            BEGIN SELECT RAISE(ABORT, 'immutable agent version'); END;
+            CREATE TRIGGER IF NOT EXISTS agent_snapshot_no_update
+            BEFORE UPDATE ON agent_version_snapshots
+            BEGIN SELECT RAISE(ABORT, 'immutable agent snapshot'); END;
+            CREATE TRIGGER IF NOT EXISTS agent_snapshot_no_delete
+            BEFORE DELETE ON agent_version_snapshots
+            BEGIN SELECT RAISE(ABORT, 'immutable agent snapshot'); END;
+            CREATE TRIGGER IF NOT EXISTS agent_eval_dataset_no_update
+            BEFORE UPDATE ON agent_eval_datasets
+            BEGIN SELECT RAISE(ABORT, 'immutable evaluation dataset'); END;
+            CREATE TRIGGER IF NOT EXISTS agent_eval_dataset_no_delete
+            BEFORE DELETE ON agent_eval_datasets
+            BEGIN SELECT RAISE(ABORT, 'immutable evaluation dataset'); END;
+            CREATE TRIGGER IF NOT EXISTS agent_evaluation_no_update
+            BEFORE UPDATE ON agent_evaluations
+            BEGIN SELECT RAISE(ABORT, 'immutable evaluation'); END;
+            CREATE TRIGGER IF NOT EXISTS agent_evaluation_no_delete
+            BEFORE DELETE ON agent_evaluations
+            BEGIN SELECT RAISE(ABORT, 'immutable evaluation'); END;
             CREATE TABLE IF NOT EXISTS agent_pauses (
                 audit_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
                 expected_version INTEGER, decided_by TEXT NOT NULL, reason TEXT NOT NULL,
@@ -650,8 +709,19 @@ class SQLiteStore:
         self.connection.commit()
 
     def save_agent_version(self, version: Any) -> None:
+        existing = self.get_agent_version(version.agent_id, version.version)
+        if existing is not None:
+            if (json.loads(existing["capabilities_json"]) != sorted(version.capabilities)
+                    or existing["skill_version"] != version.skill_version):
+                raise ValueError("agent version snapshot is immutable")
+            self.connection.execute(
+                "UPDATE agent_versions SET active = ? WHERE agent_id = ? AND version = ?",
+                (int(version.active), version.agent_id, version.version),
+            )
+            self.connection.commit()
+            return
         self.connection.execute(
-            "INSERT OR REPLACE INTO agent_versions VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO agent_versions VALUES (?, ?, ?, ?, ?)",
             (version.agent_id, version.version, self._json(sorted(version.capabilities)), int(version.active), version.skill_version),
         )
         self.connection.commit()
@@ -761,6 +831,139 @@ class SQLiteStore:
             ids,
         ).fetchall()
 
+    def get_agent_route(self, tenant_id: str, agent_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM agent_routes WHERE tenant_id = ? AND agent_id = ?",
+            (tenant_id, agent_id),
+        ).fetchone()
+
+    def agent_volunteer_consent(self, tenant_id: str, agent_id: str, member_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM agent_volunteer_consents WHERE tenant_id = ? AND agent_id = ? AND member_id = ?",
+            (tenant_id, agent_id, member_id),
+        ).fetchone()
+
+    def set_agent_volunteer_consent(self, tenant_id: str, agent_id: str, member_id: str,
+                                    candidate_version: int, enroll: bool, event: Any) -> bool:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            route = self.get_agent_route(tenant_id, agent_id)
+            member = self.connection.execute(
+                "SELECT 1 FROM actors WHERE actor_id = ? AND tenant_id = ? "
+                "AND actor_type = 'USER' AND active = 1", (member_id, tenant_id),
+            ).fetchone()
+            snapshot = self.get_agent_snapshot(tenant_id, agent_id, candidate_version)
+            current = self.agent_volunteer_consent(tenant_id, agent_id, member_id)
+            if (route is None or route["status"] == "ARCHIVED" or member is None or snapshot is None
+                    or candidate_version <= route["stable_version"]
+                    or (route["status"] == "CANARY" and route["canary_version"] != candidate_version)
+                    or (not enroll and (current is None or not current["active"]
+                                        or current["candidate_version"] != candidate_version))
+                    or (current is not None and bool(current["active"]) == enroll
+                        and current["candidate_version"] == candidate_version)):
+                self.connection.rollback()
+                return False
+            self.connection.execute(
+                "INSERT INTO agent_volunteer_consents(tenant_id, agent_id, member_id, candidate_version, active) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(tenant_id, agent_id, member_id) DO UPDATE SET "
+                "candidate_version = excluded.candidate_version, active = excluded.active, "
+                "updated_at = CURRENT_TIMESTAMP",
+                (tenant_id, agent_id, member_id, candidate_version, int(enroll)),
+            )
+            if not enroll and route["status"] == "CANARY":
+                volunteers = [item for item in json.loads(route["volunteer_ids_json"]) if item != member_id]
+                if volunteers:
+                    self.connection.execute(
+                        "UPDATE agent_routes SET volunteer_ids_json = ?, updated_at = CURRENT_TIMESTAMP "
+                        "WHERE agent_id = ?", (self._json(volunteers), agent_id),
+                    )
+                else:
+                    self.connection.execute(
+                        "UPDATE agent_routes SET canary_version = NULL, volunteer_ids_json = '[]', "
+                        "status = 'ACTIVE', updated_at = CURRENT_TIMESTAMP WHERE agent_id = ?", (agent_id,),
+                    )
+                    self.connection.execute(
+                        "UPDATE agent_versions SET active = 0 WHERE agent_id = ? AND version = ?",
+                        (agent_id, candidate_version),
+                    )
+            self._insert_agent_audit(event)
+            self.connection.commit()
+            return True
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def select_agent_version(self, tenant_id: str, agent_id: str, member_id: str) -> int | None:
+        route = self.get_agent_route(tenant_id, agent_id)
+        if route is None:
+            row = self.connection.execute(
+                "SELECT version FROM agent_versions WHERE agent_id = ? AND active = 1 "
+                "ORDER BY version DESC LIMIT 1", (agent_id,),
+            ).fetchone()
+            return int(row["version"]) if row else None
+        if route["status"] == "ARCHIVED":
+            return None
+        if route["status"] == "CANARY" and member_id in json.loads(route["volunteer_ids_json"]):
+            return int(route["canary_version"])
+        return int(route["stable_version"])
+
+    def get_agent_snapshot(self, tenant_id: str, agent_id: str, version: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM agent_version_snapshots WHERE tenant_id = ? AND agent_id = ? AND version = ?",
+            (tenant_id, agent_id, version),
+        ).fetchone()
+
+    def latest_agent_evaluation(self, tenant_id: str, draft_id: str, input_hash: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM agent_evaluations WHERE tenant_id = ? AND draft_id = ? AND input_hash = ? "
+            "ORDER BY rowid DESC LIMIT 1", (tenant_id, draft_id, input_hash),
+        ).fetchone()
+
+    def get_agent_eval_dataset(self, tenant_id: str, dataset_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM agent_eval_datasets WHERE tenant_id = ? AND dataset_id = ?",
+            (tenant_id, dataset_id),
+        ).fetchone()
+
+    def save_agent_eval_dataset(self, tenant_id: str, dataset_id: str, created_by: str,
+                                cases: list[dict[str, Any]], event: Any) -> None:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.connection.execute(
+                "INSERT INTO agent_eval_datasets(tenant_id, dataset_id, created_by, cases_json) "
+                "VALUES (?, ?, ?, ?)", (tenant_id, dataset_id, created_by, self._json(cases)),
+            )
+            self._insert_agent_audit(event)
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def save_agent_evaluation(self, *, evaluation_id: str, tenant_id: str, draft_id: str,
+                              input_hash: str, evaluator_id: str, dataset_id: str,
+                              cases: list[dict[str, Any]], status: str, event: Any) -> None:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.connection.execute(
+                "INSERT INTO agent_evaluations(evaluation_id, tenant_id, draft_id, input_hash, "
+                "evaluator_id, dataset_id, cases_json, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (evaluation_id, tenant_id, draft_id, input_hash, evaluator_id, dataset_id,
+                 self._json(cases), status),
+            )
+            self._insert_agent_audit(event)
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def _insert_agent_audit(self, event: Any) -> None:
+        self.connection.execute(
+            "INSERT INTO audit_events(audit_id, event_type, tenant_id, task_run_id, data_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (event.audit_id, event.event_type, event.tenant_id, event.task_run_id,
+             self._json(asdict(event))),
+        )
+
     def save_agent_config_draft(self, draft_id: str, tenant_id: str, created_by: str,
                                 status: str, data: dict[str, Any]) -> None:
         self.connection.execute(
@@ -817,8 +1020,8 @@ class SQLiteStore:
     def publish_agent_config_draft(self, *, draft_id: str, tenant_id: str, approver_id: str,
                                    review_id: str, input_hash: str, agent_id: str,
                                    actor_type: str, capabilities: list[str],
-                                   skill_version: str | None, approval_id: str) -> dict[str, Any]:
-        """Atomically publish one prechecked draft as an immutable v1 AgentVersion."""
+                                   skill_version: str | None, approval_id: str, event: Any) -> dict[str, Any]:
+        """Atomically publish a prechecked draft as an immutable AgentVersion."""
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             existing = self.get_agent_config_approval(draft_id, tenant_id, input_hash)
@@ -827,13 +1030,16 @@ class SQLiteStore:
                 return {"approval_id": existing["approval_id"], "agent_id": existing["agent_id"],
                         "version": int(existing["version"]), "status": existing["status"], "duplicate": True}
             draft = self.connection.execute(
-                "SELECT status FROM agent_config_drafts WHERE draft_id = ? AND tenant_id = ?",
+                "SELECT status, data_json FROM agent_config_drafts WHERE draft_id = ? AND tenant_id = ?",
                 (draft_id, tenant_id),
             ).fetchone()
             if draft is None:
                 raise ValueError("DRAFT_NOT_FOUND")
             if draft["status"] == "PUBLISHED":
                 raise ValueError("DRAFT_ALREADY_PUBLISHED")
+            data = json.loads(draft["data_json"])
+            if hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=True).encode()).hexdigest() != input_hash:
+                raise ValueError("PRECHECK_VERSION_STALE")
             review = self.connection.execute(
                 "SELECT review_id, input_hash, status FROM agent_config_reviews "
                 "WHERE review_id = ? AND draft_id = ? AND tenant_id = ?",
@@ -843,38 +1049,241 @@ class SQLiteStore:
                 raise ValueError("PRECHECK_VERSION_STALE")
             if review["status"] != "READY_FOR_ADMIN":
                 raise ValueError("PRECHECK_NOT_READY")
-            existing_actor = self.connection.execute(
-                "SELECT actor_id FROM actors WHERE tenant_id = ? AND actor_type IN "
-                "('PERSONAL_ASSISTANT', 'BUSINESS_AGENT', 'MANAGEMENT_AGENT')",
-                (tenant_id,),
-            ).fetchall()
-            if any(str(row["actor_id"]).casefold() == agent_id.casefold() for row in existing_actor):
-                raise ValueError("AGENT_NAME_CONFLICT")
-            self.connection.execute(
-                "INSERT INTO actors(actor_id, tenant_id, actor_type, capabilities_json, roles_json, external_ref_hash, active) "
-                "VALUES (?, ?, ?, ?, ?, NULL, 1)",
-                (agent_id, tenant_id, actor_type, self._json(sorted(capabilities)), self._json([])),
-            )
+            base_version = data.get("base_version")
+            actor = self.connection.execute("SELECT * FROM actors WHERE actor_id = ?", (agent_id,)).fetchone()
+            if base_version is None:
+                name_conflict = self.connection.execute(
+                    "SELECT 1 FROM actors WHERE tenant_id = ? AND lower(actor_id) = lower(?)",
+                    (tenant_id, agent_id),
+                ).fetchone()
+                if actor is not None or name_conflict is not None:
+                    raise ValueError("AGENT_NAME_CONFLICT")
+                version = 1
+                self.connection.execute(
+                    "INSERT INTO actors(actor_id, tenant_id, actor_type, capabilities_json, roles_json, external_ref_hash, active) "
+                    "VALUES (?, ?, ?, ?, ?, NULL, 1)",
+                    (agent_id, tenant_id, actor_type, self._json(sorted(capabilities)), self._json([])),
+                )
+                active = 1
+            else:
+                route = self.get_agent_route(tenant_id, agent_id)
+                if (actor is None or actor["tenant_id"] != tenant_id or actor["actor_type"] != actor_type
+                        or not actor["active"] or route is None or route["status"] != "ACTIVE"
+                        or int(route["stable_version"]) != base_version):
+                    raise ValueError("AGENT_BASE_VERSION_STALE")
+                evaluation = self.latest_agent_evaluation(tenant_id, draft_id, input_hash)
+                if evaluation is None or evaluation["status"] != "PASSED":
+                    raise ValueError("AGENT_EVALUATION_REQUIRED")
+                if evaluation["evaluator_id"] == approver_id:
+                    raise ValueError("SELF_EVALUATION_APPROVAL")
+                latest = self.connection.execute(
+                    "SELECT MAX(version) AS version FROM agent_versions WHERE agent_id = ?", (agent_id,),
+                ).fetchone()
+                version = int(latest["version"]) + 1
+                active = 0
             self.connection.execute(
                 "INSERT INTO agent_versions(agent_id, version, capabilities_json, active, skill_version) "
-                "VALUES (?, 1, ?, 1, ?)",
-                (agent_id, self._json(sorted(capabilities)), skill_version),
+                "VALUES (?, ?, ?, ?, ?)",
+                (agent_id, version, self._json(sorted(capabilities)), active, skill_version),
             )
+            self.connection.execute(
+                "INSERT INTO agent_version_snapshots(agent_id, version, tenant_id, draft_id, config_json, config_hash) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (agent_id, version, tenant_id, draft_id, self._json(data), input_hash),
+            )
+            if version == 1:
+                self.connection.execute(
+                    "INSERT INTO agent_routes(agent_id, tenant_id, stable_version, canary_version, "
+                    "volunteer_ids_json, status) VALUES (?, ?, 1, NULL, '[]', 'ACTIVE')",
+                    (agent_id, tenant_id),
+                )
             self.connection.execute(
                 "UPDATE agent_config_drafts SET status = 'PUBLISHED' WHERE draft_id = ? AND tenant_id = ?",
                 (draft_id, tenant_id),
             )
             self.connection.execute(
                 "INSERT INTO agent_config_approvals(approval_id, draft_id, tenant_id, approver_id, review_id, "
-                "input_hash, agent_id, version, status) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'PUBLISHED')",
-                (approval_id, draft_id, tenant_id, approver_id, review_id, input_hash, agent_id),
+                "input_hash, agent_id, version, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PUBLISHED')",
+                (approval_id, draft_id, tenant_id, approver_id, review_id, input_hash, agent_id, version),
             )
+            self._insert_agent_audit(event)
             self.connection.commit()
-            return {"approval_id": approval_id, "agent_id": agent_id, "version": 1,
+            return {"approval_id": approval_id, "agent_id": agent_id, "version": version,
                     "status": "PUBLISHED", "duplicate": False}
         except Exception:
             self.connection.rollback()
             raise
+
+    def transition_agent_route(self, *, tenant_id: str, agent_id: str, action: str,
+                               expected_version: int, target_version: int | None,
+                               volunteer_ids: list[str], event: Any) -> bool:
+        """Move a reviewed agent route and its audit record in one transaction."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            route = self.get_agent_route(tenant_id, agent_id)
+            actor = self.connection.execute(
+                "SELECT active FROM actors WHERE actor_id = ? AND tenant_id = ?", (agent_id, tenant_id),
+            ).fetchone()
+            if route is None or actor is None or route["status"] == "ARCHIVED":
+                self.connection.rollback()
+                return False
+            stable = int(route["stable_version"])
+            if stable != expected_version:
+                self.connection.rollback()
+                return False
+            if action == "CANARY":
+                if not actor["active"] or route["status"] != "ACTIVE" or target_version is None or target_version <= stable:
+                    self.connection.rollback()
+                    return False
+                snapshot = self.get_agent_snapshot(tenant_id, agent_id, target_version)
+                if snapshot is None:
+                    self.connection.rollback()
+                    return False
+                evaluation = self.latest_agent_evaluation(tenant_id, snapshot["draft_id"], snapshot["config_hash"])
+                if evaluation is None or evaluation["status"] != "PASSED":
+                    self.connection.rollback()
+                    return False
+                for member_id in volunteer_ids:
+                    member = self.connection.execute(
+                        "SELECT 1 FROM actors WHERE actor_id = ? AND tenant_id = ? "
+                        "AND actor_type = 'USER' AND active = 1", (member_id, tenant_id),
+                    ).fetchone()
+                    consent = self.agent_volunteer_consent(tenant_id, agent_id, member_id)
+                    if (member is None or consent is None or not consent["active"]
+                            or consent["candidate_version"] != target_version):
+                        self.connection.rollback()
+                        return False
+                self.connection.execute(
+                    "UPDATE agent_versions SET active = 1 WHERE agent_id = ? AND version = ?",
+                    (agent_id, target_version),
+                )
+                self.connection.execute(
+                    "UPDATE agent_routes SET canary_version = ?, volunteer_ids_json = ?, "
+                    "status = 'CANARY', updated_at = CURRENT_TIMESTAMP WHERE agent_id = ?",
+                    (target_version, self._json(volunteer_ids), agent_id),
+                )
+            elif action == "PROMOTE":
+                if not actor["active"] or route["status"] != "CANARY" or target_version != route["canary_version"]:
+                    self.connection.rollback()
+                    return False
+                observed = self.connection.execute(
+                    "SELECT (strftime('%s', 'now') - strftime('%s', updated_at)) AS seconds "
+                    "FROM agent_routes WHERE agent_id = ?", (agent_id,),
+                ).fetchone()
+                if observed is None or observed["seconds"] is None or observed["seconds"] < 60:
+                    self.connection.rollback()
+                    return False
+                canary_started = datetime.strptime(route["updated_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                sample_rows = self.connection.execute(
+                    "SELECT data_json FROM task_runs WHERE tenant_id = ?", (tenant_id,),
+                ).fetchall()
+                samples = []
+                for sample_row in sample_rows:
+                    run = json.loads(sample_row["data_json"])
+                    if (run.get("agent_id") == agent_id and run.get("agent_version") == target_version
+                            and run.get("release_mode") == "CANARY" and run.get("created_at")
+                            and datetime.fromisoformat(run["created_at"]) >= canary_started):
+                        samples.append(run)
+                if (len(samples) < 2 or any(run.get("status") != "WAITING_REVIEW"
+                                            or run.get("failure_reason") for run in samples)):
+                    self.connection.rollback()
+                    return False
+                snapshot = self.get_agent_snapshot(tenant_id, agent_id, target_version)
+                config = json.loads(snapshot["config_json"])
+                self.connection.execute(
+                    "UPDATE actors SET capabilities_json = ? WHERE actor_id = ?",
+                    (self._json(config["capabilities"]), agent_id),
+                )
+                self.connection.execute(
+                    "UPDATE agent_versions SET active = CASE WHEN version = ? THEN 1 ELSE 0 END WHERE agent_id = ?",
+                    (target_version, agent_id),
+                )
+                self.connection.execute(
+                    "UPDATE agent_routes SET stable_version = ?, canary_version = NULL, "
+                    "volunteer_ids_json = '[]', status = 'ACTIVE', updated_at = CURRENT_TIMESTAMP WHERE agent_id = ?",
+                    (target_version, agent_id),
+                )
+            elif action == "ROLLBACK":
+                if target_version is None or target_version == stable:
+                    if route["status"] != "CANARY" or target_version != stable:
+                        self.connection.rollback()
+                        return False
+                elif route["status"] != "ACTIVE" or target_version >= stable:
+                    self.connection.rollback()
+                    return False
+                snapshot = self.get_agent_snapshot(tenant_id, agent_id, target_version)
+                if snapshot is None:
+                    self.connection.rollback()
+                    return False
+                config = json.loads(snapshot["config_json"])
+                self.connection.execute(
+                    "UPDATE actors SET capabilities_json = ? WHERE actor_id = ?",
+                    (self._json(config["capabilities"]), agent_id),
+                )
+                self.connection.execute(
+                    "UPDATE agent_versions SET active = CASE WHEN version = ? THEN 1 ELSE 0 END WHERE agent_id = ?",
+                    (target_version, agent_id),
+                )
+                self.connection.execute(
+                    "UPDATE agent_routes SET stable_version = ?, canary_version = NULL, "
+                    "volunteer_ids_json = '[]', status = 'ACTIVE', updated_at = CURRENT_TIMESTAMP WHERE agent_id = ?",
+                    (target_version, agent_id),
+                )
+            elif action == "ARCHIVE":
+                self.connection.execute("UPDATE actors SET active = 0 WHERE actor_id = ?", (agent_id,))
+                self.connection.execute("UPDATE agent_versions SET active = 0 WHERE agent_id = ?", (agent_id,))
+                self.connection.execute(
+                    "UPDATE agent_routes SET canary_version = NULL, volunteer_ids_json = '[]', "
+                    "status = 'ARCHIVED', updated_at = CURRENT_TIMESTAMP WHERE agent_id = ?", (agent_id,),
+                )
+            else:
+                raise ValueError("UNKNOWN_AGENT_ACTION")
+            if action in {"PROMOTE", "ROLLBACK", "ARCHIVE"}:
+                self.connection.execute(
+                    "UPDATE agent_volunteer_consents SET active = 0, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE tenant_id = ? AND agent_id = ?", (tenant_id, agent_id),
+                )
+            self._insert_agent_audit(event)
+            self.connection.commit()
+            return True
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def agent_run_diagnostics(self, tenant_id: str, agent_id: str) -> dict[str, Any]:
+        """Aggregate persisted runs without returning member input or output."""
+        rows = self.connection.execute(
+            "SELECT data_json FROM task_runs WHERE tenant_id = ?", (tenant_id,),
+        ).fetchall()
+        by_version: dict[int, dict[str, Any]] = {}
+        run_versions: dict[str, int] = {}
+        for row in rows:
+            run = json.loads(row["data_json"])
+            if run.get("agent_id") != agent_id:
+                continue
+            version = int(run["agent_version"])
+            run_versions[str(run["task_run_id"])] = version
+            item = by_version.setdefault(version, {"total": 0, "statuses": {}, "failures": 0,
+                                                   "runtime_events": {}})
+            item["total"] += 1
+            status = str(run.get("status", "UNKNOWN"))
+            item["statuses"][status] = item["statuses"].get(status, 0) + 1
+            if status in {"FAILED", "RECONCILING"} or run.get("failure_reason"):
+                item["failures"] += 1
+        if run_versions:
+            events = self.connection.execute(
+                "SELECT runtime_events.task_run_id, runtime_events.data_json FROM runtime_events "
+                "JOIN task_runs ON task_runs.task_run_id = runtime_events.task_run_id "
+                "WHERE task_runs.tenant_id = ?", (tenant_id,),
+            ).fetchall()
+            for event in events:
+                version = run_versions.get(event["task_run_id"])
+                if version is None:
+                    continue
+                event_type = str(json.loads(event["data_json"]).get("event_type", "UNKNOWN"))
+                counts = by_version[version]["runtime_events"]
+                counts[event_type] = counts.get(event_type, 0) + 1
+        return {"versions": by_version, "total": sum(item["total"] for item in by_version.values())}
 
     def save_binding(self, binding: Any) -> None:
         self.connection.execute(

@@ -161,10 +161,9 @@ class FeishuMeetingReviewGateway:
         agent = self.control_plane._actor(agent_id)
         if agent.actor_type != ActorType.BUSINESS_AGENT or agent.tenant_id != member.tenant_id:
             raise PermissionError("会议 Agent 不属于当前租户")
-        version_rows = [row for row in self.control_plane.store.list_agent_versions([agent_id]) if row["active"]]
-        if not agent.active or not version_rows:
+        version = self.control_plane.store.select_agent_version(member.tenant_id, agent_id, member.actor_id)
+        if not agent.active or version is None:
             raise PermissionError("会议 Agent 当前不可用")
-        version = int(version_rows[0]["version"])
         document_id = self.document_id_from_url(document_url)
         if requester_identity.auth_mode == "feishu_event":
             if self.event_access_verifier is None:

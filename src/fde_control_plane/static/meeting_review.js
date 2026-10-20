@@ -13,7 +13,7 @@ const taskNames = {WAITING_REVIEW:"待核对",WAITING_APPROVAL:"待审批",CANCE
 const reasonNames = {ASSIGNEE_UNMAPPED:"负责人待确认",ASSIGNEE_INVALID:"负责人不可用",DUE_DATE_UNCONFIRMED:"截止日期待确认",DUE_DATE_INVALID:"截止日期格式无效",TITLE_MISSING:"标题待确认",POSSIBLE_DUPLICATE_OR_CONFLICT:"存在关联或冲突，需人工裁定",DISCARDED_BY_REVIEWER:"已舍弃"};
 const executionNames = {PREPARED:"待执行",DISPATCHED:"执行中",SUCCEEDED:"已创建",FAILED:"已阻断/失败",UNKNOWN:"结果待核验",RECONCILING:"结果待核验"};
 const agentTypeNames = {PERSONAL_ASSISTANT:"个人助手",BUSINESS_AGENT:"业务 Agent",MANAGEMENT_AGENT:"管理 Agent"};
-const agentStatusNames = {ACTIVE:"运行中",PAUSED:"已暂停",UNVERSIONED:"待接入"};
+const agentStatusNames = {ACTIVE:"运行中",CANARY:"志愿者灰度",PAUSED:"已暂停",ARCHIVED:"已归档",UNVERSIONED:"待接入"};
 const draftStatusNames = {PENDING_REVIEW:"待审核",APPROVED:"已批准",REJECTED:"已拒绝",PUBLISHED:"已发布"};
 const reviewStatusNames = {READY_FOR_ADMIN:"预审通过，待管理员确认",BLOCKED:"预审阻断"};
 function node(tag, text, cls) { const el=document.createElement(tag); if(text!==undefined) el.textContent=text; if(cls) el.className=cls; return el; }
@@ -173,19 +173,97 @@ function renderAgents() {
     const card=node("article",undefined,"agent-row"),head=node("div",undefined,"agent-row-head");
     const status=agentStatusNames[agent.status]||agent.status;
     head.append(node("h3",agent.agent_id),node("span",status,`badge ${agent.status==="ACTIVE"?"ready":"closed"}`));
-    card.append(head,node("p",`${agentTypeNames[agent.actor_type]||agent.actor_type} · 当前版本 ${agent.current_version==null?"未发布":`v${agent.current_version}`} · 历史版本 ${agent.version_count}`,"muted"));
+    card.append(head,node("p",`${agentTypeNames[agent.actor_type]||agent.actor_type} · 稳定版 ${agent.current_version==null?"未发布":`v${agent.current_version}`} · 历史版本 ${agent.version_count}`,"muted"));
+    if(agent.canary_version)card.append(node("p",`灰度 v${agent.canary_version} · 志愿者 ${agent.volunteer_count} 人 · 只产出建议`,"muted"));
     if(agent.capabilities.length)card.append(node("p",`能力：${agent.capabilities.join("、")}`,"agent-capabilities"));
     if(agent.skill_version)card.append(node("p",`Skill：${agent.skill_version}`,"muted"));
     if(agent.pause_reason)card.append(node("p",`暂停原因：${agent.pause_reason}`,"muted"));
-    if(agentState.canPause && agent.status!=="PAUSED"){
+    if(agent.candidate_version && ["ACTIVE","CANARY"].includes(agent.status)){
+      const actions=node("div",undefined,"commands agent-review-actions");
+      const button=node("button",agent.volunteer_enrolled?"退出灰度报名":"报名灰度试运行");
+      button.type="button";button.addEventListener("click",()=>changeAgentVolunteer(agent,button));
+      actions.append(button);card.append(actions);
+    }
+    if(agentState.canPause && agent.status!=="PAUSED" && agent.status!=="ARCHIVED"){
       const actions=node("div",undefined,"commands agent-review-actions"),button=node("button","暂停 Agent");
       button.type="button";button.addEventListener("click",()=>pauseAgent(agent,button));actions.append(button);card.append(actions);
     }else if(agentState.canResume && agent.status==="PAUSED" && agent.current_version!=null){
       const actions=node("div",undefined,"commands agent-review-actions"),button=node("button","恢复 Agent");
       button.type="button";button.className="primary";button.addEventListener("click",()=>resumeAgent(agent,button));actions.append(button);card.append(actions);
     }
+    if(agentState.canConfirm){
+      const actions=node("div",undefined,"commands agent-review-actions");
+      const add=(label,fn)=>{const button=node("button",label);button.type="button";button.addEventListener("click",()=>fn(button));actions.append(button);};
+      add("运行诊断与版本对比",button=>inspectAgent(agent,button));
+      if(agent.status!=="ARCHIVED" && agent.current_version!=null){
+        const candidates=agent.versions.filter(version=>version>agent.current_version);
+        if(agent.status==="ACTIVE" && candidates.length)add("启动志愿者灰度",button=>changeAgentRoute(agent,"canary",button));
+        if(agent.status==="CANARY")add("人工转正",button=>changeAgentRoute(agent,"promote",button));
+        if(agent.status==="CANARY" || agent.current_version>1)add("人工回退",button=>changeAgentRoute(agent,"rollback",button));
+        add("下架归档",button=>changeAgentRoute(agent,"archive",button));
+      }
+      card.append(actions);
+    }
     panel.append(card);
   });
+}
+async function changeAgentVolunteer(agent,button){
+  if(agentState.busy)return;
+  const enroll=!agent.volunteer_enrolled;
+  if(!window.confirm(enroll?`报名“${agent.agent_id}”v${agent.candidate_version} 的只读建议灰度？`:
+    `退出“${agent.agent_id}”的灰度？退出后不再路由到候选版。`))return;
+  agentState.busy=true;button.disabled=true;
+  try{await api(`/api/meetings/agents/${encodeURIComponent(agent.agent_id)}/volunteer`,{
+    method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":agentState.csrf},
+    body:JSON.stringify({candidate_version:agent.candidate_version,enroll})
+  });agentState.busy=false;await loadAgents();agentNotice(enroll?"灰度报名已记录。":"已退出灰度报名。","success");}
+  catch(error){agentNotice(error.message,"error");button.disabled=false;}
+  finally{agentState.busy=false;}
+}
+async function inspectAgent(agent,button){
+  button.disabled=true;
+  try{
+    const base=`/api/meetings/agents/${encodeURIComponent(agent.agent_id)}`;
+    const diagnostic=await api(`${base}/diagnostics`);
+    const versions=agent.versions;
+    let report=`${agent.agent_id}：累计 ${diagnostic.total} 次运行。\n`;
+    for(const [version,item] of Object.entries(diagnostic.versions))report+=`v${version}：${item.total} 次，异常 ${item.failures} 次；状态 ${JSON.stringify(item.statuses)}\n`;
+    if(versions.length>1){
+      const newer=agent.canary_version||versions[0],older=versions.find(version=>version<newer);
+      if(older){const comparison=await api(`${base}/compare?old_version=${older}&new_version=${newer}`);
+        report+=`v${older} → v${newer} 配置差异：${JSON.stringify(comparison.changes)}`;}
+    }
+    window.alert(report);
+  }catch(error){agentNotice(error.message,"error");}
+  finally{button.disabled=false;}
+}
+async function changeAgentRoute(agent,action,button){
+  if(agentState.busy)return;
+  const labels={canary:"志愿者灰度",promote:"人工转正",rollback:"人工回退",archive:"下架归档"};
+  let target=null,volunteer_ids=[];
+  if(action==="canary"){
+    target=Math.max(...agent.versions.filter(version=>version>agent.current_version));
+    const input=window.prompt("志愿者成员编号（逗号分隔；灰度版只产出建议）：");if(input===null)return;
+    volunteer_ids=input.split(",").map(value=>value.trim()).filter(Boolean);
+    if(!volunteer_ids.length){agentNotice("至少指定一名志愿者。","error");return;}
+  }else if(action==="promote")target=agent.canary_version;
+  else if(action==="rollback"){
+    target=agent.status==="CANARY"?agent.current_version:Number(window.prompt(`回退到哪个历史版本？可选：${agent.versions.filter(version=>version<agent.current_version).join("、")}`));
+    if(!agent.versions.includes(target)){agentNotice("请填写有效的历史版本。","error");return;}
+  }
+  const reason=window.prompt(`${labels[action]}“${agent.agent_id}”的原因（至少 5 个字）：`);
+  if(reason===null)return;
+  if(reason.trim().length<5){agentNotice("请填写至少 5 个字的原因。","error");return;}
+  if(!window.confirm(`确认${labels[action]}“${agent.agent_id}”？`))return;
+  agentState.busy=true;button.disabled=true;
+  try{
+    await api(`/api/meetings/agents/${encodeURIComponent(agent.agent_id)}/${action}`,{
+      method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":agentState.csrf},
+      body:JSON.stringify({expected_version:agent.current_version,target_version:target,volunteer_ids,reason:reason.trim()})
+    });
+    agentState.busy=false;await loadAgents();agentNotice(`${labels[action]}已记录，审计与路由同步更新。`,"success");
+  }catch(error){agentNotice(error.message,"error");button.disabled=false;}
+  finally{agentState.busy=false;}
 }
 async function pauseAgent(agent,button) {
   if(agentState.busy)return;
@@ -225,7 +303,8 @@ function renderAgentDrafts() {
   agentState.drafts.forEach(draft=>{
     const card=node("article",undefined,"agent-draft-row"),head=node("div",undefined,"agent-row-head");
     head.append(node("h3",draft.name),node("span",draftStatusNames[draft.status]||draft.status,`badge ${draft.status==="PUBLISHED"||draft.status==="APPROVED"?"ready":""}`));
-    card.append(head,node("p",`${agentTypeNames[draft.actor_type]||draft.actor_type} · 提交时间 ${draft.created_at}${draft.created_by_current_member?" · 我提交":""}`,"muted"),node("p",draft.description,"agent-draft-description"));
+    card.append(head,node("p",`${agentTypeNames[draft.actor_type]||draft.actor_type} · ${draft.base_version?`升级自 v${draft.base_version}`:"初版"} · 提交时间 ${draft.created_at}${draft.created_by_current_member?" · 我提交":""}`,"muted"),node("p",draft.description,"agent-draft-description"));
+    if(draft.evaluation_status)card.append(node("p",`独立评测：${draft.evaluation_status==="PASSED"?"通过":"未通过"}`,"muted"));
     if(draft.capabilities.length)card.append(node("p",`申请能力：${draft.capabilities.join("、")}`,"agent-capabilities"));
     if(draft.review_status){
       card.append(node("p",`审核官预审：${reviewStatusNames[draft.review_status]||draft.review_status}`,`agent-review-status ${draft.review_status==="READY_FOR_ADMIN"?"ready":"blocked"}`));
@@ -235,6 +314,8 @@ function renderAgentDrafts() {
     if(agentState.canPrecheck && draft.status==="PENDING_REVIEW"){
       const actions=node("div",undefined,"commands agent-review-actions"),button=node("button","运行审核预审");
       button.type="button";button.addEventListener("click",()=>precheckAgentDraft(draft,button));actions.append(button);card.append(actions);
+      if(draft.review_input_hash){const evaluate=node("button","登记独立评测");evaluate.type="button";
+        evaluate.addEventListener("click",()=>evaluateAgentDraft(draft,evaluate));actions.append(evaluate);}
     }
     if(agentState.canConfirm && draft.status!=="PUBLISHED" && draft.review_status==="READY_FOR_ADMIN"){
       const actions=node("div",undefined,"commands agent-review-actions"),button=node("button","管理员确认发布");
@@ -320,7 +401,7 @@ async function approveMemberAccess(item,button) {
 }
 async function loadAgents() {
   if(agentState.busy)return;agentState.busy=true;$("agents-reload").disabled=true;$("agent-list").setAttribute("aria-busy","true");
-  try{const data=await api("/api/meetings/agents");const drafts=await api("/api/meetings/agent-drafts");agentState.agents=data.agents||[];agentState.drafts=drafts.drafts||[];agentState.canPause=Boolean(data.can_pause);agentState.canResume=Boolean(data.can_resume);agentState.canPrecheck=Boolean(drafts.can_precheck);agentState.canConfirm=Boolean(drafts.can_confirm);agentState.csrf=drafts.csrf_token;renderAgents();renderAgentDrafts();agentNotice("");}
+  try{const data=await api("/api/meetings/agents");const drafts=await api("/api/meetings/agent-drafts");agentState.agents=data.agents||[];agentState.drafts=drafts.drafts||[];agentState.canPause=Boolean(data.can_pause);agentState.canResume=Boolean(data.can_resume);agentState.canPrecheck=Boolean(drafts.can_precheck);agentState.canConfirm=Boolean(drafts.can_confirm);agentState.csrf=drafts.csrf_token;$("agent-eval-dataset").hidden=!agentState.canPrecheck;renderAgents();renderAgentDrafts();agentNotice("");}
   catch(error){agentNotice(error.message,"error");if(!agentState.agents.length)$("agent-list").replaceChildren(node("p","Agent 目录暂时无法加载，请稍后刷新。","muted"));}
   finally{agentState.busy=false;$("agents-reload").disabled=false;$("agent-list").setAttribute("aria-busy","false");}
 }
@@ -392,11 +473,47 @@ async function precheckAgentDraft(draft,button) {
   catch(error){agentNotice(error.message,"error");button.disabled=false;}
   finally{agentState.busy=false;}
 }
+async function evaluationHash(value){
+  const bytes=new TextEncoder().encode(value);
+  return [...new Uint8Array(await crypto.subtle.digest("SHA-256",bytes))].map(byte=>byte.toString(16).padStart(2,"0")).join("");
+}
+async function createEvalDataset(){
+  if(agentState.busy)return;
+  const dataset_id=window.prompt("新评测集编号（不可覆盖）：");if(dataset_id===null)return;
+  const input=window.prompt("每行一例：案例编号|期望结果|证据引用。至少两例；仅保存期望结果哈希。");
+  if(input===null)return;
+  const rows=input.trim().split(/\r?\n/).map(line=>line.split("|").map(value=>value.trim()));
+  if(rows.length<2 || rows.some(row=>row.length!==3 || row.some(value=>!value))){agentNotice("请填写至少两条完整的评测案例。","error");return;}
+  const cases=[];
+  for(const [case_id,expected,evidence_ref] of rows)cases.push({case_id,expected_hash:await evaluationHash(expected),evidence_ref});
+  agentState.busy=true;
+  try{await api("/api/meetings/agent-evaluation-datasets",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":agentState.csrf},body:JSON.stringify({dataset_id,cases})});
+    agentNotice(`评测集 ${dataset_id} 已登记，案例和期望结果不可覆盖。`,"success");}
+  catch(error){agentNotice(error.message,"error");}
+  finally{agentState.busy=false;}
+}
+async function evaluateAgentDraft(draft,button){
+  if(agentState.busy)return;
+  const dataset_id=window.prompt("独立评测集编号：");if(dataset_id===null)return;
+  const input=window.prompt("每行一例：案例编号|期望结果|实际结果|证据引用。至少两例；仅保存结果哈希。");
+  if(input===null)return;
+  const rows=input.trim().split(/\r?\n/).map(line=>line.split("|").map(value=>value.trim()));
+  if(rows.length<2 || rows.some(row=>row.length!==4 || row.some(value=>!value))){agentNotice("请填写至少两条完整评测案例。","error");return;}
+  const cases=[];
+  for(const [case_id,expected,observed,evidence_ref] of rows)cases.push({case_id,expected_hash:await evaluationHash(expected),observed_hash:await evaluationHash(observed),evidence_ref});
+  agentState.busy=true;button.disabled=true;
+  try{const result=await api(`/api/meetings/agent-drafts/${encodeURIComponent(draft.draft_id)}/evaluate`,{
+    method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":agentState.csrf},
+    body:JSON.stringify({input_hash:draft.review_input_hash,dataset_id,cases})
+  });agentState.busy=false;await loadAgents();agentNotice(`评测${result.status==="PASSED"?"通过":"未通过"}：${result.passed}/${result.total}；请重新运行审核预审。`,result.status==="PASSED"?"success":"error");}
+  catch(error){agentNotice(error.message,"error");button.disabled=false;}
+  finally{agentState.busy=false;}
+}
 async function confirmAgentDraft(draft,button) {
   if(agentState.busy)return;
-  if(!window.confirm(`确认发布“${draft.name}”的 Agent v1？这会创建运行版本并启用申请的能力。`))return;
+  if(!window.confirm(`确认发布“${draft.name}”的${draft.base_version?"候选新版本":" Agent v1"}？${draft.base_version?"候选版须另行启动灰度。":"这会启用申请的能力。"}`))return;
   agentState.busy=true;button.disabled=true;agentNotice(`正在确认发布“${draft.name}”…`);
-  try{const result=await api(`/api/meetings/agent-drafts/${encodeURIComponent(draft.draft_id)}/confirm`,{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":agentState.csrf},body:JSON.stringify({review_id:draft.review_id,input_hash:draft.review_input_hash})});agentNotice(result.duplicate?"发布确认已处理，返回原版本。":"Agent 已发布为 v1。","success");agentState.busy=false;await loadAgents();}
+  try{const result=await api(`/api/meetings/agent-drafts/${encodeURIComponent(draft.draft_id)}/confirm`,{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":agentState.csrf},body:JSON.stringify({review_id:draft.review_id,input_hash:draft.review_input_hash})});agentNotice(result.duplicate?"发布确认已处理，返回原版本。":`Agent v${result.version} 已发布；候选版需另行启动灰度。`,"success");agentState.busy=false;await loadAgents();}
   catch(error){agentNotice(error.message,"error");button.disabled=false;}
   finally{agentState.busy=false;}
 }
@@ -406,7 +523,7 @@ async function submitAgentDraft(event) {
   const capabilities=$("agent-draft-capabilities").value.split(",").map(value=>value.trim()).filter(Boolean);
   agentState.busy=true;$("agent-draft-form").querySelectorAll("input,select,textarea,button").forEach(el=>el.disabled=true);agentNotice("正在提交配置草稿…");
   try{
-    await api("/api/meetings/agent-drafts",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":agentState.csrf},body:JSON.stringify({name:$("agent-draft-name").value.trim(),actor_type:$("agent-draft-type").value,description:$("agent-draft-description").value.trim(),capabilities,skill_version:$("agent-draft-skill").value.trim()||null})});
+    await api("/api/meetings/agent-drafts",{method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":agentState.csrf},body:JSON.stringify({name:$("agent-draft-name").value.trim(),actor_type:$("agent-draft-type").value,description:$("agent-draft-description").value.trim(),capabilities,skill_version:$("agent-draft-skill").value.trim()||null,base_version:$("agent-draft-base-version").value?Number($("agent-draft-base-version").value):null})});
     $("agent-draft-form").reset();$("agent-draft-editor").hidden=true;agentNotice("配置草稿已提交，等待审核官和管理员处理。","success");
     const drafts=await api("/api/meetings/agent-drafts");agentState.drafts=drafts.drafts||[];agentState.canPrecheck=Boolean(drafts.can_precheck);agentState.canConfirm=Boolean(drafts.can_confirm);agentState.csrf=drafts.csrf_token;renderAgentDrafts();
   }catch(error){agentNotice(error.message,"error");}
@@ -556,6 +673,7 @@ $("organizer-reload").addEventListener("click",loadOrganizerTasks);
 $("meeting-start-form").addEventListener("submit",submitMeetingStart);
 $("follow-up-reload").addEventListener("click",refreshDigest);
 $("agents-reload").addEventListener("click",loadAgents);
+  $("agent-eval-dataset").addEventListener("click",createEvalDataset);
 $("members-reload").addEventListener("click",loadMembers);
 $("audit-reload").addEventListener("click",loadAudit);
 $("agent-draft-toggle").addEventListener("click",()=>{const editor=$("agent-draft-editor");editor.hidden=!editor.hidden;if(!editor.hidden)$("agent-draft-name").focus();});

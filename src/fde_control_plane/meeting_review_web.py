@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import sqlite3
 from collections import Counter
 from datetime import date
 from threading import RLock
@@ -72,12 +73,55 @@ class AgentConfigDraftRequest(BaseModel):
     description: StrictStr = Field(min_length=1, max_length=2000)
     capabilities: list[StrictStr] = Field(default_factory=list, max_length=30)
     skill_version: StrictStr | None = Field(default=None, max_length=100)
+    base_version: int | None = Field(default=None, ge=1)
 
 
 class AgentConfigApprovalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     review_id: StrictStr = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_-]+$")
     input_hash: StrictStr = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]+$")
+
+
+class AgentEvaluationCase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    case_id: StrictStr = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_-]+$")
+    expected_hash: StrictStr = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]+$")
+    observed_hash: StrictStr = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]+$")
+    evidence_ref: StrictStr = Field(min_length=1, max_length=200)
+
+
+class AgentEvaluationDatasetCase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    case_id: StrictStr = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_-]+$")
+    expected_hash: StrictStr = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]+$")
+    evidence_ref: StrictStr = Field(min_length=1, max_length=200)
+
+
+class AgentEvaluationDatasetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    dataset_id: StrictStr = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_-]+$")
+    cases: list[AgentEvaluationDatasetCase] = Field(min_length=2, max_length=50)
+
+
+class AgentEvaluationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    input_hash: StrictStr = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]+$")
+    dataset_id: StrictStr = Field(min_length=1, max_length=100)
+    cases: list[AgentEvaluationCase] = Field(min_length=2, max_length=50)
+
+
+class AgentRouteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int = Field(ge=1)
+    target_version: int | None = Field(default=None, ge=1)
+    volunteer_ids: list[StrictStr] = Field(default_factory=list, max_length=20)
+    reason: StrictStr = Field(min_length=5, max_length=500)
+
+
+class AgentVolunteerRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    candidate_version: int = Field(ge=1)
+    enroll: StrictBool
 
 
 class AgentPauseRequest(BaseModel):
@@ -169,18 +213,120 @@ class MeetingReviewWebService:
         items = []
         for actor in actors:
             history = by_agent.get(actor["actor_id"], [])
-            current = next((version for version in history if version["active"]), None)
+            route = self.cp.store.get_agent_route(identity.tenant_id, actor["actor_id"])
+            current = (next((version for version in history if version["version"] == route["stable_version"]), None)
+                       if route is not None else next((version for version in history if version["active"]), None))
+            status = ("ARCHIVED" if route is not None and route["status"] == "ARCHIVED" else
+                      "PAUSED" if not actor["active"] else
+                      "UNVERSIONED" if current is None else
+                      "CANARY" if route is not None and route["status"] == "CANARY" else "ACTIVE")
+            candidate_versions = [int(version["version"]) for version in history
+                                  if route is not None and version["version"] > route["stable_version"]
+                                  and self.cp.store.get_agent_snapshot(identity.tenant_id, actor["actor_id"],
+                                                                       version["version"]) is not None]
+            candidate_version = (int(route["canary_version"]) if route is not None
+                                 and route["status"] == "CANARY" else
+                                 max(candidate_versions) if candidate_versions else None)
+            consent = self.cp.store.agent_volunteer_consent(identity.tenant_id, actor["actor_id"], identity.actor_id)
             items.append({
                 "agent_id": actor["actor_id"],
                 "actor_type": actor["actor_type"],
-                "status": "PAUSED" if not actor["active"] else ("UNVERSIONED" if current is None else "ACTIVE"),
+                "status": status,
                 "current_version": int(current["version"]) if current is not None else None,
+                "canary_version": int(route["canary_version"]) if route is not None and route["canary_version"] else None,
+                "volunteer_count": len(json.loads(route["volunteer_ids_json"])) if route is not None else 0,
+                "candidate_version": candidate_version,
+                "volunteer_enrolled": bool(consent["active"]) and consent["candidate_version"] == candidate_version
+                if consent is not None else False,
                 "version_count": len(history),
+                "versions": [int(version["version"]) for version in history] if can_manage else [],
                 "capabilities": sorted(json.loads(current["capabilities_json"])) if current is not None else [],
                 "skill_version": current["skill_version"] if current is not None else None,
                 "pause_reason": pauses[actor["actor_id"]]["reason"] if not actor["active"] and actor["actor_id"] in pauses else None,
             })
-        return {"agents": items, "can_pause": can_manage, "can_resume": can_manage}
+        return {"agents": items, "can_pause": can_manage, "can_resume": can_manage,
+                "can_manage_lifecycle": can_manage}
+
+    def agent_diagnostics(self, agent_id: str, identity: IdentityContext) -> dict[str, Any]:
+        if not self.can_confirm_agent_config(identity):
+            raise HTTPException(403, "只有管理员可以查看运行诊断")
+        actor = self.cp.store.get_actor(agent_id)
+        if actor is None or actor["tenant_id"] != identity.tenant_id:
+            raise HTTPException(404, "Agent 不存在")
+        return {"agent_id": agent_id, **self.cp.store.agent_run_diagnostics(identity.tenant_id, agent_id)}
+
+    def agent_comparison(self, agent_id: str, old_version: int, new_version: int,
+                         identity: IdentityContext) -> dict[str, Any]:
+        if not self.can_confirm_agent_config(identity):
+            raise HTTPException(403, "只有管理员可以比较版本")
+        snapshots = [self.cp.store.get_agent_snapshot(identity.tenant_id, agent_id, version)
+                     for version in (old_version, new_version)]
+        if any(snapshot is None for snapshot in snapshots):
+            raise HTTPException(404, "版本快照不存在")
+        old, new = [json.loads(snapshot["config_json"]) for snapshot in snapshots]
+        diagnostics = self.cp.store.agent_run_diagnostics(identity.tenant_id, agent_id)["versions"]
+        return {"agent_id": agent_id, "old_version": old_version, "new_version": new_version,
+                "changes": {key: {"old": old.get(key), "new": new.get(key)}
+                            for key in ("description", "capabilities", "skill_version")
+                            if old.get(key) != new.get(key)},
+                "runs": {str(version): diagnostics.get(version, {"total": 0, "statuses": {}, "failures": 0})
+                         for version in (old_version, new_version)},
+                "config_hashes": {str(old_version): snapshots[0]["config_hash"],
+                                  str(new_version): snapshots[1]["config_hash"]}}
+
+    def transition_agent(self, agent_id: str, action: str, identity: IdentityContext,
+                         body: AgentRouteRequest) -> dict[str, Any]:
+        if not self.can_confirm_agent_config(identity):
+            raise HTTPException(403, "只有管理员可以变更 Agent 生命周期")
+        reason = body.reason.strip()
+        if len(reason) < 5:
+            raise HTTPException(422, "请填写至少 5 个字的处置原因")
+        volunteers = list(dict.fromkeys(body.volunteer_ids))
+        if action == "CANARY" and (not volunteers or body.target_version is None):
+            raise HTTPException(422, "灰度需要候选版本和至少一名志愿者")
+        if action in {"PROMOTE", "ROLLBACK"} and body.target_version is None:
+            raise HTTPException(422, "请指定目标版本")
+        if action not in {"CANARY", "PROMOTE", "ROLLBACK", "ARCHIVE"}:
+            raise HTTPException(404, "未知生命周期操作")
+        event = AuditEvent(
+            audit_id="audit-" + secrets.token_hex(12), event_type="AGENT_" + action,
+            tenant_id=identity.tenant_id, actor_id=identity.actor_id, task_run_id=None,
+            correlation_id=None, payload_hash=hashlib.sha256(json.dumps({
+                "agent_id": agent_id, "expected_version": body.expected_version,
+                "target_version": body.target_version, "volunteers": volunteers,
+                "reason": reason,
+            }, sort_keys=True, ensure_ascii=True).encode()).hexdigest(), outcome=action,
+        )
+        changed = self.cp.store.transition_agent_route(
+            tenant_id=identity.tenant_id, agent_id=agent_id, action=action,
+            expected_version=body.expected_version, target_version=body.target_version,
+            volunteer_ids=volunteers, event=event,
+        )
+        if not changed:
+            raise HTTPException(409, "Agent 版本、状态或志愿者已变化，请刷新后核对")
+        return {"agent_id": agent_id, "action": action, "remote_write": False}
+
+    def set_agent_volunteer(self, agent_id: str, identity: IdentityContext,
+                            body: AgentVolunteerRequest) -> dict[str, Any]:
+        actor = self.cp.verify_identity(identity)
+        if identity.auth_mode != "user_oauth" or actor.actor_type != ActorType.USER:
+            raise HTTPException(403, "只有成员本人可以报名或退出灰度")
+        event = AuditEvent(
+            audit_id="audit-" + secrets.token_hex(12),
+            event_type="AGENT_VOLUNTEER_JOINED" if body.enroll else "AGENT_VOLUNTEER_LEFT",
+            tenant_id=identity.tenant_id, actor_id=identity.actor_id, task_run_id=None,
+            correlation_id=None, payload_hash=hashlib.sha256(json.dumps({
+                "agent_id": agent_id, "candidate_version": body.candidate_version,
+                "enroll": body.enroll,
+            }, sort_keys=True).encode()).hexdigest(),
+            outcome="ENROLLED" if body.enroll else "WITHDRAWN",
+        )
+        if not self.cp.store.set_agent_volunteer_consent(
+                identity.tenant_id, agent_id, identity.actor_id, body.candidate_version,
+                body.enroll, event):
+            raise HTTPException(409, "候选版本、报名状态或成员身份已变化")
+        return {"agent_id": agent_id, "candidate_version": body.candidate_version,
+                "enrolled": body.enroll, "remote_write": False}
 
     def pause_agent(self, agent_id: str, identity: IdentityContext,
                     body: AgentPauseRequest) -> dict[str, Any]:
@@ -233,6 +379,10 @@ class MeetingReviewWebService:
                 "created_at": row["created_at"], "name": data["name"],
                 "actor_type": data["actor_type"], "description": data["description"],
                 "capabilities": data["capabilities"], "skill_version": data.get("skill_version"),
+                "base_version": data.get("base_version"),
+                "evaluation_status": (evaluation["status"] if (evaluation := self.cp.store.latest_agent_evaluation(
+                    identity.tenant_id, row["draft_id"], hashlib.sha256(json.dumps(
+                        data, sort_keys=True, ensure_ascii=True).encode()).hexdigest())) is not None else None),
                 "review_status": review["status"] if review is not None else None,
                 "review_id": review["review_id"] if review is not None else None,
                 "review_input_hash": review["input_hash"] if review is not None else None,
@@ -398,8 +548,11 @@ class MeetingReviewWebService:
             raise HTTPException(404, "配置草稿不存在或无权访问")
         data = json.loads(row["data_json"])
         input_hash = hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+        evaluation = self.cp.store.latest_agent_evaluation(identity.tenant_id, draft_id, input_hash)
         previous = self.cp.store.get_latest_agent_config_review(draft_id, identity.tenant_id)
-        if previous is not None and previous["input_hash"] == input_hash:
+        if (previous is not None and previous["input_hash"] == input_hash
+                and json.loads(previous["report_json"]).get("evaluation_id") ==
+                (evaluation["evaluation_id"] if evaluation is not None else None)):
             report = json.loads(previous["report_json"])
             return {"draft_id": draft_id, "review_id": previous["review_id"], "input_hash": input_hash,
                     "status": previous["status"],
@@ -415,8 +568,19 @@ class MeetingReviewWebService:
         if row["created_by"] == identity.actor_id:
             blockers.append("SELF_REVIEW")
         existing = self.cp.store.list_agent_actors(identity.tenant_id)
-        if any(str(item["actor_id"]).casefold() == str(data["name"]).casefold() for item in existing):
-            blockers.append("AGENT_NAME_CONFLICT")
+        matched = [item for item in existing if str(item["actor_id"]).casefold() == str(data["name"]).casefold()]
+        if data.get("base_version") is None:
+            if matched:
+                blockers.append("AGENT_NAME_CONFLICT")
+        else:
+            route = self.cp.store.get_agent_route(identity.tenant_id, data["name"])
+            if (len(matched) != 1 or matched[0]["actor_type"] != data["actor_type"]
+                    or not matched[0]["active"] or route is None or route["status"] != "ACTIVE"
+                    or route["stable_version"] != data["base_version"]):
+                blockers.append("AGENT_BASE_VERSION_STALE")
+            evaluation = self.cp.store.latest_agent_evaluation(identity.tenant_id, draft_id, input_hash)
+            if evaluation is None or evaluation["status"] != "PASSED":
+                blockers.append("AGENT_EVALUATION_REQUIRED")
         high_risk = sorted(capabilities & HIGH_RISK_AGENT_CAPABILITIES)
         if high_risk:
             warnings.append("HIGH_RISK_CAPABILITY:" + ",".join(high_risk))
@@ -426,6 +590,7 @@ class MeetingReviewWebService:
         report = {
             "input_hash": input_hash, "blockers": blockers, "warnings": warnings,
             "requested_capabilities": sorted(capabilities), "reviewer_role": sorted(actor.roles & AGENT_REVIEWER_ROLES),
+            "evaluation_id": evaluation["evaluation_id"] if evaluation is not None else None,
         }
         review_id = "agent-review-" + secrets.token_hex(10)
         self.cp.store.save_agent_config_review(review_id, draft_id, identity.tenant_id, identity.actor_id,
@@ -453,12 +618,21 @@ class MeetingReviewWebService:
             raise HTTPException(409, "审核预审版本已变化，请重新运行审核预审")
         if review["status"] != "READY_FOR_ADMIN":
             raise HTTPException(409, "审核预审未通过，不能发布 Agent")
+        approval_id = "agent-approval-" + secrets.token_hex(10)
+        event = AuditEvent(
+            audit_id="audit-" + secrets.token_hex(12), event_type="AGENT_CONFIG_CONFIRMED",
+            tenant_id=identity.tenant_id, actor_id=identity.actor_id, task_run_id=None,
+            correlation_id=None, payload_hash=hashlib.sha256(json.dumps({
+                "draft_id": draft_id, "approval_id": approval_id,
+                "agent_id": data["name"], "input_hash": input_hash,
+            }, sort_keys=True, ensure_ascii=True).encode()).hexdigest(), outcome="PUBLISHED",
+        )
         try:
             result = self.cp.store.publish_agent_config_draft(
                 draft_id=draft_id, tenant_id=identity.tenant_id, approver_id=identity.actor_id,
                 review_id=body.review_id, input_hash=input_hash, agent_id=data["name"],
                 actor_type=ActorType(data["actor_type"]).value, capabilities=list(data.get("capabilities") or []),
-                skill_version=data.get("skill_version"), approval_id="agent-approval-" + secrets.token_hex(10),
+                skill_version=data.get("skill_version"), approval_id=approval_id, event=event,
             )
         except ValueError as exc:
             reasons = {
@@ -467,12 +641,12 @@ class MeetingReviewWebService:
                 "PRECHECK_VERSION_STALE": (409, "审核预审版本已变化，请重新运行审核预审"),
                 "PRECHECK_NOT_READY": (409, "审核预审未通过，不能发布 Agent"),
                 "AGENT_NAME_CONFLICT": (409, "Agent 名称已存在，请修改草稿后重新预审"),
+                "AGENT_BASE_VERSION_STALE": (409, "Agent 基线版本已变化，请重新提交草稿"),
+                "AGENT_EVALUATION_REQUIRED": (409, "候选版本缺少通过的独立评测"),
+                "SELF_EVALUATION_APPROVAL": (409, "评测人不能确认发布自己的评测结果"),
             }
             code, message = reasons.get(str(exc), (409, "Agent 配置发布未完成，请重新核对"))
             raise HTTPException(code, message) from exc
-        self.cp._audit("AGENT_CONFIG_CONFIRMED", identity.tenant_id, identity.actor_id, None,
-                       {"draft_id": draft_id, "approval_id": result["approval_id"],
-                        "agent_id": data["name"], "version": result["version"]}, result["status"])
         return {**result, "draft_id": draft_id}
 
     def create_agent_config_draft(self, identity: IdentityContext, body: AgentConfigDraftRequest) -> dict[str, Any]:
@@ -488,12 +662,78 @@ class MeetingReviewWebService:
             raise HTTPException(422, "单项能力名称不能超过 100 个字符")
         draft_id = "agent-draft-" + secrets.token_hex(10)
         data = {"name": name, "actor_type": body.actor_type, "description": description,
-                "capabilities": capabilities, "skill_version": body.skill_version.strip() if body.skill_version else None}
+                "capabilities": capabilities, "skill_version": body.skill_version.strip() if body.skill_version else None,
+                "base_version": body.base_version}
         self.cp.store.save_agent_config_draft(draft_id, identity.tenant_id, identity.actor_id, "PENDING_REVIEW", data)
         self.cp._audit("AGENT_CONFIG_DRAFT_CREATED", identity.tenant_id, identity.actor_id, None,
                        {"draft_id": draft_id, "actor_type": body.actor_type, "capability_count": len(capabilities)},
                        "PENDING_REVIEW")
         return {"draft_id": draft_id, "status": "PENDING_REVIEW", "name": name}
+
+    def evaluate_agent_draft(self, draft_id: str, identity: IdentityContext,
+                             body: AgentEvaluationRequest) -> dict[str, Any]:
+        if not self.can_precheck_agent_config(identity):
+            raise HTTPException(403, "只有审核官或管理员可以登记独立评测")
+        row = self.cp.store.get_agent_config_draft(draft_id, identity.tenant_id)
+        if row is None:
+            raise HTTPException(404, "配置草稿不存在")
+        if row["status"] != "PENDING_REVIEW" or row["created_by"] == identity.actor_id:
+            raise HTTPException(409, "已发布草稿或提交人本人不能登记评测")
+        data = json.loads(row["data_json"])
+        current_hash = hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+        if body.input_hash != current_hash:
+            raise HTTPException(409, "评测输入版本已变化")
+        dataset = self.cp.store.get_agent_eval_dataset(identity.tenant_id, body.dataset_id)
+        if dataset is None or dataset["created_by"] == row["created_by"]:
+            raise HTTPException(409, "独立评测集不存在或由草稿提交人创建")
+        cases = [case.model_dump() for case in body.cases]
+        if len({case["case_id"] for case in cases}) != len(cases):
+            raise HTTPException(422, "评测案例编号必须唯一")
+        expected = {case["case_id"]: case for case in json.loads(dataset["cases_json"])}
+        if (set(expected) != {case["case_id"] for case in cases}
+                or any(case["expected_hash"] != expected[case["case_id"]]["expected_hash"]
+                       or case["evidence_ref"] != expected[case["case_id"]]["evidence_ref"]
+                       for case in cases)):
+            raise HTTPException(409, "案例与不可变评测集不一致")
+        passed = sum(case["expected_hash"] == case["observed_hash"] for case in cases)
+        status = "PASSED" if passed == len(cases) else "FAILED"
+        evaluation_id = "agent-eval-" + secrets.token_hex(10)
+        event = AuditEvent(
+            audit_id="audit-" + secrets.token_hex(12), event_type="AGENT_EVALUATED",
+            tenant_id=identity.tenant_id, actor_id=identity.actor_id, task_run_id=None,
+            correlation_id=None, payload_hash=hashlib.sha256(json.dumps({
+                "draft_id": draft_id, "input_hash": current_hash, "dataset_id": body.dataset_id,
+                "case_count": len(cases), "passed": passed,
+            }, sort_keys=True).encode()).hexdigest(), outcome=status,
+        )
+        self.cp.store.save_agent_evaluation(
+            evaluation_id=evaluation_id, tenant_id=identity.tenant_id, draft_id=draft_id,
+            input_hash=current_hash, evaluator_id=identity.actor_id, dataset_id=body.dataset_id,
+            cases=cases, status=status, event=event,
+        )
+        return {"evaluation_id": evaluation_id, "draft_id": draft_id, "status": status,
+                "passed": passed, "total": len(cases), "remote_write": False}
+
+    def create_agent_eval_dataset(self, identity: IdentityContext,
+                                  body: AgentEvaluationDatasetRequest) -> dict[str, Any]:
+        if not self.can_precheck_agent_config(identity):
+            raise HTTPException(403, "只有审核官或管理员可以登记独立评测集")
+        cases = [case.model_dump() for case in body.cases]
+        if len({case["case_id"] for case in cases}) != len(cases):
+            raise HTTPException(422, "评测案例编号必须唯一")
+        event = AuditEvent(
+            audit_id="audit-" + secrets.token_hex(12), event_type="AGENT_EVAL_DATASET_CREATED",
+            tenant_id=identity.tenant_id, actor_id=identity.actor_id, task_run_id=None,
+            correlation_id=None, payload_hash=hashlib.sha256(json.dumps({
+                "dataset_id": body.dataset_id, "cases": cases,
+            }, sort_keys=True, ensure_ascii=True).encode()).hexdigest(), outcome="CREATED",
+        )
+        try:
+            self.cp.store.save_agent_eval_dataset(identity.tenant_id, body.dataset_id,
+                                                  identity.actor_id, cases, event)
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(409, "评测集编号已存在；版本不可覆盖") from exc
+        return {"dataset_id": body.dataset_id, "case_count": len(cases), "remote_write": False}
 
     def owned_record(self, record_id: str, identity: IdentityContext) -> dict[str, Any]:
         self.cp.verify_identity(identity)
@@ -855,6 +1095,17 @@ def build_meeting_review_router(
         with service.lock:
             return service.agent_registry(identity)
 
+    @router.get("/agents/{agent_id}/diagnostics")
+    def agent_diagnostics(agent_id: str, identity: IdentityContext = Depends(require_identity)):
+        with service.lock:
+            return service.agent_diagnostics(agent_id, identity)
+
+    @router.get("/agents/{agent_id}/compare")
+    def compare_agent(agent_id: str, old_version: int, new_version: int,
+                      identity: IdentityContext = Depends(require_identity)):
+        with service.lock:
+            return service.agent_comparison(agent_id, old_version, new_version, identity)
+
     @router.post("/agents/{agent_id}/pause")
     def pause_agent(agent_id: str, body: AgentPauseRequest, request: Request,
                     identity: IdentityContext = Depends(require_identity)):
@@ -868,6 +1119,21 @@ def build_meeting_review_router(
         check_csrf(request)
         with service.lock:
             return service.resume_agent(agent_id, identity, body)
+
+    @router.post("/agents/{agent_id}/volunteer")
+    def volunteer_agent(agent_id: str, body: AgentVolunteerRequest, request: Request,
+                        identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        with service.lock:
+            return service.set_agent_volunteer(agent_id, identity, body)
+
+    @router.post("/agents/{agent_id}/{action}")
+    def transition_agent(agent_id: str, action: Literal["canary", "promote", "rollback", "archive"],
+                         body: AgentRouteRequest, request: Request,
+                         identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        with service.lock:
+            return service.transition_agent(agent_id, action.upper(), identity, body)
 
     @router.get("/agent-drafts")
     def get_agent_drafts(request: Request, identity: IdentityContext = Depends(require_identity)):
@@ -924,12 +1190,26 @@ def build_meeting_review_router(
         with service.lock:
             return service.create_agent_config_draft(identity, body)
 
+    @router.post("/agent-evaluation-datasets")
+    def create_agent_eval_dataset(body: AgentEvaluationDatasetRequest, request: Request,
+                                  identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        with service.lock:
+            return service.create_agent_eval_dataset(identity, body)
+
     @router.post("/agent-drafts/{draft_id}/precheck")
     def precheck_agent_draft(draft_id: str, request: Request,
                              identity: IdentityContext = Depends(require_identity)):
         check_csrf(request)
         with service.lock:
             return service.precheck_agent_config_draft(draft_id, identity)
+
+    @router.post("/agent-drafts/{draft_id}/evaluate")
+    def evaluate_agent_draft(draft_id: str, body: AgentEvaluationRequest, request: Request,
+                             identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        with service.lock:
+            return service.evaluate_agent_draft(draft_id, identity, body)
 
     @router.post("/agent-drafts/{draft_id}/confirm")
     def confirm_agent_draft(draft_id: str, body: AgentConfigApprovalRequest, request: Request,

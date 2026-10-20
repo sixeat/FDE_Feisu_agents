@@ -162,12 +162,17 @@ class ControlPlane:
             raise PermissionError("inactive actor or agent version")
         if user.tenant_id != tenant or assistant.tenant_id != tenant or agent.tenant_id != tenant:
             raise PermissionError("tenant mismatch")
+        route = self.store.get_agent_route(tenant, agent_id)
+        if route is not None and self.store.select_agent_version(tenant, agent_id, requested_by) != agent_version:
+            raise PermissionError("agent version is not routed to this member")
         binding = self.store.get_binding(requested_by, tenant)
         if binding is None or binding["assistant_actor_id"] != assistant_actor_id:
             raise PermissionError("assistant is not bound to member")
         task = TaskRun(task_run_id=task_run_id or _id("run"), tenant_id=tenant, requested_by=requested_by,
                        assistant_actor_id=assistant_actor_id, agent_id=agent_id, agent_version=agent_version,
-                       status=TaskRunStatus.QUEUED, input_ref_hash=input_ref_hash)
+                       status=TaskRunStatus.QUEUED, input_ref_hash=input_ref_hash,
+                       release_mode=("CANARY" if route is not None and route["status"] == "CANARY"
+                                     and route["canary_version"] == agent_version else "STABLE"))
         if dispatch_key:
             dispatch_data = {
                 "requested_by": requested_by,
@@ -277,6 +282,10 @@ class ControlPlane:
         agent = self._actor(task.agent_id)
         version = self._agent_version(task.agent_id, task.agent_version)
         intersection = user.capabilities & assistant.capabilities & agent.capabilities & version.capabilities
+        route = self.store.get_agent_route(task.tenant_id, task.agent_id)
+        if (task.release_mode == "CANARY" or route is not None and route["status"] == "CANARY"
+                and route["canary_version"] == task.agent_version):
+            return AuthorizationDecision(False, False, intersection, "canary version is suggestion-only")
         required = frozenset(tool.required_capabilities)
         missing = required - intersection
         if not all(actor.active for actor in (user, assistant, agent)) or not version.active:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
 
@@ -154,6 +155,8 @@ class TaskRun:
     current_step_id: str | None = None
     failure_reason: str | None = None
     warnings: list[str] = field(default_factory=list)
+    release_mode: str = "STABLE"
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 @dataclass(frozen=True)

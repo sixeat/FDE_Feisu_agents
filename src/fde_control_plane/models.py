@@ -156,6 +156,7 @@ class TaskRun:
     failure_reason: str | None = None
     warnings: list[str] = field(default_factory=list)
     release_mode: str = "STABLE"
+    canary_epoch: int | None = None
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 

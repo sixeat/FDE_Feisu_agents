@@ -14,7 +14,6 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
-from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any, Iterable
@@ -80,6 +79,12 @@ class SQLiteStore:
                 decided_by TEXT NOT NULL, reason TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS member_reviewer_role_changes (
+                audit_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL, reviewer INTEGER NOT NULL,
+                decided_by TEXT NOT NULL, reason TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS agent_versions (
                 agent_id TEXT NOT NULL, version INTEGER NOT NULL,
                 capabilities_json TEXT NOT NULL, active INTEGER NOT NULL,
@@ -108,6 +113,7 @@ class SQLiteStore:
                 agent_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
                 stable_version INTEGER NOT NULL, canary_version INTEGER,
                 volunteer_ids_json TEXT NOT NULL, status TEXT NOT NULL,
+                canary_epoch INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS agent_volunteer_consents (
@@ -116,6 +122,14 @@ class SQLiteStore:
                 active INTEGER NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (tenant_id, agent_id, member_id)
             );
+            CREATE TABLE IF NOT EXISTS agent_canary_reviews (
+                task_run_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+                agent_version INTEGER NOT NULL, reviewer_id TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK(outcome IN ('PASS', 'FAIL')),
+                evidence_ref TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_canary_reviews_agent
+                ON agent_canary_reviews(tenant_id, agent_id, agent_version);
             CREATE TRIGGER IF NOT EXISTS agent_version_config_immutable
             BEFORE UPDATE ON agent_versions
             WHEN NEW.agent_id IS NOT OLD.agent_id OR NEW.version IS NOT OLD.version
@@ -143,6 +157,12 @@ class SQLiteStore:
             CREATE TRIGGER IF NOT EXISTS agent_evaluation_no_delete
             BEFORE DELETE ON agent_evaluations
             BEGIN SELECT RAISE(ABORT, 'immutable evaluation'); END;
+            CREATE TRIGGER IF NOT EXISTS agent_canary_review_no_update
+            BEFORE UPDATE ON agent_canary_reviews
+            BEGIN SELECT RAISE(ABORT, 'immutable canary review'); END;
+            CREATE TRIGGER IF NOT EXISTS agent_canary_review_no_delete
+            BEFORE DELETE ON agent_canary_reviews
+            BEGIN SELECT RAISE(ABORT, 'immutable canary review'); END;
             CREATE TABLE IF NOT EXISTS agent_pauses (
                 audit_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
                 expected_version INTEGER, decided_by TEXT NOT NULL, reason TEXT NOT NULL,
@@ -353,6 +373,10 @@ class SQLiteStore:
             "PRAGMA table_info(assistant_card_deliveries)").fetchall()}
         if "review_snapshot" not in card_columns:
             self.connection.execute("ALTER TABLE assistant_card_deliveries ADD COLUMN review_snapshot TEXT")
+        route_columns = {row["name"] for row in self.connection.execute(
+            "PRAGMA table_info(agent_routes)").fetchall()}
+        if "canary_epoch" not in route_columns:
+            self.connection.execute("ALTER TABLE agent_routes ADD COLUMN canary_epoch INTEGER NOT NULL DEFAULT 0")
         self.connection.commit()
 
     @staticmethod
@@ -913,6 +937,72 @@ class SQLiteStore:
             (tenant_id, agent_id, version),
         ).fetchone()
 
+    def agent_canary_runs(self, tenant_id: str, agent_id: str) -> list[dict[str, Any]]:
+        """Return only metadata for runs in the current canary window."""
+        route = self.get_agent_route(tenant_id, agent_id)
+        if route is None or route["status"] != "CANARY":
+            return []
+        rows = self.connection.execute(
+            "SELECT data_json FROM task_runs WHERE tenant_id = ?", (tenant_id,),
+        ).fetchall()
+        runs = []
+        for row in rows:
+            run = json.loads(row["data_json"])
+            if (run.get("agent_id") == agent_id and run.get("agent_version") == route["canary_version"]
+                    and run.get("release_mode") == "CANARY"
+                    and run.get("canary_epoch") == route["canary_epoch"]):
+                runs.append(run)
+        return runs
+
+    def list_agent_canary_reviews(self, tenant_id: str, agent_id: str,
+                                  task_run_ids: list[str]) -> dict[str, sqlite3.Row]:
+        if not task_run_ids:
+            return {}
+        result: dict[str, sqlite3.Row] = {}
+        for start in range(0, len(task_run_ids), 500):
+            chunk = task_run_ids[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.connection.execute(
+                f"SELECT task_run_id, outcome, reviewer_id, evidence_ref, created_at "
+                f"FROM agent_canary_reviews WHERE tenant_id = ? AND agent_id = ? "
+                f"AND task_run_id IN ({placeholders})",
+                (tenant_id, agent_id, *chunk),
+            ).fetchall()
+            result.update({row["task_run_id"]: row for row in rows})
+        return result
+
+    def save_agent_canary_review(self, *, tenant_id: str, agent_id: str, task_run_id: str,
+                                 expected_version: int, reviewer_id: str, outcome: str,
+                                 evidence_ref: str, event: Any) -> bool:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            route = self.get_agent_route(tenant_id, agent_id)
+            snapshot = self.get_agent_snapshot(tenant_id, agent_id, expected_version)
+            run = self.get_task_run(task_run_id)
+            draft = (self.get_agent_config_draft(snapshot["draft_id"], tenant_id)
+                     if snapshot is not None else None)
+            current_ids = {item["task_run_id"] for item in self.agent_canary_runs(tenant_id, agent_id)}
+            if (route is None or route["status"] != "CANARY"
+                    or route["canary_version"] != expected_version or draft is None
+                    or draft["created_by"] == reviewer_id or run is None
+                    or task_run_id not in current_ids or run.get("status") != "WAITING_REVIEW"
+                    or self.connection.execute(
+                        "SELECT 1 FROM agent_canary_reviews WHERE task_run_id = ?", (task_run_id,),
+                    ).fetchone() is not None):
+                self.connection.rollback()
+                return False
+            self.connection.execute(
+                "INSERT INTO agent_canary_reviews(task_run_id, tenant_id, agent_id, agent_version, "
+                "reviewer_id, outcome, evidence_ref) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (task_run_id, tenant_id, agent_id, expected_version, reviewer_id, outcome, evidence_ref),
+            )
+            self._insert_agent_audit(event)
+            self.connection.commit()
+            return True
+        except Exception:
+            self.connection.rollback()
+            raise
+
     def latest_agent_evaluation(self, tenant_id: str, draft_id: str, input_hash: str) -> sqlite3.Row | None:
         return self.connection.execute(
             "SELECT * FROM agent_evaluations WHERE tenant_id = ? AND draft_id = ? AND input_hash = ? "
@@ -1159,7 +1249,8 @@ class SQLiteStore:
                 )
                 self.connection.execute(
                     "UPDATE agent_routes SET canary_version = ?, volunteer_ids_json = ?, "
-                    "status = 'CANARY', updated_at = CURRENT_TIMESTAMP WHERE agent_id = ?",
+                    "status = 'CANARY', canary_epoch = canary_epoch + 1, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE agent_id = ?",
                     (target_version, self._json(volunteer_ids), agent_id),
                 )
             elif action == "PROMOTE":
@@ -1173,19 +1264,16 @@ class SQLiteStore:
                 if observed is None or observed["seconds"] is None or observed["seconds"] < 60:
                     self.connection.rollback()
                     return False
-                canary_started = datetime.strptime(route["updated_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                sample_rows = self.connection.execute(
-                    "SELECT data_json FROM task_runs WHERE tenant_id = ?", (tenant_id,),
-                ).fetchall()
-                samples = []
-                for sample_row in sample_rows:
-                    run = json.loads(sample_row["data_json"])
-                    if (run.get("agent_id") == agent_id and run.get("agent_version") == target_version
-                            and run.get("release_mode") == "CANARY" and run.get("created_at")
-                            and datetime.fromisoformat(run["created_at"]) >= canary_started):
-                        samples.append(run)
+                samples = self.agent_canary_runs(tenant_id, agent_id)
+                reviews = self.list_agent_canary_reviews(
+                    tenant_id, agent_id, [run["task_run_id"] for run in samples],
+                )
                 if (len(samples) < 2 or any(run.get("status") != "WAITING_REVIEW"
-                                            or run.get("failure_reason") for run in samples)):
+                                            or run.get("failure_reason")
+                                            or run["task_run_id"] not in reviews
+                                            or reviews[run["task_run_id"]]["outcome"] != "PASS"
+                                            or reviews[run["task_run_id"]]["reviewer_id"] == event.actor_id
+                                            for run in samples)):
                     self.connection.rollback()
                     return False
                 snapshot = self.get_agent_snapshot(tenant_id, agent_id, target_version)
@@ -1653,6 +1741,56 @@ class SQLiteStore:
     def latest_member_status_changes(self, tenant_id: str) -> dict[str, sqlite3.Row]:
         rows = self.connection.execute(
             "SELECT actor_id, active, reason, created_at FROM member_status_changes "
+            "WHERE tenant_id = ? ORDER BY rowid DESC", (tenant_id,),
+        ).fetchall()
+        return {row["actor_id"]: row for row in reversed(rows)}
+
+    def set_member_reviewer_role(self, tenant_id: str, actor_id: str, expected_reviewer: bool,
+                                 reviewer: bool, reason: str, event: Any) -> bool:
+        """Compare and change an active member's reviewer role with its audit record."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT roles_json FROM actors WHERE tenant_id = ? AND actor_id = ? "
+                "AND actor_type = 'USER' AND external_ref_hash IS NOT NULL AND active = 1",
+                (tenant_id, actor_id),
+            ).fetchone()
+            if row is None:
+                self.connection.rollback()
+                return False
+            roles = set(json.loads(row["roles_json"]))
+            if "admin" in roles or ("agent_reviewer" in roles) != expected_reviewer \
+                    or expected_reviewer == reviewer:
+                self.connection.rollback()
+                return False
+            if reviewer:
+                roles.add("agent_reviewer")
+            else:
+                roles.remove("agent_reviewer")
+            self.connection.execute(
+                "UPDATE actors SET roles_json = ? WHERE tenant_id = ? AND actor_id = ?",
+                (self._json(sorted(roles)), tenant_id, actor_id),
+            )
+            self.connection.execute(
+                "INSERT INTO member_reviewer_role_changes(audit_id, tenant_id, actor_id, reviewer, decided_by, reason) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (event.audit_id, tenant_id, actor_id, int(reviewer), event.actor_id, reason),
+            )
+            self.connection.execute(
+                "INSERT INTO audit_events(audit_id, event_type, tenant_id, task_run_id, data_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (event.audit_id, event.event_type, event.tenant_id, event.task_run_id,
+                 self._json(asdict(event))),
+            )
+            self.connection.commit()
+            return True
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def latest_member_reviewer_role_changes(self, tenant_id: str) -> dict[str, sqlite3.Row]:
+        rows = self.connection.execute(
+            "SELECT actor_id, reviewer, reason, created_at FROM member_reviewer_role_changes "
             "WHERE tenant_id = ? ORDER BY rowid DESC", (tenant_id,),
         ).fetchall()
         return {row["actor_id"]: row for row in reversed(rows)}

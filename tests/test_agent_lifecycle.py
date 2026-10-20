@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 
-from fde_control_plane import Actor, ActorType, AgentVersion, RiskLevel, TaskRunStatus, ToolDefinition
+from fde_control_plane import Actor, ActorType, AgentVersion, RiskLevel, SQLiteStore, TaskRunStatus, ToolDefinition
 from test_meeting_review_web import switch_user, web_setup
 
 
@@ -33,10 +33,28 @@ def _draft(client, headers, *, base_version=None, description="只读建议与�
     return result.json()["draft_id"]
 
 
+def test_existing_agent_route_database_adds_canary_epoch_without_losing_route(tmp_path):
+    path = tmp_path / "existing.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE agent_routes (agent_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, "
+            "stable_version INTEGER NOT NULL, canary_version INTEGER, "
+            "volunteer_ids_json TEXT NOT NULL, status TEXT NOT NULL, "
+            "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        connection.execute(
+            "INSERT INTO agent_routes(agent_id, tenant_id, stable_version, canary_version, "
+            "volunteer_ids_json, status) VALUES ('sample', 'tenant', 1, NULL, '[]', 'ACTIVE')"
+        )
+    with SQLiteStore(path) as store:
+        route = store.get_agent_route("tenant", "sample")
+        assert route["stable_version"] == 1 and route["canary_epoch"] == 0
+
+
 def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
     cp, _, client, member_headers, _, _, _ = web_setup(tmp_path)
     cp.register_actor(Actor("reviewer", "tenant", ActorType.USER, frozenset(),
-                            roles=frozenset({"agent_reviewer"}), external_ref_hash="reviewer-subject"))
+                            external_ref_hash="reviewer-subject"))
     reviewer_headers = switch_user(cp, client, "reviewer", "reviewer-subject")
     dataset = {"dataset_id": "sample-regression-v1", "cases": [
         {"case_id": "case-read", "expected_hash": hashlib.sha256(b"READ").hexdigest(),
@@ -44,6 +62,14 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
         {"case_id": "case-human", "expected_hash": hashlib.sha256(b"ASK_HUMAN").hexdigest(),
          "evidence_ref": "fixture-human"},
     ]}
+    assert client.post("/api/meetings/agent-evaluation-datasets", json=dataset,
+                       headers=reviewer_headers).status_code == 403
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    grant = client.post("/api/meetings/member-directory/reviewer/reviewer-role", json={
+        "expected_reviewer": False, "reviewer": True, "reason": "授权独立审核样例 Agent",
+    }, headers=admin_headers)
+    assert grant.status_code == 200 and grant.json()["reviewer"] is True
+    reviewer_headers = switch_user(cp, client, "reviewer", "reviewer-subject")
     assert client.post("/api/meetings/agent-evaluation-datasets", json=dataset,
                        headers=reviewer_headers).status_code == 200
     assert client.post("/api/meetings/agent-evaluation-datasets", json=dataset,
@@ -138,14 +164,66 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
     run3 = cp.create_task_run("member", "assistant", "sample-lifecycle-agent", 2)
     run3.status = TaskRunStatus.WAITING_REVIEW
     cp.store.save_task_run(run3)
-    assert client.post(route + "/promote", json={**payload, "volunteer_ids": []},
-                       headers=admin_headers).status_code == 409
     cp.store.connection.execute(
         "UPDATE agent_routes SET updated_at = datetime('now', '-2 minutes') WHERE agent_id = ?",
         ("sample-lifecycle-agent",),
     )
+    assert client.post(route + "/promote", json={**payload, "volunteer_ids": []},
+                       headers=admin_headers).status_code == 409
+    reviewer_headers = switch_user(cp, client, "reviewer", "reviewer-subject")
+    candidate_runs = client.get(route + "/canary-runs").json()["runs"]
+    assert {item["task_run_id"] for item in candidate_runs} == {run2.task_run_id, run3.task_run_id}
+    failed_review = {"expected_version": 2, "outcome": "FAIL", "evidence_ref": "fixture:badcase"}
+    assert client.post(route + f"/canary-runs/{run2.task_run_id}/review", json=failed_review,
+                       headers=reviewer_headers).status_code == 200
+    assert client.post(route + f"/canary-runs/{run2.task_run_id}/review", json=failed_review,
+                       headers=reviewer_headers).status_code == 409
+    passed_review = {"expected_version": 2, "outcome": "PASS", "evidence_ref": "fixture:reviewed"}
+    assert client.post(route + f"/canary-runs/{run3.task_run_id}/review", json=passed_review,
+                       headers=reviewer_headers).status_code == 200
+    with pytest.raises(sqlite3.IntegrityError, match="immutable canary review"):
+        cp.store.connection.execute(
+            "UPDATE agent_canary_reviews SET outcome = 'PASS' WHERE task_run_id = ?",
+            (run2.task_run_id,),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="immutable canary review"):
+        cp.store.connection.execute(
+            "DELETE FROM agent_canary_reviews WHERE task_run_id = ?", (run2.task_run_id,),
+        )
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    reviewed_runs = client.get(route + "/canary-runs").json()["runs"]
+    assert {run["reviewer_id"] for run in reviewed_runs} == {"reviewer"}
+    assert {run["evidence_ref"] for run in reviewed_runs} == {"fixture:badcase", "fixture:reviewed"}
+    assert client.post(route + "/promote", json={**payload, "volunteer_ids": []},
+                       headers=admin_headers).status_code == 409
+    first_epoch = run2.canary_epoch
+    assert client.post(route + "/rollback", json={"expected_version": 1, "target_version": 1,
+        "reason": "灰度失败后回到稳定版"}, headers=admin_headers).status_code == 200
+    member_headers = switch_user(cp, client, "member", hashlib.sha256(b"ou_submitter").hexdigest())
+    assert client.post(route + "/volunteer", json=consent, headers=member_headers).status_code == 200
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    assert client.post(route + "/canary", json=payload, headers=admin_headers).status_code == 200
+    fresh_runs = []
+    for _ in range(2):
+        run = cp.create_task_run("member", "assistant", "sample-lifecycle-agent", 2)
+        run.status = TaskRunStatus.WAITING_REVIEW
+        cp.store.save_task_run(run)
+        fresh_runs.append(run)
+    assert all(run.canary_epoch != first_epoch for run in fresh_runs)
+    cp.store.connection.execute(
+        "UPDATE agent_routes SET updated_at = datetime('now', '-2 minutes') WHERE agent_id = ?",
+        ("sample-lifecycle-agent",),
+    )
+    reviewer_headers = switch_user(cp, client, "reviewer", "reviewer-subject")
+    assert {item["task_run_id"] for item in client.get(route + "/canary-runs").json()["runs"]} == {
+        run.task_run_id for run in fresh_runs
+    }
+    for run in fresh_runs:
+        assert client.post(route + f"/canary-runs/{run.task_run_id}/review", json=passed_review,
+                           headers=reviewer_headers).status_code == 200
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
     diagnostics = client.get(route + "/diagnostics").json()
-    assert diagnostics["total"] == 3 and diagnostics["versions"]["1"]["failures"] == 1
+    assert diagnostics["total"] == 5 and diagnostics["versions"]["1"]["failures"] == 1
     comparison = client.get(route + "/compare?old_version=1&new_version=2").json()
     assert comparison["changes"]["description"]["old"] != comparison["changes"]["description"]["new"]
     assert client.post(route + "/promote", json={**payload, "volunteer_ids": []},
@@ -163,7 +241,7 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
                 if agent["agent_id"] == "sample-lifecycle-agent")["status"] == "ARCHIVED"
     assert dict(cp.store.get_agent_snapshot("tenant", "sample-lifecycle-agent", 1)) == snapshot1
     events = [event["event_type"] for event in cp.store.list_audits()]
-    assert all(name in events for name in ("AGENT_EVALUATED", "AGENT_CANARY", "AGENT_PROMOTE",
+    assert all(name in events for name in ("AGENT_EVALUATED", "AGENT_CANARY", "AGENT_CANARY_REVIEWED", "AGENT_PROMOTE",
                                       "AGENT_ROLLBACK", "AGENT_ARCHIVE"))
 
 

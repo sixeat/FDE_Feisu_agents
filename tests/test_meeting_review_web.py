@@ -270,8 +270,8 @@ def test_member_access_requires_admin_and_preserves_meeting_isolation(tmp_path):
     assert subject_hash not in listed.text
     directory = client.get("/api/meetings/member-directory")
     assert directory.status_code == 200
-    assert directory.json()["members"] == [{"actor_id": "admin", "display_name": None, "role": "ADMIN", "status": "ACTIVE", "joined_at": None, "status_reason": None},
-                                            {"actor_id": "member", "display_name": None, "role": "MEMBER", "status": "ACTIVE", "joined_at": None, "status_reason": None}]
+    assert directory.json()["members"] == [{"actor_id": "admin", "display_name": None, "role": "ADMIN", "reviewer": False, "status": "ACTIVE", "joined_at": None, "status_reason": None, "reviewer_reason": None},
+                                            {"actor_id": "member", "display_name": None, "role": "MEMBER", "reviewer": False, "status": "ACTIVE", "joined_at": None, "status_reason": None, "reviewer_reason": None}]
     assert "admin-subject" not in directory.text
     cp.store.connection.execute(
         "INSERT INTO member_profiles(actor_id, tenant_id, display_name) VALUES ('member', 'tenant', '飞书测试员')"
@@ -464,6 +464,61 @@ def test_member_status_change_is_admin_only_atomic_and_reversible(tmp_path):
     assert restored.status_code == 200
     row = next(item for item in client.get("/api/meetings/member-directory").json()["members"] if item["actor_id"] == "member")
     assert row["status"] == "ACTIVE" and row["status_reason"] == "成员账号复核通过"
+
+
+def test_reviewer_role_grant_and_revocation_are_audited_and_take_effect_immediately(tmp_path):
+    cp, _, client, _, _, _, _ = web_setup(tmp_path)
+    cp.register_actor(Actor("reviewer", "tenant", ActorType.USER, frozenset(),
+                            roles=frozenset({"observer"}), external_ref_hash="reviewer-subject"))
+    cp.register_actor(Actor("outsider", "other-tenant", ActorType.USER, frozenset(),
+                            external_ref_hash="outsider-subject"))
+    reviewer_headers = switch_user(cp, client, "reviewer", "reviewer-subject")
+    reviewer_session = client.cookies.get("fde_auth_session")
+    assert client.get("/api/meetings/agent-drafts").json()["can_precheck"] is False
+    url = "/api/meetings/member-directory/reviewer/reviewer-role"
+    grant = {"expected_reviewer": False, "reviewer": True, "reason": "指定独立审核样例 Agent"}
+    assert client.post(url, json=grant, headers=reviewer_headers).status_code == 403
+
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    assert client.post(url, json=grant).status_code == 403
+    assert client.post(url, json=grant, headers={**admin_headers, "Origin": "https://evil.test"}).status_code == 403
+    assert client.post("/api/meetings/member-directory/outsider/reviewer-role",
+                       json=grant, headers=admin_headers).status_code == 404
+    assert client.post("/api/meetings/member-directory/admin/reviewer-role",
+                       json=grant, headers=admin_headers).status_code == 409
+    assert client.post(url, json={**grant, "reviewer": False}, headers=admin_headers).status_code == 422
+    assert client.post(url, json={**grant, "reason": "     "}, headers=admin_headers).status_code == 422
+    granted = client.post(url, json=grant, headers=admin_headers)
+    assert granted.status_code == 200 and granted.json() == {
+        "actor_id": "reviewer", "reviewer": True, "remote_write": False,
+    }
+    assert client.post(url, json=grant, headers=admin_headers).status_code == 409
+    directory = next(item for item in client.get("/api/meetings/member-directory").json()["members"]
+                     if item["actor_id"] == "reviewer")
+    assert directory["reviewer"] is True and directory["reviewer_reason"] == grant["reason"]
+    assert set(json.loads(cp.store.get_actor("reviewer")["roles_json"])) == {"observer", "agent_reviewer"}
+
+    client.cookies.set("fde_auth_session", reviewer_session)
+    assert client.get("/api/meetings/agent-drafts").json()["can_precheck"] is True
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    revoke = {"expected_reviewer": True, "reviewer": False, "reason": "样例评审职责已经结束"}
+    assert client.post(url, json=revoke, headers=admin_headers).status_code == 200
+    assert client.post(url, json=revoke, headers=admin_headers).status_code == 409
+    assert set(json.loads(cp.store.get_actor("reviewer")["roles_json"])) == {"observer"}
+    assert cp.store.connection.execute(
+        "SELECT reviewer, reason FROM member_reviewer_role_changes WHERE tenant_id = ? ORDER BY rowid",
+        ("tenant",),
+    ).fetchall()[1]["reason"] == revoke["reason"]
+    assert len([event for event in cp.store.list_audits()
+                if event["event_type"] == "MEMBER_REVIEWER_ROLE_CHANGED"]) == 2
+    client.cookies.set("fde_auth_session", reviewer_session)
+    assert client.get("/api/meetings/agent-drafts").json()["can_precheck"] is False
+
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    assert client.post("/api/meetings/member-directory/reviewer/status", json={
+        "expected_status": "ACTIVE", "status": "INACTIVE", "reason": "暂停该成员账号",
+    }, headers=admin_headers).status_code == 200
+    assert client.post(url, json=grant, headers=admin_headers).status_code == 409
 
 
 def test_admin_pause_blocks_existing_approval_and_new_dispatch_without_changing_version(tmp_path):

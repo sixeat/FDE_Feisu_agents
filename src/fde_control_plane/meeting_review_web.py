@@ -124,6 +124,14 @@ class AgentVolunteerRequest(BaseModel):
     enroll: StrictBool
 
 
+class AgentCanaryReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int = Field(ge=1)
+    outcome: Literal["PASS", "FAIL"]
+    evidence_ref: StrictStr = Field(min_length=3, max_length=200,
+                                    pattern=r"^[A-Za-z0-9_.:-]+$")
+
+
 class AgentPauseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_version: int | None = Field(default=None, ge=1)
@@ -140,6 +148,13 @@ class MemberStatusRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_status: Literal["ACTIVE", "INACTIVE"]
     status: Literal["ACTIVE", "INACTIVE"]
+    reason: StrictStr = Field(min_length=5, max_length=500)
+
+
+class MemberReviewerRoleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_reviewer: StrictBool
+    reviewer: StrictBool
     reason: StrictStr = Field(min_length=5, max_length=500)
 
 
@@ -254,6 +269,47 @@ class MeetingReviewWebService:
         if actor is None or actor["tenant_id"] != identity.tenant_id:
             raise HTTPException(404, "Agent 不存在")
         return {"agent_id": agent_id, **self.cp.store.agent_run_diagnostics(identity.tenant_id, agent_id)}
+
+    def agent_canary_runs(self, agent_id: str, identity: IdentityContext) -> dict[str, Any]:
+        if not self.can_precheck_agent_config(identity):
+            raise HTTPException(403, "只有审核官或管理员可以查看灰度运行记录")
+        route = self.cp.store.get_agent_route(identity.tenant_id, agent_id)
+        if route is None or route["status"] != "CANARY":
+            raise HTTPException(409, "Agent 当前没有灰度版本")
+        runs = self.cp.store.agent_canary_runs(identity.tenant_id, agent_id)
+        reviews = self.cp.store.list_agent_canary_reviews(
+            identity.tenant_id, agent_id, [run["task_run_id"] for run in runs],
+        )
+        return {"agent_id": agent_id, "candidate_version": int(route["canary_version"]),
+                "runs": [{"task_run_id": run["task_run_id"], "status": run["status"],
+                          "created_at": run["created_at"],
+                          "review_outcome": reviews[run["task_run_id"]]["outcome"]
+                          if run["task_run_id"] in reviews else None,
+                          "reviewer_id": reviews[run["task_run_id"]]["reviewer_id"]
+                          if run["task_run_id"] in reviews else None,
+                          "evidence_ref": reviews[run["task_run_id"]]["evidence_ref"]
+                          if run["task_run_id"] in reviews else None}
+                         for run in runs]}
+
+    def review_agent_canary_run(self, agent_id: str, task_run_id: str,
+                                identity: IdentityContext, body: AgentCanaryReviewRequest) -> dict[str, Any]:
+        if not self.can_precheck_agent_config(identity):
+            raise HTTPException(403, "只有审核官或管理员可以评审灰度运行")
+        event = AuditEvent(
+            audit_id="audit-" + secrets.token_hex(12), event_type="AGENT_CANARY_REVIEWED",
+            tenant_id=identity.tenant_id, actor_id=identity.actor_id, task_run_id=task_run_id,
+            correlation_id=None, payload_hash=hashlib.sha256(json.dumps({
+                "agent_id": agent_id, "version": body.expected_version,
+                "outcome": body.outcome, "evidence_ref": body.evidence_ref,
+            }, sort_keys=True).encode()).hexdigest(), outcome=body.outcome,
+        )
+        if not self.cp.store.save_agent_canary_review(
+                tenant_id=identity.tenant_id, agent_id=agent_id, task_run_id=task_run_id,
+                expected_version=body.expected_version, reviewer_id=identity.actor_id,
+                outcome=body.outcome, evidence_ref=body.evidence_ref, event=event):
+            raise HTTPException(409, "灰度任务、版本或评审状态已变化")
+        return {"agent_id": agent_id, "task_run_id": task_run_id,
+                "outcome": body.outcome, "remote_write": False}
 
     def agent_comparison(self, agent_id: str, old_version: int, new_version: int,
                          identity: IdentityContext) -> dict[str, Any]:
@@ -484,13 +540,17 @@ class MeetingReviewWebService:
         if not self.can_confirm_agent_config(identity):
             raise HTTPException(403, "只有管理员可以查看成员目录")
         changes = self.cp.store.latest_member_status_changes(identity.tenant_id)
+        reviewer_changes = self.cp.store.latest_member_reviewer_role_changes(identity.tenant_id)
         return [{
             "actor_id": row["actor_id"],
             "display_name": row["display_name"],
             "role": "ADMIN" if "admin" in json.loads(row["roles_json"]) else "MEMBER",
+            "reviewer": "agent_reviewer" in json.loads(row["roles_json"]),
             "status": "ACTIVE" if row["active"] else "INACTIVE",
             "joined_at": row["joined_at"],
             "status_reason": changes[row["actor_id"]]["reason"] if row["actor_id"] in changes else None,
+            "reviewer_reason": reviewer_changes[row["actor_id"]]["reason"]
+                               if row["actor_id"] in reviewer_changes else None,
         } for row in self.cp.store.list_member_directory(identity.tenant_id)]
 
     def set_member_status(self, actor_id: str, identity: IdentityContext,
@@ -522,6 +582,37 @@ class MeetingReviewWebService:
         if not self.cp.store.set_member_active(identity.tenant_id, actor_id, expected_active, active, reason, event):
             raise HTTPException(409, "成员状态已变化，请刷新目录后核对")
         return {"actor_id": actor_id, "status": body.status, "remote_write": False}
+
+    def set_member_reviewer_role(self, actor_id: str, identity: IdentityContext,
+                                 body: MemberReviewerRoleRequest) -> dict[str, Any]:
+        if not self.can_confirm_agent_config(identity):
+            raise HTTPException(403, "只有管理员可以变更审核官角色")
+        target = self.cp.store.get_actor(actor_id)
+        if target is None or target["tenant_id"] != identity.tenant_id or target["actor_type"] != "USER" \
+                or not target["external_ref_hash"]:
+            raise HTTPException(404, "成员不存在或不属于当前租户")
+        if actor_id == identity.actor_id or "admin" in json.loads(target["roles_json"]):
+            raise HTTPException(409, "不能通过此入口变更管理员角色")
+        if not target["active"]:
+            raise HTTPException(409, "只有已启用成员可以担任审核官")
+        if body.expected_reviewer == body.reviewer:
+            raise HTTPException(422, "目标角色必须与当前角色不同")
+        reason = body.reason.strip()
+        if len(reason) < 5:
+            raise HTTPException(422, "请填写至少 5 个字的原因")
+        payload = {"actor_id": actor_id, "expected_reviewer": body.expected_reviewer,
+                   "reviewer": body.reviewer, "reason": reason}
+        event = AuditEvent(
+            audit_id="audit-" + secrets.token_hex(12), event_type="MEMBER_REVIEWER_ROLE_CHANGED",
+            tenant_id=identity.tenant_id, actor_id=identity.actor_id,
+            task_run_id=None, correlation_id=None,
+            payload_hash=hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode()).hexdigest(),
+            outcome="GRANTED" if body.reviewer else "REVOKED",
+        )
+        if not self.cp.store.set_member_reviewer_role(identity.tenant_id, actor_id,
+                                                      body.expected_reviewer, body.reviewer, reason, event):
+            raise HTTPException(409, "审核官角色或成员状态已变化，请刷新目录后核对")
+        return {"actor_id": actor_id, "reviewer": body.reviewer, "remote_write": False}
 
     def approve_member_access(self, request_id: str, identity: IdentityContext) -> dict[str, Any]:
         if not self.can_confirm_agent_config(identity):
@@ -1100,6 +1191,18 @@ def build_meeting_review_router(
         with service.lock:
             return service.agent_diagnostics(agent_id, identity)
 
+    @router.get("/agents/{agent_id}/canary-runs")
+    def agent_canary_runs(agent_id: str, identity: IdentityContext = Depends(require_identity)):
+        with service.lock:
+            return service.agent_canary_runs(agent_id, identity)
+
+    @router.post("/agents/{agent_id}/canary-runs/{task_run_id}/review")
+    def review_agent_canary_run(agent_id: str, task_run_id: str, body: AgentCanaryReviewRequest,
+                                request: Request, identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        with service.lock:
+            return service.review_agent_canary_run(agent_id, task_run_id, identity, body)
+
     @router.get("/agents/{agent_id}/compare")
     def compare_agent(agent_id: str, old_version: int, new_version: int,
                       identity: IdentityContext = Depends(require_identity)):
@@ -1160,6 +1263,13 @@ def build_meeting_review_router(
         check_csrf(request)
         with service.lock:
             return service.set_member_status(actor_id, identity, body)
+
+    @router.post("/member-directory/{actor_id}/reviewer-role")
+    def set_member_reviewer_role(actor_id: str, body: MemberReviewerRoleRequest, request: Request,
+                                 identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        with service.lock:
+            return service.set_member_reviewer_role(actor_id, identity, body)
 
     @router.get("/audit")
     def get_audit(request: Request, identity: IdentityContext = Depends(require_identity)):

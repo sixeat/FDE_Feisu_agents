@@ -184,6 +184,13 @@ function renderAgents() {
       button.type="button";button.addEventListener("click",()=>changeAgentVolunteer(agent,button));
       actions.append(button);card.append(actions);
     }
+    if(agent.status==="CANARY" && agentState.canPrecheck){
+      const actions=node("div",undefined,"commands agent-review-actions");
+      const button=node("button","查看并评审灰度运行");button.type="button";
+      const details=node("div",undefined,"agent-draft-row");details.hidden=true;
+      button.addEventListener("click",()=>loadCanaryRuns(agent,details,button));
+      actions.append(button);card.append(actions,details);
+    }
     if(agentState.canPause && agent.status!=="PAUSED" && agent.status!=="ARCHIVED"){
       const actions=node("div",undefined,"commands agent-review-actions"),button=node("button","暂停 Agent");
       button.type="button";button.addEventListener("click",()=>pauseAgent(agent,button));actions.append(button);card.append(actions);
@@ -206,6 +213,42 @@ function renderAgents() {
     }
     panel.append(card);
   });
+}
+async function loadCanaryRuns(agent,panel,button){
+  button.disabled=true;panel.hidden=false;panel.replaceChildren(node("p","正在读取灰度运行元数据…","muted"));
+  try{
+    const result=await api(`/api/meetings/agents/${encodeURIComponent(agent.agent_id)}/canary-runs`);
+    panel.replaceChildren();
+    if(!result.runs.length){panel.append(node("p","当前灰度期还没有运行记录。","muted"));return;}
+    result.runs.forEach(run=>{
+      const row=node("div",undefined,"agent-draft-row");
+      row.append(node("p",`运行 ${run.task_run_id} · ${taskNames[run.status]||run.status} · ${run.review_outcome||"待独立评审"}`,"muted"));
+      if(run.review_outcome)row.append(node("p",`审核人：${run.reviewer_id} · 证据编号：${run.evidence_ref}`,"muted"));
+      if(run.status==="WAITING_REVIEW" && !run.review_outcome){
+        for(const [outcome,label] of [["PASS","通过"],["FAIL","未通过"]]){
+          const reviewButton=node("button",label);reviewButton.type="button";
+          reviewButton.addEventListener("click",()=>submitCanaryReview(agent,run,outcome,panel,button));
+          row.append(reviewButton);
+        }
+      }
+      panel.append(row);
+    });
+  }catch(error){panel.replaceChildren(node("p",error.message,"error"));}
+  finally{button.disabled=false;}
+}
+async function submitCanaryReview(agent,run,outcome,panel,button){
+  if(agentState.busy)return;
+  const evidence_ref=window.prompt("请填写独立核对材料的引用编号（不填正文或链接）：");
+  if(evidence_ref===null)return;
+  if(!/^[A-Za-z0-9_.:-]{3,200}$/.test(evidence_ref)){agentNotice("证据引用需为 3–200 位编号。","error");return;}
+  if(!window.confirm(`确认将运行 ${run.task_run_id} 评为 ${outcome}？评审记录不可修改。`))return;
+  agentState.busy=true;
+  try{await api(`/api/meetings/agents/${encodeURIComponent(agent.agent_id)}/canary-runs/${encodeURIComponent(run.task_run_id)}/review`,{
+    method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":agentState.csrf},
+    body:JSON.stringify({expected_version:agent.canary_version,outcome,evidence_ref})
+  });agentNotice("灰度运行评审已记录。","success");await loadCanaryRuns(agent,panel,button);}
+  catch(error){agentNotice(error.message,"error");}
+  finally{agentState.busy=false;}
 }
 async function changeAgentVolunteer(agent,button){
   if(agentState.busy)return;
@@ -339,12 +382,18 @@ function renderMemberDirectory() {
   memberState.members.forEach(member=>{
     const row=node("article",undefined,"member-row"),head=node("div",undefined,"agent-row-head");
     head.append(node("h3",member.display_name||member.actor_id),node("span",member.status==="ACTIVE"?"已启用":"已停用",`badge ${member.status==="ACTIVE"?"ready":"closed"}`));
-    row.append(head,node("p",`成员编号：${member.actor_id} · 应用角色：${member.role==="ADMIN"?"管理员":"普通成员"} · 接入时间：${member.joined_at||"初始绑定"}`,"muted"));
+    row.append(head,node("p",`成员编号：${member.actor_id} · 应用角色：${member.role==="ADMIN"?"管理员":member.reviewer?"Agent 审核官":"普通成员"} · 接入时间：${member.joined_at||"初始绑定"}`,"muted"));
     if(member.status_reason)row.append(node("p",`最近处置：${member.status_reason}`,"muted"));
+    if(member.reviewer_reason)row.append(node("p",`审核官角色最近变更：${member.reviewer_reason}`,"muted"));
     if(member.role!=="ADMIN"){
       const button=node("button",member.status==="ACTIVE"?"停用成员":"恢复成员");button.type="button";
       button.addEventListener("click",()=>changeMemberStatus(member,button));
       row.append(button);
+      if(member.status==="ACTIVE"){
+        const roleButton=node("button",member.reviewer?"撤销审核官":"授予审核官");roleButton.type="button";
+        roleButton.addEventListener("click",()=>changeReviewerRole(member,roleButton));
+        row.append(roleButton);
+      }
     }
     panel.append(row);
   });
@@ -366,6 +415,25 @@ async function changeMemberStatus(member,button){
     memberNotice(`成员已${next==="ACTIVE"?"恢复":"停用"}。`,"success");
     memberState.busy=false;
     await loadMembers();
+  }catch(error){memberNotice(error.message,"error");button.disabled=false;}
+  finally{memberState.busy=false;}
+}
+async function changeReviewerRole(member,button){
+  if(memberState.busy)return;
+  const reviewer=!member.reviewer,label=reviewer?"授予":"撤销";
+  const reason=window.prompt(`${label}成员“${member.actor_id}”的 Agent 审核官角色，原因（至少 5 个字）：`);
+  if(reason===null)return;
+  if(reason.trim().length<5){memberNotice("请填写至少 5 个字的原因。","error");return;}
+  if(!window.confirm(`确认${label}成员“${member.actor_id}”的 Agent 审核官角色？`))return;
+  memberState.busy=true;button.disabled=true;memberNotice(`正在${label}审核官角色…`);
+  try{
+    await api(`/api/meetings/member-directory/${encodeURIComponent(member.actor_id)}/reviewer-role`,{
+      method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":memberState.csrf},
+      body:JSON.stringify({expected_reviewer:Boolean(member.reviewer),reviewer,reason:reason.trim()})
+    });
+    memberState.busy=false;
+    await loadMembers();
+    memberNotice(`已${label} Agent 审核官角色。`,"success");
   }catch(error){memberNotice(error.message,"error");button.disabled=false;}
   finally{memberState.busy=false;}
 }

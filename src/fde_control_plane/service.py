@@ -172,7 +172,9 @@ class ControlPlane:
                        assistant_actor_id=assistant_actor_id, agent_id=agent_id, agent_version=agent_version,
                        status=TaskRunStatus.QUEUED, input_ref_hash=input_ref_hash,
                        release_mode=("CANARY" if route is not None and route["status"] == "CANARY"
-                                     and route["canary_version"] == agent_version else "STABLE"))
+                                     and route["canary_version"] == agent_version else "STABLE"),
+                       canary_epoch=(route["canary_epoch"] if route is not None and route["status"] == "CANARY"
+                                     and route["canary_version"] == agent_version else None))
         if dispatch_key:
             dispatch_data = {
                 "requested_by": requested_by,

@@ -23,7 +23,7 @@ DOC_URL = f"https://demo.feishu.cn/docx/{DOC_ID}"
 
 class FakeUserReader:
     def __init__(self) -> None:
-        self.allowed = {"admin", "lead", "teacher"}
+        self.allowed = {"admin", "lead", "teacher", "teacher2"}
         self.revision = "1"
         self.text = "第 2 周：以虚构示例讲授递归。"
         self.blocks = None
@@ -53,7 +53,8 @@ def setup(tmp_path):
     contexts = {}
     for name, roles, tenant in [
         ("admin", {"admin"}, "tenant"), ("lead", set(), "tenant"),
-        ("teacher", set(), "tenant"), ("outsider", set(), "tenant"),
+        ("teacher", set(), "tenant"), ("teacher2", set(), "tenant"),
+        ("outsider", set(), "tenant"),
         ("foreign", {"admin"}, "other"),
     ]:
         subject = hashlib.sha256(f"oauth-{name}".encode()).hexdigest()
@@ -155,6 +156,9 @@ def test_feishu_source_is_fresh_member_oauth_only_and_never_persisted_as_text(tm
         "actor_id": "teacher", "reason": "课程组负责人批准资料阅读",
     }, headers=lead_headers)
     assert granted.status_code == 200
+    assert client.post(f"/api/teaching/courses/demo/sources/{source_id}/readers", json={
+        "actor_id": "teacher", "reason": "课程负责人共享该来源",
+    }, headers=lead_headers).status_code == 200
     login("teacher")
     assert client.get(f"/api/teaching/courses/demo/sources/{source_id}").status_code == 200
     assert reader.calls[-2:] == [("teacher", DOC_ID), ("teacher", DOC_ID)]
@@ -190,6 +194,9 @@ def test_source_requires_course_access_and_document_scope(tmp_path):
         "actor_id": "teacher", "reason": "批准成员查看课程资料",
     }, headers=login("lead"))
     assert granted.status_code == 200
+    assert client.post(f"/api/teaching/courses/demo/sources/{source['source_id']}/readers", json={
+        "actor_id": "teacher", "reason": "负责人授权阅读该资料",
+    }, headers=login("lead")).status_code == 200
     login("teacher")
     assert client.get(f"/api/teaching/courses/demo/sources/{source['source_id']}").status_code == 200
     lead_headers = login("lead")
@@ -208,12 +215,20 @@ def test_source_requires_course_access_and_document_scope(tmp_path):
 def test_reopening_database_preserves_course_and_source_contract(tmp_path):
     cp, reader, client, contexts, login = setup(tmp_path)
     create_course(client, login("admin"))
+    lead_headers = login("lead")
     source = client.post("/api/teaching/courses/demo/sources", json={
         "kind": "LESSON_PLAN", "document_url": DOC_URL,
-    }, headers=login("lead")).json()
+    }, headers=lead_headers).json()
+    assert client.post("/api/teaching/courses/demo/teachers", json={
+        "actor_id": "teacher", "reason": "课程负责人批准任课教师",
+    }, headers=lead_headers).status_code == 200
+    assert client.post(f"/api/teaching/courses/demo/sources/{source['source_id']}/readers", json={
+        "actor_id": "teacher", "reason": "负责人共享教案来源",
+    }, headers=lead_headers).status_code == 200
     reopened = SQLiteStore(tmp_path / "course.sqlite3")
     assert reopened.get_teaching_course("tenant", "demo")["term"] == "2026 秋"
     assert reopened.get_teaching_source("tenant", "demo", source["source_id"])["revision_id"] == "1"
+    assert reopened.get_teaching_source_reader("tenant", "demo", source["source_id"], "teacher")["active"] == 1
     reopened.close()
 
 
@@ -275,6 +290,9 @@ def test_weekly_outline_has_pinned_citations_and_human_coverage(tmp_path):
         "actor_id": "teacher", "reason": "课程负责人允许查看周计划",
     }, headers=lead_headers)
     assert granted.status_code == 200
+    assert client.post(f"/api/teaching/courses/demo/sources/{source_id}/readers", json={
+        "actor_id": "teacher", "reason": "课程负责人共享周计划",
+    }, headers=lead_headers).status_code == 200
     login("teacher")
     assert client.get(path).json()["outlines"][0]["outline_id"] == outline_id
     detail = client.get(f"{path}/{outline_id}")
@@ -362,3 +380,126 @@ def test_outline_rejects_ambiguous_quotes_and_cross_course_ids(tmp_path):
     wrong_path = f"/api/teaching/courses/another/sources/{source_id}/outlines/{created.json()['outline_id']}"
     assert client.get(wrong_path).status_code == 404
     assert len(reader.calls) == before
+
+
+def test_two_teachers_sources_and_outlines_are_private_until_lead_shares(tmp_path):
+    cp, reader, client, contexts, login = setup(tmp_path)
+    assert create_course(client, login("admin")).status_code == 200
+    lead_headers = login("lead")
+    for actor_id in ("teacher", "teacher2"):
+        assert client.post("/api/teaching/courses/demo/teachers", json={
+            "actor_id": actor_id, "reason": "课程负责人确认任课教师",
+        }, headers=lead_headers).status_code == 200
+
+    first_headers = login("teacher")
+    first = client.post("/api/teaching/courses/demo/sources", json={
+        "kind": "SYLLABUS", "document_url": DOC_URL,
+    }, headers=first_headers).json()["source_id"]
+    first_path = f"/api/teaching/courses/demo/sources/{first}"
+    assert client.post(f"{first_path}/outlines", json={"items": [{
+        "item_id": "objective-1", "kind": "OBJECTIVE", "block_index": 1,
+        "quote": "以虚构示例讲授递归",
+    }]}, headers=first_headers).status_code == 200
+
+    second_headers = login("teacher2")
+    second = client.post("/api/teaching/courses/demo/sources", json={
+        "kind": "LESSON_PLAN", "document_url": DOC_URL,
+    }, headers=second_headers).json()["source_id"]
+    second_path = f"/api/teaching/courses/demo/sources/{second}"
+    second_outline = client.post(f"{second_path}/outlines", json={"items": [{
+        "item_id": "lesson-1", "kind": "LESSON_FRAGMENT", "block_index": 1,
+        "quote": "以虚构示例讲授递归", "week_number": 2,
+    }]}, headers=second_headers).json()["outline_id"]
+    assert [row["source_id"] for row in client.get("/api/teaching/courses/demo/sources").json()["sources"]] == [second]
+    before = len(reader.calls)
+    assert client.get(first_path).status_code == 403
+    assert client.get(f"{first_path}/outlines").status_code == 403
+    assert len(reader.calls) == before
+
+    login("teacher")
+    assert [row["source_id"] for row in client.get("/api/teaching/courses/demo/sources").json()["sources"]] == [first]
+    before = len(reader.calls)
+    assert client.get(second_path).status_code == 403
+    assert client.get(f"{second_path}/outlines/{second_outline}").status_code == 403
+    assert len(reader.calls) == before
+    assert client.post(f"{second_path}/readers", json={
+        "actor_id": "teacher", "reason": "自行申请访问其他教师来源",
+    }, headers=first_headers).status_code == 403
+
+    lead_headers = login("lead")
+    assert {row["source_id"] for row in client.get("/api/teaching/courses/demo/sources").json()["sources"]} == {
+        first, second,
+    }
+    reader.allowed.remove("lead")
+    assert client.get(second_path).status_code == 403
+    reader.allowed.add("lead")
+    share_path = f"{second_path}/readers"
+    share = {"actor_id": "teacher", "reason": "负责人同意共同备课"}
+    assert client.post(share_path, json=share, headers=lead_headers).status_code == 200
+    assert client.post(share_path, json=share, headers=lead_headers).status_code == 409
+    assert client.post(share_path, json={"actor_id": "outsider", "reason": "尝试共享给非成员"},
+                       headers=lead_headers).status_code == 403
+    assert client.get(share_path).json()["readers"][0]["actor_id"] == "teacher"
+    login("teacher")
+    assert {row["source_id"] for row in client.get("/api/teaching/courses/demo/sources").json()["sources"]} == {
+        first, second,
+    }
+    assert client.get(second_path).status_code == 200
+    assert client.get(f"{second_path}/outlines/{second_outline}").status_code == 200
+    assert client.get(share_path).status_code == 403
+
+    lead_headers = login("lead")
+    assert client.delete(f"{share_path}/teacher", params={"reason": "负责人结束共同备课访问"},
+                         headers=lead_headers).status_code == 200
+    login("teacher")
+    before = len(reader.calls)
+    assert client.get(f"{second_path}/outlines/{second_outline}").status_code == 403
+    assert len(reader.calls) == before
+    lead_headers = login("lead")
+    assert client.post(share_path, json=share, headers=lead_headers).status_code == 200
+    assert client.delete("/api/teaching/courses/demo/teachers/teacher",
+                         params={"reason": "课程负责人撤销课程成员"}, headers=lead_headers).status_code == 200
+    assert client.post("/api/teaching/courses/demo/teachers", json={
+        "actor_id": "teacher", "reason": "课程负责人重新加入成员",
+    }, headers=lead_headers).status_code == 200
+    login("teacher")
+    assert [row["source_id"] for row in client.get("/api/teaching/courses/demo/sources").json()["sources"]] == [first]
+    assert client.get(second_path).status_code == 403
+    assert {event["event_type"] for event in cp.store.list_tenant_audits("tenant")} >= {
+        "TEACHING_SOURCE_READER_GRANTED", "TEACHING_SOURCE_READER_REVOKED", "TEACHING_ACCESS_DENIED",
+    }
+
+
+def test_source_share_revoked_during_remote_read_does_not_return_content(tmp_path):
+    cp, reader, client, contexts, login = setup(tmp_path)
+    assert create_course(client, login("admin")).status_code == 200
+    lead_headers = login("lead")
+    assert client.post("/api/teaching/courses/demo/teachers", json={
+        "actor_id": "teacher", "reason": "课程负责人确认任课教师",
+    }, headers=lead_headers).status_code == 200
+    source_id = client.post("/api/teaching/courses/demo/sources", json={
+        "kind": "SYLLABUS", "document_url": DOC_URL,
+    }, headers=lead_headers).json()["source_id"]
+    path = f"/api/teaching/courses/demo/sources/{source_id}"
+    assert client.post(f"{path}/readers", json={
+        "actor_id": "teacher", "reason": "负责人共享课程资料",
+    }, headers=lead_headers).status_code == 200
+    original_read = reader.read_document
+
+    def revoke_during_read(identity, document_id):
+        document = original_read(identity, document_id)
+        cp.store.connection.execute(
+            "UPDATE teaching_source_readers SET active = 0 WHERE source_id = ? AND actor_id = ?",
+            (source_id, "teacher"),
+        )
+        cp.store.connection.commit()
+        return document
+
+    reader.read_document = revoke_during_read
+    login("teacher")
+    assert client.get(path).status_code == 403
+    assert client.post(f"{path}/outlines", json={"items": [{
+        "item_id": "objective-1", "kind": "OBJECTIVE", "block_index": 1,
+        "quote": "以虚构示例讲授递归",
+    }]}, headers=login("teacher")).status_code == 403
+    assert cp.store.connection.execute("SELECT count(*) FROM teaching_outlines").fetchone()[0] == 0

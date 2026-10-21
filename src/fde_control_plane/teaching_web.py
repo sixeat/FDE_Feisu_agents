@@ -73,7 +73,10 @@ def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSession
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
         except ValueError as exc:
-            status = 409 if str(exc) in {"course already exists", "teacher is already active", "teacher is not active"} else 422
+            status = 409 if str(exc) in {
+                "course already exists", "teacher is already active", "teacher is not active",
+                "source reader is already active", "source reader is not active",
+            } else 422
             raise HTTPException(status, str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(503, "当前无法以成员授权读取飞书文档") from exc
@@ -121,6 +124,27 @@ def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSession
     @router.get("/courses/{course_id}/sources/{source_id}")
     def read_source(course_id: str, source_id: str, identity: IdentityContext = Depends(require_identity)):
         return call(service.read_source, identity, course_id, source_id)
+
+    @router.get("/courses/{course_id}/sources/{source_id}/readers")
+    def list_source_readers(course_id: str, source_id: str,
+                            identity: IdentityContext = Depends(require_identity)):
+        return {"readers": call(service.list_source_readers, identity, course_id, source_id)}
+
+    @router.post("/courses/{course_id}/sources/{source_id}/readers")
+    def grant_source_reader(course_id: str, source_id: str, body: TeacherGrantRequest, request: Request,
+                            identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        return call(service.set_source_reader, identity, course_id, source_id, body.actor_id,
+                    active=True, reason=body.reason)
+
+    @router.delete("/courses/{course_id}/sources/{source_id}/readers/{teacher_actor_id}")
+    def revoke_source_reader(course_id: str, source_id: str, teacher_actor_id: str, reason: str,
+                             request: Request, identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        if not 5 <= len(reason) <= 500:
+            raise HTTPException(422, "撤权原因长度不合法")
+        return call(service.set_source_reader, identity, course_id, source_id, teacher_actor_id,
+                    active=False, reason=reason)
 
     @router.get("/courses/{course_id}/sources/{source_id}/outlines")
     def list_outlines(course_id: str, source_id: str, identity: IdentityContext = Depends(require_identity)):

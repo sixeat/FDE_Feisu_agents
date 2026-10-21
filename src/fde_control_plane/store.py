@@ -396,6 +396,18 @@ class SQLiteStore:
             BEFORE UPDATE ON teaching_sources BEGIN SELECT RAISE(ABORT, 'immutable teaching source'); END;
             CREATE TRIGGER IF NOT EXISTS teaching_sources_no_delete
             BEFORE DELETE ON teaching_sources BEGIN SELECT RAISE(ABORT, 'immutable teaching source'); END;
+            CREATE TABLE IF NOT EXISTS teaching_source_readers (
+                tenant_id TEXT NOT NULL, course_id TEXT NOT NULL,
+                source_id TEXT NOT NULL, actor_id TEXT NOT NULL,
+                active INTEGER NOT NULL CHECK(active IN (0, 1)),
+                granted_by TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (tenant_id, course_id, source_id, actor_id),
+                FOREIGN KEY (source_id) REFERENCES teaching_sources(source_id),
+                FOREIGN KEY (tenant_id, course_id, actor_id)
+                    REFERENCES teaching_course_members(tenant_id, course_id, actor_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_teaching_source_readers_actor
+                ON teaching_source_readers(tenant_id, course_id, actor_id, active);
             CREATE TABLE IF NOT EXISTS teaching_outlines (
                 outline_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, course_id TEXT NOT NULL,
                 source_id TEXT NOT NULL, source_revision TEXT NOT NULL,
@@ -2501,11 +2513,32 @@ class SQLiteStore:
             (tenant_id, course_id, source_id),
         ).fetchone()
 
-    def list_teaching_sources(self, tenant_id: str, course_id: str) -> list[sqlite3.Row]:
+    def list_teaching_sources(self, tenant_id: str, course_id: str, actor_id: str,
+                              *, lead: bool) -> list[sqlite3.Row]:
         return self.connection.execute(
-            "SELECT source_id, kind, revision_id, block_count, submitted_by, created_at "
-            "FROM teaching_sources WHERE tenant_id = ? AND course_id = ? ORDER BY created_at, source_id",
-            (tenant_id, course_id),
+            "SELECT s.source_id, s.kind, s.revision_id, s.block_count, s.submitted_by, s.created_at "
+            "FROM teaching_sources AS s WHERE s.tenant_id = ? AND s.course_id = ? "
+            "AND (? = 1 OR s.submitted_by = ? OR EXISTS ("
+            "SELECT 1 FROM teaching_source_readers AS r WHERE r.tenant_id = s.tenant_id "
+            "AND r.course_id = s.course_id AND r.source_id = s.source_id "
+            "AND r.actor_id = ? AND r.active = 1)) ORDER BY s.created_at, s.source_id",
+            (tenant_id, course_id, int(lead), actor_id, actor_id),
+        ).fetchall()
+
+    def get_teaching_source_reader(self, tenant_id: str, course_id: str, source_id: str,
+                                   actor_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT active FROM teaching_source_readers WHERE tenant_id = ? AND course_id = ? "
+            "AND source_id = ? AND actor_id = ?",
+            (tenant_id, course_id, source_id, actor_id),
+        ).fetchone()
+
+    def list_teaching_source_readers(self, tenant_id: str, course_id: str,
+                                     source_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT actor_id, granted_by, updated_at FROM teaching_source_readers "
+            "WHERE tenant_id = ? AND course_id = ? AND source_id = ? AND active = 1 ORDER BY actor_id",
+            (tenant_id, course_id, source_id),
         ).fetchall()
 
     def get_teaching_outline(self, tenant_id: str, course_id: str, source_id: str,

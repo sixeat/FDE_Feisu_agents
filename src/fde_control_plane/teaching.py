@@ -52,6 +52,21 @@ class TeachingService:
         return {"course_id": course_id, "title": course["title"], "term": course["term"],
                 "role": membership["role"]}
 
+    def _authorized_source(self, identity: IdentityContext, course_id: str, source_id: str):
+        course = self._course_member(identity, course_id)
+        row = self.store.get_teaching_source(identity.tenant_id, course_id, source_id)
+        if row is None:
+            raise KeyError("teaching source is not in this course")
+        if course["role"] != "LEAD" and row["submitted_by"] != identity.actor_id:
+            reader = self.store.get_teaching_source_reader(identity.tenant_id, course_id,
+                                                           source_id, identity.actor_id)
+            if reader is None or not reader["active"]:
+                self.store.save_audit(self._audit(identity, "TEACHING_ACCESS_DENIED",
+                                                  {"course_id": course_id, "source_id": source_id},
+                                                  outcome="DENIED"))
+                raise PermissionError("teaching source access is missing or revoked")
+        return row
+
     @staticmethod
     def _audit(identity: IdentityContext, event_type: str, payload: dict[str, Any],
                *, outcome: str = "SUCCEEDED") -> AuditEvent:
@@ -161,8 +176,84 @@ class TeachingService:
                     "WHERE tenant_id = ? AND course_id = ? AND actor_id = ?",
                     (identity.tenant_id, course_id, teacher_actor_id),
                 )
+                connection.execute(
+                    "UPDATE teaching_source_readers SET active = 0, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE tenant_id = ? AND course_id = ? AND actor_id = ? AND active = 1",
+                    (identity.tenant_id, course_id, teacher_actor_id),
+                )
             self.store.teaching_audit_in_transaction(connection, event)
         return {"course_id": course_id, "teacher_actor_id": teacher_actor_id, "active": active}
+
+    def set_source_reader(self, identity: IdentityContext, course_id: str, source_id: str,
+                          teacher_actor_id: str, *, active: bool, reason: str) -> dict[str, Any]:
+        self._course_member(identity, course_id, lead=True)
+        event = self._audit(identity, "TEACHING_SOURCE_READER_GRANTED" if active
+                            else "TEACHING_SOURCE_READER_REVOKED",
+                            {"course_id": course_id, "source_id": source_id,
+                             "teacher": teacher_actor_id, "reason": reason})
+        with self.store.teaching_transaction() as connection:
+            lead = connection.execute(
+                "SELECT m.role, m.active, a.active AS actor_active, a.external_ref_hash "
+                "FROM teaching_course_members AS m JOIN actors AS a "
+                "ON a.actor_id = m.actor_id AND a.tenant_id = m.tenant_id "
+                "WHERE m.tenant_id = ? AND m.course_id = ? AND m.actor_id = ?",
+                (identity.tenant_id, course_id, identity.actor_id),
+            ).fetchone()
+            if (lead is None or lead["role"] != "LEAD" or not lead["active"]
+                    or not lead["actor_active"] or lead["external_ref_hash"] != identity.subject_ref_hash):
+                raise PermissionError("course lead authorization was revoked")
+            source = connection.execute(
+                "SELECT submitted_by FROM teaching_sources WHERE tenant_id = ? AND course_id = ? AND source_id = ?",
+                (identity.tenant_id, course_id, source_id),
+            ).fetchone()
+            if source is None:
+                raise KeyError("teaching source is not in this course")
+            if source["submitted_by"] == teacher_actor_id:
+                raise ValueError("source owner already has access")
+            reader = connection.execute(
+                "SELECT active FROM teaching_source_readers WHERE tenant_id = ? AND course_id = ? "
+                "AND source_id = ? AND actor_id = ?",
+                (identity.tenant_id, course_id, source_id, teacher_actor_id),
+            ).fetchone()
+            if active:
+                target = connection.execute(
+                    "SELECT m.role, m.active, a.active AS actor_active, a.actor_type, a.external_ref_hash "
+                    "FROM teaching_course_members AS m JOIN actors AS a "
+                    "ON a.actor_id = m.actor_id AND a.tenant_id = m.tenant_id "
+                    "WHERE m.tenant_id = ? AND m.course_id = ? AND m.actor_id = ?",
+                    (identity.tenant_id, course_id, teacher_actor_id),
+                ).fetchone()
+                if (target is None or target["role"] != "TEACHER" or not target["active"]
+                        or not target["actor_active"] or target["actor_type"] != "USER"
+                        or not target["external_ref_hash"]):
+                    raise PermissionError("reader must be an active, bound teacher in this course")
+                if reader is not None and reader["active"]:
+                    raise ValueError("source reader is already active")
+                connection.execute(
+                    "INSERT INTO teaching_source_readers(tenant_id, course_id, source_id, actor_id, active, "
+                    "granted_by) VALUES (?, ?, ?, ?, 1, ?) "
+                    "ON CONFLICT(tenant_id, course_id, source_id, actor_id) "
+                    "DO UPDATE SET active = 1, granted_by = excluded.granted_by, updated_at = CURRENT_TIMESTAMP",
+                    (identity.tenant_id, course_id, source_id, teacher_actor_id, identity.actor_id),
+                )
+            else:
+                if reader is None or not reader["active"]:
+                    raise ValueError("source reader is not active")
+                connection.execute(
+                    "UPDATE teaching_source_readers SET active = 0, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE tenant_id = ? AND course_id = ? AND source_id = ? AND actor_id = ?",
+                    (identity.tenant_id, course_id, source_id, teacher_actor_id),
+                )
+            self.store.teaching_audit_in_transaction(connection, event)
+        return {"source_id": source_id, "teacher_actor_id": teacher_actor_id, "active": active}
+
+    def list_source_readers(self, identity: IdentityContext, course_id: str,
+                            source_id: str) -> list[dict[str, Any]]:
+        self._course_member(identity, course_id, lead=True)
+        if self.store.get_teaching_source(identity.tenant_id, course_id, source_id) is None:
+            raise KeyError("teaching source is not in this course")
+        return [dict(row) for row in self.store.list_teaching_source_readers(identity.tenant_id,
+                                                                              course_id, source_id)]
 
     @staticmethod
     def _snapshot(document: dict[str, Any], document_id: str) -> tuple[str, str, list[dict[str, Any]]]:
@@ -234,19 +325,17 @@ class TeachingService:
                 "revision_id": revision, "content_hash": digest, "block_count": len(blocks)}
 
     def list_sources(self, identity: IdentityContext, course_id: str) -> list[dict[str, Any]]:
-        self._course_member(identity, course_id)
-        return [dict(row) for row in self.store.list_teaching_sources(identity.tenant_id, course_id)]
+        course = self._course_member(identity, course_id)
+        return [dict(row) for row in self.store.list_teaching_sources(
+            identity.tenant_id, course_id, identity.actor_id, lead=course["role"] == "LEAD")]
 
     def read_source(self, identity: IdentityContext, course_id: str, source_id: str) -> dict[str, Any]:
-        self._course_member(identity, course_id)
-        row = self.store.get_teaching_source(identity.tenant_id, course_id, source_id)
-        if row is None:
-            raise KeyError("teaching source is not in this course")
+        row = self._authorized_source(identity, course_id, source_id)
         revision, digest, blocks, title = self._fresh_read(identity, row["document_id"])
         if revision != row["revision_id"] or digest != row["content_hash"]:
             raise SourceChanged("source revision or content changed; register a new snapshot")
-        # Membership can be revoked while the remote read is in progress.
-        self._course_member(identity, course_id)
+        # Course or source authorization can be revoked during the remote read.
+        self._authorized_source(identity, course_id, source_id)
         self.store.save_audit(self._audit(identity, "TEACHING_SOURCE_READ",
                                          {"course_id": course_id, "source_id": source_id,
                                           "revision": revision, "hash": digest}))
@@ -318,11 +407,12 @@ class TeachingService:
                 (identity.actor_id, identity.tenant_id),
             ).fetchone()
             member = connection.execute(
-                "SELECT active FROM teaching_course_members WHERE tenant_id = ? AND course_id = ? AND actor_id = ?",
+                "SELECT role, active FROM teaching_course_members "
+                "WHERE tenant_id = ? AND course_id = ? AND actor_id = ?",
                 (identity.tenant_id, course_id, identity.actor_id),
             ).fetchone()
             pinned = connection.execute(
-                "SELECT revision_id, content_hash FROM teaching_sources "
+                "SELECT revision_id, content_hash, submitted_by FROM teaching_sources "
                 "WHERE tenant_id = ? AND course_id = ? AND source_id = ?",
                 (identity.tenant_id, course_id, source_id),
             ).fetchone()
@@ -332,6 +422,14 @@ class TeachingService:
             if (pinned is None or pinned["revision_id"] != source["revision_id"]
                     or pinned["content_hash"] != source["content_hash"]):
                 raise SourceChanged("source snapshot changed during annotation")
+            if member["role"] != "LEAD" and pinned["submitted_by"] != identity.actor_id:
+                reader = connection.execute(
+                    "SELECT active FROM teaching_source_readers WHERE tenant_id = ? AND course_id = ? "
+                    "AND source_id = ? AND actor_id = ?",
+                    (identity.tenant_id, course_id, source_id, identity.actor_id),
+                ).fetchone()
+                if reader is None or not reader["active"]:
+                    raise PermissionError("source reader authorization was revoked during annotation")
             connection.execute(
                 "INSERT INTO teaching_outlines(outline_id, tenant_id, course_id, source_id, source_revision, "
                 "source_hash, outline_hash, data_json, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -344,14 +442,12 @@ class TeachingService:
                 "coverage": self._week_coverage(references, expected_weeks)}
 
     def list_outlines(self, identity: IdentityContext, course_id: str, source_id: str) -> list[dict[str, Any]]:
-        self._course_member(identity, course_id)
-        if self.store.get_teaching_source(identity.tenant_id, course_id, source_id) is None:
-            raise KeyError("teaching source is not in this course")
+        self._authorized_source(identity, course_id, source_id)
         return [dict(row) for row in self.store.list_teaching_outlines(identity.tenant_id, course_id, source_id)]
 
     def read_outline(self, identity: IdentityContext, course_id: str, source_id: str,
                      outline_id: str) -> dict[str, Any]:
-        self._course_member(identity, course_id)
+        self._authorized_source(identity, course_id, source_id)
         row = self.store.get_teaching_outline(identity.tenant_id, course_id, source_id, outline_id)
         if row is None:
             raise KeyError("teaching outline is not in this course and source")

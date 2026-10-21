@@ -6,7 +6,7 @@ import secrets
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
 
 from .feishu_oauth_web import SQLiteOAuthSessionIssuer, build_session_dependency
 from .meeting_review_web import csrf_token
@@ -32,6 +32,7 @@ class SourceRegisterRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal["SYLLABUS", "WEEKLY_PLAN", "LESSON_PLAN", "MATERIAL"]
     document_url: StrictStr = Field(min_length=20, max_length=1000)
+    attested_no_student_data: StrictBool
 
 
 class TeachingOutlineItem(BaseModel):
@@ -119,7 +120,8 @@ def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSession
     def register_source(course_id: str, body: SourceRegisterRequest, request: Request,
                         identity: IdentityContext = Depends(require_identity)):
         check_csrf(request)
-        return call(service.register_source, identity, course_id, body.kind, body.document_url)
+        return call(service.register_source, identity, course_id, body.kind, body.document_url,
+                    attested_no_student_data=body.attested_no_student_data)
 
     @router.get("/courses/{course_id}/sources/{source_id}")
     def read_source(course_id: str, source_id: str, identity: IdentityContext = Depends(require_identity)):

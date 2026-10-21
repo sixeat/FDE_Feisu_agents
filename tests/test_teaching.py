@@ -26,6 +26,7 @@ class FakeUserReader:
         self.allowed = {"admin", "lead", "teacher", "teacher2"}
         self.revision = "1"
         self.text = "第 2 周：以虚构示例讲授递归。"
+        self.title = "虚构课程周计划"
         self.blocks = None
         self.calls: list[tuple[str, str]] = []
         self.change_during_read = False
@@ -34,7 +35,7 @@ class FakeUserReader:
         self.calls.append((identity.actor_id, document_id))
         if identity.actor_id not in self.allowed:
             raise PermissionError("member cannot read the Feishu document")
-        snapshot = {"document_id": document_id, "revision_id": self.revision, "title": "虚构课程周计划",
+        snapshot = {"document_id": document_id, "revision_id": self.revision, "title": self.title,
                     "blocks": self.blocks or [{"index": 1, "block_type": 2, "text": self.text}]}
         if self.change_during_read:
             self.revision = str(int(self.revision) + 1)
@@ -126,7 +127,8 @@ def test_feishu_source_is_fresh_member_oauth_only_and_never_persisted_as_text(tm
     admin_headers = login("admin")
     assert create_course(client, admin_headers).status_code == 200
     lead_headers = login("lead")
-    source_request = {"kind": "WEEKLY_PLAN", "document_url": DOC_URL}
+    source_request = {"kind": "WEEKLY_PLAN", "document_url": DOC_URL,
+                      "attested_no_student_data": True}
     assert client.post("/api/teaching/courses/demo/sources", json=source_request).status_code == 403
     assert client.post("/api/teaching/courses/demo/sources", json=source_request,
                        headers={**lead_headers, "Origin": "https://evil.test"}).status_code == 403
@@ -184,7 +186,7 @@ def test_source_requires_course_access_and_document_scope(tmp_path):
     create_course(client, login("admin"))
     lead_headers = login("lead")
     source = client.post("/api/teaching/courses/demo/sources", json={
-        "kind": "SYLLABUS", "document_url": DOC_URL,
+        "kind": "SYLLABUS", "document_url": DOC_URL, "attested_no_student_data": True,
     }, headers=lead_headers).json()
     login("outsider")
     before = len(reader.calls)
@@ -217,7 +219,7 @@ def test_reopening_database_preserves_course_and_source_contract(tmp_path):
     create_course(client, login("admin"))
     lead_headers = login("lead")
     source = client.post("/api/teaching/courses/demo/sources", json={
-        "kind": "LESSON_PLAN", "document_url": DOC_URL,
+        "kind": "LESSON_PLAN", "document_url": DOC_URL, "attested_no_student_data": True,
     }, headers=lead_headers).json()
     assert client.post("/api/teaching/courses/demo/teachers", json={
         "actor_id": "teacher", "reason": "课程负责人批准任课教师",
@@ -243,10 +245,80 @@ def test_missing_member_oauth_reader_fails_closed(tmp_path):
     token = sessions(contexts["lead"])
     closed_client.cookies.set("fde_auth_session", token)
     assert closed_client.post("/api/teaching/courses/demo/sources", json={
-        "kind": "MATERIAL", "document_url": DOC_URL,
+        "kind": "MATERIAL", "document_url": DOC_URL, "attested_no_student_data": True,
     }, headers={"X-CSRF-Token": hashlib.sha256(("meeting-review-csrf:" + token).encode()).hexdigest(),
                 "Origin": "https://example.test"}).status_code == 503
     assert cp.store.connection.execute("SELECT count(*) FROM teaching_sources").fetchone()[0] == 0
+
+
+def test_source_attestation_and_student_data_screening_fail_closed(tmp_path):
+    cp, reader, client, contexts, login = setup(tmp_path)
+    assert create_course(client, login("admin")).status_code == 200
+    headers = login("lead")
+    path = "/api/teaching/courses/demo/sources"
+    request = {"kind": "SYLLABUS", "document_url": DOC_URL}
+    before = len(reader.calls)
+    assert client.post(path, json=request, headers=headers).status_code == 422
+    assert client.post(path, json={**request, "attested_no_student_data": False},
+                       headers=headers).status_code == 422
+    assert client.post(path, json={**request, "attested_no_student_data": "true"},
+                       headers=headers).status_code == 422
+    assert len(reader.calls) == before
+
+    reviewed_request = {**request, "attested_no_student_data": True}
+    for sensitive in ("学生姓名：张三", "学号：2026123456", "个人成绩：95",
+                      "联系电话 13800138000", "11010519491231002X"):
+        reader.text = sensitive
+        response = client.post(path, json=reviewed_request, headers=headers)
+        assert response.status_code == 422
+        assert sensitive not in response.text
+    reader.text = "教学目标：学生能够分析算法复杂度。"
+    reader.title = "学生名单"
+    assert client.post(path, json=reviewed_request, headers=headers).status_code == 422
+    assert cp.store.connection.execute("SELECT count(*) FROM teaching_sources").fetchone()[0] == 0
+
+    reader.title = "虚构课程大纲"
+    created = client.post(path, json=reviewed_request, headers=headers)
+    assert created.status_code == 200
+    source_id = created.json()["source_id"]
+    assert created.json()["data_reviewed"] is True
+    assert cp.store.get_teaching_source("tenant", "demo", source_id)["data_reviewed"] == 1
+    assert client.get(f"{path}/{source_id}").status_code == 200
+    reader.text = "学生姓名：张三"
+    response = client.get(f"{path}/{source_id}")
+    assert response.status_code == 422
+    assert "张三" not in response.text
+    assert all("张三" not in str(event) for event in cp.store.list_tenant_audits("tenant"))
+
+
+def test_legacy_source_migration_requires_new_review_before_read(tmp_path):
+    path = tmp_path / "course.sqlite3"
+    with sqlite3.connect(path) as legacy:
+        legacy.execute(
+            "CREATE TABLE teaching_sources ("
+            "source_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, course_id TEXT NOT NULL, "
+            "kind TEXT NOT NULL, document_id TEXT NOT NULL, revision_id TEXT NOT NULL, "
+            "content_hash TEXT NOT NULL, block_count INTEGER NOT NULL, submitted_by TEXT NOT NULL, "
+            "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        legacy.execute(
+            "INSERT INTO teaching_sources(source_id, tenant_id, course_id, kind, document_id, "
+            "revision_id, content_hash, block_count, submitted_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("legacy-source", "tenant", "demo", "SYLLABUS", DOC_ID, "1", "old-hash", 1, "lead"),
+        )
+    cp, reader, client, contexts, login = setup(tmp_path)
+    assert create_course(client, login("admin")).status_code == 200
+    login("lead")
+    assert cp.store.get_teaching_source("tenant", "demo", "legacy-source")["data_reviewed"] == 0
+    before = len(reader.calls)
+    legacy_path = "/api/teaching/courses/demo/sources/legacy-source"
+    assert client.get(legacy_path).status_code == 409
+    assert len(reader.calls) == before
+    new_source = client.post("/api/teaching/courses/demo/sources", json={
+        "kind": "SYLLABUS", "document_url": DOC_URL, "attested_no_student_data": True,
+    }, headers=login("lead"))
+    assert new_source.status_code == 200
+    assert client.get(f"/api/teaching/courses/demo/sources/{new_source.json()['source_id']}").status_code == 200
 
 
 def test_weekly_outline_has_pinned_citations_and_human_coverage(tmp_path):
@@ -259,7 +331,7 @@ def test_weekly_outline_has_pinned_citations_and_human_coverage(tmp_path):
     ]
     lead_headers = login("lead")
     source = client.post("/api/teaching/courses/demo/sources", json={
-        "kind": "WEEKLY_PLAN", "document_url": DOC_URL,
+        "kind": "WEEKLY_PLAN", "document_url": DOC_URL, "attested_no_student_data": True,
     }, headers=lead_headers).json()
     source_id = source["source_id"]
     outline_request = {"expected_weeks": [1, 2, 3], "items": [
@@ -334,7 +406,7 @@ def test_syllabus_and_lesson_fragments_require_exact_source_quote(
     reader.text = f"虚构资料：{quote}。"
     headers = login("lead")
     source_id = client.post("/api/teaching/courses/demo/sources", json={
-        "kind": source_kind, "document_url": DOC_URL,
+        "kind": source_kind, "document_url": DOC_URL, "attested_no_student_data": True,
     }, headers=headers).json()["source_id"]
     path = f"/api/teaching/courses/demo/sources/{source_id}/outlines"
     item = {"item_id": "item-1", "kind": item_kind, "block_index": 1,
@@ -363,7 +435,7 @@ def test_outline_rejects_ambiguous_quotes_and_cross_course_ids(tmp_path):
     reader.text = "第 1 周练习，继续第 1 周练习。"
     headers = login("lead")
     source_id = client.post("/api/teaching/courses/demo/sources", json={
-        "kind": "WEEKLY_PLAN", "document_url": DOC_URL,
+        "kind": "WEEKLY_PLAN", "document_url": DOC_URL, "attested_no_student_data": True,
     }, headers=headers).json()["source_id"]
     path = f"/api/teaching/courses/demo/sources/{source_id}/outlines"
     item = {"item_id": "w1", "kind": "WEEK_PLAN", "block_index": 1,
@@ -393,7 +465,7 @@ def test_two_teachers_sources_and_outlines_are_private_until_lead_shares(tmp_pat
 
     first_headers = login("teacher")
     first = client.post("/api/teaching/courses/demo/sources", json={
-        "kind": "SYLLABUS", "document_url": DOC_URL,
+        "kind": "SYLLABUS", "document_url": DOC_URL, "attested_no_student_data": True,
     }, headers=first_headers).json()["source_id"]
     first_path = f"/api/teaching/courses/demo/sources/{first}"
     assert client.post(f"{first_path}/outlines", json={"items": [{
@@ -403,7 +475,7 @@ def test_two_teachers_sources_and_outlines_are_private_until_lead_shares(tmp_pat
 
     second_headers = login("teacher2")
     second = client.post("/api/teaching/courses/demo/sources", json={
-        "kind": "LESSON_PLAN", "document_url": DOC_URL,
+        "kind": "LESSON_PLAN", "document_url": DOC_URL, "attested_no_student_data": True,
     }, headers=second_headers).json()["source_id"]
     second_path = f"/api/teaching/courses/demo/sources/{second}"
     second_outline = client.post(f"{second_path}/outlines", json={"items": [{
@@ -478,7 +550,7 @@ def test_source_share_revoked_during_remote_read_does_not_return_content(tmp_pat
         "actor_id": "teacher", "reason": "课程负责人确认任课教师",
     }, headers=lead_headers).status_code == 200
     source_id = client.post("/api/teaching/courses/demo/sources", json={
-        "kind": "SYLLABUS", "document_url": DOC_URL,
+        "kind": "SYLLABUS", "document_url": DOC_URL, "attested_no_student_data": True,
     }, headers=lead_headers).json()["source_id"]
     path = f"/api/teaching/courses/demo/sources/{source_id}"
     assert client.post(f"{path}/readers", json={

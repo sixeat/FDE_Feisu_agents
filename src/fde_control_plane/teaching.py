@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 from typing import Any, Protocol
 
@@ -11,6 +12,13 @@ from .feishu_review import FeishuMeetingReviewGateway
 from .models import ActorType, AuditEvent, IdentityContext
 from .service import ControlPlane
 from .user_document_access import DOC_READ_SCOPE
+
+
+_STUDENT_DATA_MARKERS = re.compile(
+    r"学号|学生(?:姓名|名单|个人|成绩|评价)|(?:个人|个体)(?:成绩|评价)|手机号|身份证(?:号)?"
+)
+_MOBILE_NUMBER = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+_IDENTITY_NUMBER = re.compile(r"(?<!\d)\d{17}[\dXx](?!\d)")
 
 
 class UserTeachingDocumentReader(Protocol):
@@ -289,18 +297,31 @@ class TeachingService:
             raise RuntimeError("member document reading is not configured")
         document = self.reader.read_document(identity, document_id)
         revision, digest, blocks = self._snapshot(document, document_id)
+        title = str(document.get("title") or "未命名文档")
+        if self._contains_student_data(title) or any(
+            self._contains_student_data(block["text"]) for block in blocks
+        ):
+            raise ValueError("student personal data is not accepted in teaching sources")
         if self.reader.get_revision(identity, document_id) != revision:
             raise SourceChanged("document changed during the read")
-        return revision, digest, blocks, str(document.get("title") or "未命名文档")
+        return revision, digest, blocks, title
+
+    @staticmethod
+    def _contains_student_data(text: str) -> bool:
+        return bool(_STUDENT_DATA_MARKERS.search(text) or _MOBILE_NUMBER.search(text)
+                    or _IDENTITY_NUMBER.search(text))
 
     def register_source(self, identity: IdentityContext, course_id: str, kind: str,
-                        document_url: str) -> dict[str, Any]:
+                        document_url: str, *, attested_no_student_data: bool = False) -> dict[str, Any]:
         self._course_member(identity, course_id)
+        if attested_no_student_data is not True:
+            raise ValueError("teaching source requires a no-student-data attestation")
         document_id = FeishuMeetingReviewGateway.document_id_from_url(document_url)
         revision, digest, blocks, _ = self._fresh_read(identity, document_id)
         source_id = "source-" + secrets.token_hex(12)
         event = self._audit(identity, "TEACHING_SOURCE_REGISTERED",
-                            {"course_id": course_id, "source_id": source_id, "revision": revision, "hash": digest})
+                            {"course_id": course_id, "source_id": source_id, "revision": revision,
+                             "hash": digest, "attested_no_student_data": True})
         with self.store.teaching_transaction() as connection:
             actor = connection.execute(
                 "SELECT active, external_ref_hash FROM actors WHERE actor_id = ? AND tenant_id = ?",
@@ -316,13 +337,15 @@ class TeachingService:
                 raise PermissionError("course membership was revoked during the read")
             connection.execute(
                 "INSERT INTO teaching_sources(source_id, tenant_id, course_id, kind, document_id, revision_id, "
-                "content_hash, block_count, submitted_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "content_hash, block_count, data_reviewed, submitted_by) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
                 (source_id, identity.tenant_id, course_id, kind, document_id,
                  revision, digest, len(blocks), identity.actor_id),
             )
             self.store.teaching_audit_in_transaction(connection, event)
         return {"source_id": source_id, "course_id": course_id, "kind": kind,
-                "revision_id": revision, "content_hash": digest, "block_count": len(blocks)}
+                "revision_id": revision, "content_hash": digest, "block_count": len(blocks),
+                "data_reviewed": True}
 
     def list_sources(self, identity: IdentityContext, course_id: str) -> list[dict[str, Any]]:
         course = self._course_member(identity, course_id)
@@ -331,6 +354,8 @@ class TeachingService:
 
     def read_source(self, identity: IdentityContext, course_id: str, source_id: str) -> dict[str, Any]:
         row = self._authorized_source(identity, course_id, source_id)
+        if not row["data_reviewed"]:
+            raise SourceChanged("teaching source must be re-registered after data review")
         revision, digest, blocks, title = self._fresh_read(identity, row["document_id"])
         if revision != row["revision_id"] or digest != row["content_hash"]:
             raise SourceChanged("source revision or content changed; register a new snapshot")

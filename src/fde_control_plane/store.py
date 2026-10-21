@@ -387,6 +387,7 @@ class SQLiteStore:
                 kind TEXT NOT NULL CHECK(kind IN ('SYLLABUS', 'WEEKLY_PLAN', 'LESSON_PLAN', 'MATERIAL')),
                 document_id TEXT NOT NULL, revision_id TEXT NOT NULL,
                 content_hash TEXT NOT NULL, block_count INTEGER NOT NULL,
+                data_reviewed INTEGER NOT NULL DEFAULT 0 CHECK(data_reviewed IN (0, 1)),
                 submitted_by TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (tenant_id, course_id) REFERENCES teaching_courses(tenant_id, course_id)
             );
@@ -448,6 +449,13 @@ class SQLiteStore:
             "PRAGMA table_info(agent_routes)").fetchall()}
         if "canary_epoch" not in route_columns:
             self.connection.execute("ALTER TABLE agent_routes ADD COLUMN canary_epoch INTEGER NOT NULL DEFAULT 0")
+        source_columns = {row["name"] for row in self.connection.execute(
+            "PRAGMA table_info(teaching_sources)").fetchall()}
+        if "data_reviewed" not in source_columns:
+            self.connection.execute(
+                "ALTER TABLE teaching_sources ADD COLUMN data_reviewed INTEGER NOT NULL DEFAULT 0 "
+                "CHECK(data_reviewed IN (0, 1))"
+            )
         self.connection.commit()
 
     @staticmethod
@@ -2516,7 +2524,8 @@ class SQLiteStore:
     def list_teaching_sources(self, tenant_id: str, course_id: str, actor_id: str,
                               *, lead: bool) -> list[sqlite3.Row]:
         return self.connection.execute(
-            "SELECT s.source_id, s.kind, s.revision_id, s.block_count, s.submitted_by, s.created_at "
+            "SELECT s.source_id, s.kind, s.revision_id, s.block_count, s.data_reviewed, "
+            "s.submitted_by, s.created_at "
             "FROM teaching_sources AS s WHERE s.tenant_id = ? AND s.course_id = ? "
             "AND (? = 1 OR s.submitted_by = ? OR EXISTS ("
             "SELECT 1 FROM teaching_source_readers AS r WHERE r.tenant_id = s.tenant_id "

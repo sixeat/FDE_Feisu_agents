@@ -397,6 +397,16 @@ class SQLiteStore:
             BEFORE UPDATE ON teaching_sources BEGIN SELECT RAISE(ABORT, 'immutable teaching source'); END;
             CREATE TRIGGER IF NOT EXISTS teaching_sources_no_delete
             BEFORE DELETE ON teaching_sources BEGIN SELECT RAISE(ABORT, 'immutable teaching source'); END;
+            CREATE TABLE IF NOT EXISTS teaching_source_blocks (
+                source_id TEXT NOT NULL, block_index INTEGER NOT NULL,
+                block_hash TEXT NOT NULL,
+                PRIMARY KEY (source_id, block_index),
+                FOREIGN KEY (source_id) REFERENCES teaching_sources(source_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS teaching_source_blocks_no_update
+            BEFORE UPDATE ON teaching_source_blocks BEGIN SELECT RAISE(ABORT, 'immutable teaching source block'); END;
+            CREATE TRIGGER IF NOT EXISTS teaching_source_blocks_no_delete
+            BEFORE DELETE ON teaching_source_blocks BEGIN SELECT RAISE(ABORT, 'immutable teaching source block'); END;
             CREATE TABLE IF NOT EXISTS teaching_source_readers (
                 tenant_id TEXT NOT NULL, course_id TEXT NOT NULL,
                 source_id TEXT NOT NULL, actor_id TEXT NOT NULL,
@@ -2532,6 +2542,12 @@ class SQLiteStore:
             "SELECT * FROM teaching_sources WHERE tenant_id = ? AND course_id = ? AND source_id = ?",
             (tenant_id, course_id, source_id),
         ).fetchone()
+
+    def list_teaching_source_blocks(self, source_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT block_index, block_hash FROM teaching_source_blocks "
+            "WHERE source_id = ? ORDER BY block_index", (source_id,)
+        ).fetchall()
 
     def list_teaching_sources(self, tenant_id: str, course_id: str, actor_id: str,
                               *, lead: bool) -> list[sqlite3.Row]:

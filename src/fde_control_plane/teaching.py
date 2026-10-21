@@ -8,6 +8,7 @@ import re
 import secrets
 from contextlib import contextmanager
 from dataclasses import replace
+from difflib import SequenceMatcher
 from typing import Any, Protocol
 
 from .feishu_review import FeishuMeetingReviewGateway
@@ -323,6 +324,12 @@ class TeachingService:
         return bool(_STUDENT_DATA_MARKERS.search(text) or _MOBILE_NUMBER.search(text)
                     or _IDENTITY_NUMBER.search(text))
 
+    @staticmethod
+    def _block_hash(block: dict[str, Any]) -> str:
+        payload = {"block_type": block["block_type"], "text": block["text"]}
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=True, sort_keys=True,
+                                         separators=(",", ":")).encode()).hexdigest()
+
     def register_source(self, identity: IdentityContext, course_id: str, kind: str,
                         document_url: str, *, attested_no_student_data: bool = False) -> dict[str, Any]:
         self._course_member(identity, course_id)
@@ -354,6 +361,10 @@ class TeachingService:
                 (source_id, identity.tenant_id, course_id, kind, document_id,
                  revision, digest, len(blocks), identity.actor_id),
             )
+            connection.executemany(
+                "INSERT INTO teaching_source_blocks(source_id, block_index, block_hash) VALUES (?, ?, ?)",
+                [(source_id, block["index"], self._block_hash(block)) for block in blocks],
+            )
             self.store.teaching_audit_in_transaction(connection, event)
         return {"source_id": source_id, "course_id": course_id, "kind": kind,
                 "revision_id": revision, "content_hash": digest, "block_count": len(blocks),
@@ -379,6 +390,48 @@ class TeachingService:
         return {"source_id": source_id, "course_id": course_id, "kind": row["kind"],
                 "revision_id": revision, "content_hash": digest, "title": title,
                 "blocks": blocks}
+
+    def diagnose_source(self, identity: IdentityContext, course_id: str, source_id: str) -> dict[str, Any]:
+        row = self._authorized_source(identity, course_id, source_id)
+        if not row["data_reviewed"]:
+            raise SourceChanged("teaching source must be re-registered after data review")
+        revision, digest, blocks, _ = self._fresh_read(identity, row["document_id"])
+        self._authorized_source(identity, course_id, source_id)
+        baseline = self.store.list_teaching_source_blocks(source_id)
+        current = [self._block_hash(block) for block in blocks]
+        baseline_available = len(baseline) == row["block_count"]
+        same_content = digest == row["content_hash"]
+        if same_content and revision == row["revision_id"]:
+            status = "CURRENT"
+        elif not baseline_available:
+            status = "BASELINE_UNAVAILABLE"
+        elif same_content:
+            status = "VERSION_CHANGED"
+        else:
+            status = "CONTENT_CHANGED"
+        missing: list[int] = []
+        added: list[int] = []
+        if baseline_available and not same_content:
+            old_hashes = [item["block_hash"] for item in baseline]
+            matched_old: set[int] = set()
+            matched_new: set[int] = set()
+            for old_start, new_start, length in SequenceMatcher(
+                None, old_hashes, current, autojunk=False,
+            ).get_matching_blocks():
+                matched_old.update(range(old_start, old_start + length))
+                matched_new.update(range(new_start, new_start + length))
+            missing = [item["block_index"] for i, item in enumerate(baseline) if i not in matched_old]
+            added = [blocks[i]["index"] for i in range(len(blocks)) if i not in matched_new]
+        self.store.save_audit(self._audit(identity, "TEACHING_SOURCE_DIAGNOSED",
+                                         {"course_id": course_id, "source_id": source_id,
+                                          "baseline_revision": row["revision_id"],
+                                          "current_revision": revision, "status": status,
+                                          "missing": missing, "added": added}))
+        return {"source_id": source_id, "baseline_revision": row["revision_id"],
+                "current_revision": revision, "baseline_block_count": row["block_count"],
+                "current_block_count": len(blocks), "status": status,
+                "baseline_available": baseline_available,
+                "missing_block_candidates": missing, "new_block_candidates": added}
 
     @staticmethod
     def _week_coverage(items: list[dict[str, Any]], expected_weeks: list[int]) -> dict[str, list[int]]:

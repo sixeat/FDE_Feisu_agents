@@ -127,6 +127,11 @@ def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSession
     def read_source(course_id: str, source_id: str, identity: IdentityContext = Depends(require_identity)):
         return call(service.read_source, identity, course_id, source_id)
 
+    @router.get("/courses/{course_id}/sources/{source_id}/diagnostics")
+    def diagnose_source(course_id: str, source_id: str,
+                        identity: IdentityContext = Depends(require_identity)):
+        return call(service.diagnose_source, identity, course_id, source_id)
+
     @router.get("/courses/{course_id}/sources/{source_id}/readers")
     def list_source_readers(course_id: str, source_id: str,
                             identity: IdentityContext = Depends(require_identity)):

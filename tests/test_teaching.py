@@ -339,6 +339,93 @@ def test_source_requires_course_access_and_document_scope(tmp_path):
     assert len(reader.calls) == before
 
 
+def test_source_diagnostics_separate_removed_blocks_edits_and_revision_only(tmp_path):
+    cp, reader, client, contexts, login = setup(tmp_path)
+    create_course(client, login("admin"))
+    original = [
+        {"index": 1, "block_type": 2, "text": "课程目标：理解递归。"},
+        {"index": 2, "block_type": 2, "text": "第 1 周：递归定义。"},
+        {"index": 3, "block_type": 2, "text": "第 2 周：递归练习。"},
+    ]
+    reader.blocks = original
+    source = client.post("/api/teaching/courses/demo/sources", json={
+        "kind": "WEEKLY_PLAN", "document_url": DOC_URL, "attested_no_student_data": True,
+    }, headers=login("lead")).json()
+    source_id = source["source_id"]
+    path = f"/api/teaching/courses/demo/sources/{source_id}/diagnostics"
+    assert client.get(path).json()["status"] == "CURRENT"
+    assert len(cp.store.list_teaching_source_blocks(source_id)) == 3
+    assert all("递归" not in str(dict(row)) for row in cp.store.list_teaching_source_blocks(source_id))
+    with pytest.raises(sqlite3.IntegrityError, match="immutable teaching source block"):
+        cp.store.connection.execute(
+            "UPDATE teaching_source_blocks SET block_hash = 'x' WHERE source_id = ?", (source_id,)
+        )
+    reader.revision = "2"
+    reader.blocks = [original[0], {**original[2], "index": 2}]
+    result = client.get(path).json()
+    assert result["status"] == "CONTENT_CHANGED"
+    assert result["missing_block_candidates"] == [2]
+    assert result["new_block_candidates"] == []
+    assert result["baseline_block_count"] == 3 and result["current_block_count"] == 2
+    assert "递归" not in str(result)
+    assert client.get(f"/api/teaching/courses/demo/sources/{source_id}").status_code == 409
+    reader.blocks = [original[0], {**original[1], "text": "第 1 周：递归案例。"}, original[2]]
+    edited = client.get(path).json()
+    assert edited["missing_block_candidates"] == [2]
+    assert edited["new_block_candidates"] == [2]
+    reader.blocks = original
+    assert client.get(path).json()["status"] == "VERSION_CHANGED"
+    assert all("递归" not in str(event) for event in cp.store.list_tenant_audits("tenant"))
+
+
+def test_source_diagnostics_fail_closed_on_revocation_and_old_baseline(tmp_path):
+    cp, reader, client, contexts, login = setup(tmp_path)
+    create_course(client, login("admin"))
+    source_id = client.post("/api/teaching/courses/demo/sources", json={
+        "kind": "SYLLABUS", "document_url": DOC_URL, "attested_no_student_data": True,
+    }, headers=login("lead")).json()["source_id"]
+    path = f"/api/teaching/courses/demo/sources/{source_id}/diagnostics"
+    login("outsider")
+    before = len(reader.calls)
+    assert client.get(path).status_code == 403
+    assert len(reader.calls) == before
+    login("lead")
+    reader.allowed.remove("lead")
+    assert client.get(path).status_code == 403
+    reader.allowed.add("lead")
+    original_read = reader.read_document
+
+    def revoke_during_read(identity, document_id):
+        result = original_read(identity, document_id)
+        cp.store.connection.execute(
+            "UPDATE teaching_course_members SET active = 0 WHERE course_id = 'demo' AND actor_id = 'lead'"
+        )
+        cp.store.connection.commit()
+        return result
+
+    reader.read_document = revoke_during_read
+    assert client.get(path).status_code == 403
+    assert not any(event["event_type"] == "TEACHING_SOURCE_DIAGNOSED"
+                   for event in cp.store.list_tenant_audits("tenant"))
+    reader.read_document = original_read
+    cp.store.connection.execute(
+        "UPDATE teaching_course_members SET active = 1 WHERE course_id = 'demo' AND actor_id = 'lead'"
+    )
+    cp.store.connection.commit()
+    revision, digest, _ = TeachingService._snapshot(original_read(contexts["lead"], DOC_ID), DOC_ID)
+    cp.store.connection.execute(
+        "INSERT INTO teaching_sources(source_id, tenant_id, course_id, kind, document_id, revision_id, "
+        "content_hash, block_count, data_reviewed, submitted_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+        ("old-source", "tenant", "demo", "SYLLABUS", DOC_ID, revision, digest, 1, "lead"),
+    )
+    cp.store.connection.commit()
+    reader.text = "虚构课程目标改为迭代。"
+    legacy = client.get("/api/teaching/courses/demo/sources/old-source/diagnostics").json()
+    assert legacy["status"] == "BASELINE_UNAVAILABLE"
+    assert legacy["baseline_available"] is False
+    assert legacy["missing_block_candidates"] == []
+
+
 def test_reopening_database_preserves_course_and_source_contract(tmp_path):
     cp, reader, client, contexts, login = setup(tmp_path)
     create_course(client, login("admin"))

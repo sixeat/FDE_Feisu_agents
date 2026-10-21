@@ -6,7 +6,7 @@ import secrets
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 
 from .feishu_oauth_web import SQLiteOAuthSessionIssuer, build_session_dependency
 from .meeting_review_web import csrf_token
@@ -32,6 +32,22 @@ class SourceRegisterRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal["SYLLABUS", "WEEKLY_PLAN", "LESSON_PLAN", "MATERIAL"]
     document_url: StrictStr = Field(min_length=20, max_length=1000)
+
+
+class TeachingOutlineItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    item_id: StrictStr = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    kind: Literal["OBJECTIVE", "WEEK_PLAN", "LESSON_FRAGMENT"]
+    block_index: StrictInt = Field(ge=1, le=1000)
+    quote: StrictStr = Field(min_length=2, max_length=1000)
+    week_number: StrictInt | None = Field(default=None, ge=1, le=60)
+    start_offset: StrictInt | None = Field(default=None, ge=0)
+
+
+class TeachingOutlineRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    items: list[TeachingOutlineItem] = Field(min_length=1, max_length=100)
+    expected_weeks: list[StrictInt] = Field(default_factory=list, max_length=60)
 
 
 def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSessionIssuer,
@@ -105,5 +121,21 @@ def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSession
     @router.get("/courses/{course_id}/sources/{source_id}")
     def read_source(course_id: str, source_id: str, identity: IdentityContext = Depends(require_identity)):
         return call(service.read_source, identity, course_id, source_id)
+
+    @router.get("/courses/{course_id}/sources/{source_id}/outlines")
+    def list_outlines(course_id: str, source_id: str, identity: IdentityContext = Depends(require_identity)):
+        return {"outlines": call(service.list_outlines, identity, course_id, source_id)}
+
+    @router.post("/courses/{course_id}/sources/{source_id}/outlines")
+    def create_outline(course_id: str, source_id: str, body: TeachingOutlineRequest, request: Request,
+                       identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        return call(service.create_outline, identity, course_id, source_id,
+                    [item.model_dump() for item in body.items], body.expected_weeks)
+
+    @router.get("/courses/{course_id}/sources/{source_id}/outlines/{outline_id}")
+    def read_outline(course_id: str, source_id: str, outline_id: str,
+                     identity: IdentityContext = Depends(require_identity)):
+        return call(service.read_outline, identity, course_id, source_id, outline_id)
 
     return router

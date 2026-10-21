@@ -396,6 +396,20 @@ class SQLiteStore:
             BEFORE UPDATE ON teaching_sources BEGIN SELECT RAISE(ABORT, 'immutable teaching source'); END;
             CREATE TRIGGER IF NOT EXISTS teaching_sources_no_delete
             BEFORE DELETE ON teaching_sources BEGIN SELECT RAISE(ABORT, 'immutable teaching source'); END;
+            CREATE TABLE IF NOT EXISTS teaching_outlines (
+                outline_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, course_id TEXT NOT NULL,
+                source_id TEXT NOT NULL, source_revision TEXT NOT NULL,
+                source_hash TEXT NOT NULL, outline_hash TEXT NOT NULL,
+                data_json TEXT NOT NULL, created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (source_id) REFERENCES teaching_sources(source_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_teaching_outlines_source
+                ON teaching_outlines(tenant_id, course_id, source_id, created_at);
+            CREATE TRIGGER IF NOT EXISTS teaching_outlines_no_update
+            BEFORE UPDATE ON teaching_outlines BEGIN SELECT RAISE(ABORT, 'immutable teaching outline'); END;
+            CREATE TRIGGER IF NOT EXISTS teaching_outlines_no_delete
+            BEFORE DELETE ON teaching_outlines BEGIN SELECT RAISE(ABORT, 'immutable teaching outline'); END;
             CREATE INDEX IF NOT EXISTS idx_audit_triage_tenant
                 ON audit_triage(tenant_id, status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_approvals_task ON approvals(task_run_id);
@@ -2492,6 +2506,22 @@ class SQLiteStore:
             "SELECT source_id, kind, revision_id, block_count, submitted_by, created_at "
             "FROM teaching_sources WHERE tenant_id = ? AND course_id = ? ORDER BY created_at, source_id",
             (tenant_id, course_id),
+        ).fetchall()
+
+    def get_teaching_outline(self, tenant_id: str, course_id: str, source_id: str,
+                             outline_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM teaching_outlines WHERE tenant_id = ? AND course_id = ? "
+            "AND source_id = ? AND outline_id = ?",
+            (tenant_id, course_id, source_id, outline_id),
+        ).fetchone()
+
+    def list_teaching_outlines(self, tenant_id: str, course_id: str, source_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT outline_id, source_revision, outline_hash, created_by, created_at "
+            "FROM teaching_outlines WHERE tenant_id = ? AND course_id = ? AND source_id = ? "
+            "ORDER BY created_at, outline_id",
+            (tenant_id, course_id, source_id),
         ).fetchall()
 
     def list_audits(self) -> list[dict[str, Any]]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 
 import pytest
@@ -25,6 +26,7 @@ class FakeUserReader:
         self.allowed = {"admin", "lead", "teacher"}
         self.revision = "1"
         self.text = "第 2 周：以虚构示例讲授递归。"
+        self.blocks = None
         self.calls: list[tuple[str, str]] = []
         self.change_during_read = False
 
@@ -33,7 +35,7 @@ class FakeUserReader:
         if identity.actor_id not in self.allowed:
             raise PermissionError("member cannot read the Feishu document")
         snapshot = {"document_id": document_id, "revision_id": self.revision, "title": "虚构课程周计划",
-                    "blocks": [{"index": 1, "block_type": 2, "text": self.text}]}
+                    "blocks": self.blocks or [{"index": 1, "block_type": 2, "text": self.text}]}
         if self.change_during_read:
             self.revision = str(int(self.revision) + 1)
         return snapshot
@@ -230,3 +232,133 @@ def test_missing_member_oauth_reader_fails_closed(tmp_path):
     }, headers={"X-CSRF-Token": hashlib.sha256(("meeting-review-csrf:" + token).encode()).hexdigest(),
                 "Origin": "https://example.test"}).status_code == 503
     assert cp.store.connection.execute("SELECT count(*) FROM teaching_sources").fetchone()[0] == 0
+
+
+def test_weekly_outline_has_pinned_citations_and_human_coverage(tmp_path):
+    cp, reader, client, contexts, login = setup(tmp_path)
+    create_course(client, login("admin"))
+    reader.blocks = [
+        {"index": 1, "block_type": 3, "text": "虚构周计划"},
+        {"index": 2, "block_type": 2, "text": "第 1 周：递归基础与练习。"},
+        {"index": 3, "block_type": 2, "text": "第 2 周：树的遍历与讨论。"},
+    ]
+    lead_headers = login("lead")
+    source = client.post("/api/teaching/courses/demo/sources", json={
+        "kind": "WEEKLY_PLAN", "document_url": DOC_URL,
+    }, headers=lead_headers).json()
+    source_id = source["source_id"]
+    outline_request = {"expected_weeks": [1, 2, 3], "items": [
+        {"item_id": "week-1", "kind": "WEEK_PLAN", "block_index": 2,
+         "quote": "递归基础与练习", "week_number": 1},
+        {"item_id": "week-2", "kind": "WEEK_PLAN", "block_index": 3,
+         "quote": "树的遍历与讨论", "week_number": 2},
+    ]}
+    path = f"/api/teaching/courses/demo/sources/{source_id}/outlines"
+    assert client.post(path, json=outline_request).status_code == 403
+    assert client.post(path, json={**outline_request, "unexpected": True}, headers=lead_headers).status_code == 422
+    created = client.post(path, json=outline_request, headers=lead_headers)
+    assert created.status_code == 200
+    outline_id = created.json()["outline_id"]
+    assert created.json()["coverage"]["unannotated_expected_weeks"] == [3]
+    assert created.json()["coverage"]["unexpected_weeks"] == []
+    stored = dict(cp.store.get_teaching_outline("tenant", "demo", source_id, outline_id))
+    assert "递归基础与练习" not in str(stored)
+    assert "树的遍历与讨论" not in str(stored)
+    assert all("quote" not in item for item in json.loads(stored["data_json"])["items"])
+    with pytest.raises(sqlite3.IntegrityError, match="immutable teaching outline"):
+        cp.store.connection.execute("UPDATE teaching_outlines SET source_revision = '9' WHERE outline_id = ?",
+                                    (outline_id,))
+    with pytest.raises(sqlite3.IntegrityError, match="immutable teaching outline"):
+        cp.store.connection.execute("DELETE FROM teaching_outlines WHERE outline_id = ?", (outline_id,))
+
+    granted = client.post("/api/teaching/courses/demo/teachers", json={
+        "actor_id": "teacher", "reason": "课程负责人允许查看周计划",
+    }, headers=lead_headers)
+    assert granted.status_code == 200
+    login("teacher")
+    assert client.get(path).json()["outlines"][0]["outline_id"] == outline_id
+    detail = client.get(f"{path}/{outline_id}")
+    assert detail.status_code == 200
+    assert [item["quote"] for item in detail.json()["items"]] == ["递归基础与练习", "树的遍历与讨论"]
+    assert detail.json()["items"][0]["citation"]["block_index"] == 2
+    assert detail.json()["items"][0]["citation"]["revision_id"] == "1"
+    assert detail.json()["coverage"]["unannotated_expected_weeks"] == [3]
+    reader.allowed.remove("teacher")
+    assert client.get(f"{path}/{outline_id}").status_code == 403
+    reader.allowed.add("teacher")
+    reader.revision = "2"
+    assert client.get(f"{path}/{outline_id}").status_code == 409
+    assert cp.store.connection.execute("SELECT count(*) FROM teaching_outlines").fetchone()[0] == 1
+    reader.revision = "1"
+    assert client.delete("/api/teaching/courses/demo/teachers/teacher",
+                         params={"reason": "结束教师的课程资料访问"}, headers=login("lead")).status_code == 200
+    login("teacher")
+    before = len(reader.calls)
+    assert client.get(path).status_code == 403
+    assert client.get(f"{path}/{outline_id}").status_code == 403
+    assert len(reader.calls) == before
+    audits = cp.store.list_tenant_audits("tenant")
+    assert {event["event_type"] for event in audits} >= {
+        "TEACHING_OUTLINE_CREATED", "TEACHING_OUTLINE_READ",
+    }
+    assert all("递归基础与练习" not in str(event) for event in audits)
+
+
+@pytest.mark.parametrize("source_kind,item_kind,quote,week", [
+    ("SYLLABUS", "OBJECTIVE", "理解递归的基本思想", None),
+    ("LESSON_PLAN", "LESSON_FRAGMENT", "递归课堂练习", 2),
+])
+def test_syllabus_and_lesson_fragments_require_exact_source_quote(
+    tmp_path, source_kind, item_kind, quote, week,
+):
+    cp, reader, client, contexts, login = setup(tmp_path)
+    create_course(client, login("admin"))
+    reader.text = f"虚构资料：{quote}。"
+    headers = login("lead")
+    source_id = client.post("/api/teaching/courses/demo/sources", json={
+        "kind": source_kind, "document_url": DOC_URL,
+    }, headers=headers).json()["source_id"]
+    path = f"/api/teaching/courses/demo/sources/{source_id}/outlines"
+    item = {"item_id": "item-1", "kind": item_kind, "block_index": 1,
+            "quote": quote, "week_number": week}
+    assert client.post(path, json={"items": [{**item, "quote": "不存在的内容"}]},
+                       headers=headers).status_code == 422
+    assert client.post(path, json={"items": [{**item, "kind": "WEEK_PLAN"}],
+                                   "expected_weeks": [1]}, headers=headers).status_code == 422
+    created = client.post(path, json={"items": [item]}, headers=headers)
+    assert created.status_code == 200
+    fetched = client.get(f"{path}/{created.json()['outline_id']}")
+    assert fetched.status_code == 200
+    assert fetched.json()["items"][0]["quote"] == quote
+    assert fetched.json()["items"][0]["citation"]["start_offset"] == len("虚构资料：")
+    if source_kind == "LESSON_PLAN":
+        assert fetched.json()["coverage"] == {
+            "expected_weeks": [], "annotated_weeks": [week],
+            "unannotated_expected_weeks": [], "unexpected_weeks": [],
+        }
+
+
+def test_outline_rejects_ambiguous_quotes_and_cross_course_ids(tmp_path):
+    cp, reader, client, contexts, login = setup(tmp_path)
+    assert create_course(client, login("admin")).status_code == 200
+    assert create_course(client, login("admin"), "another").status_code == 200
+    reader.text = "第 1 周练习，继续第 1 周练习。"
+    headers = login("lead")
+    source_id = client.post("/api/teaching/courses/demo/sources", json={
+        "kind": "WEEKLY_PLAN", "document_url": DOC_URL,
+    }, headers=headers).json()["source_id"]
+    path = f"/api/teaching/courses/demo/sources/{source_id}/outlines"
+    item = {"item_id": "w1", "kind": "WEEK_PLAN", "block_index": 1,
+            "quote": "第 1 周练习", "week_number": 1}
+    assert client.post(path, json={"items": [item], "expected_weeks": [1]}, headers=headers).status_code == 422
+    assert client.post(path, json={"items": [item, item], "expected_weeks": [1]}, headers=headers).status_code == 422
+    assert client.post(path, json={"items": [{**item, "start_offset": 3}],
+                                   "expected_weeks": [1]}, headers=headers).status_code == 422
+    created = client.post(path, json={"items": [{**item, "start_offset": 0}],
+                                        "expected_weeks": [1, 2]}, headers=headers)
+    assert created.status_code == 200
+    assert created.json()["coverage"]["unannotated_expected_weeks"] == [2]
+    before = len(reader.calls)
+    wrong_path = f"/api/teaching/courses/another/sources/{source_id}/outlines/{created.json()['outline_id']}"
+    assert client.get(wrong_path).status_code == 404
+    assert len(reader.calls) == before

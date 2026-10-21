@@ -253,3 +253,133 @@ class TeachingService:
         return {"source_id": source_id, "course_id": course_id, "kind": row["kind"],
                 "revision_id": revision, "content_hash": digest, "title": title,
                 "blocks": blocks}
+
+    @staticmethod
+    def _week_coverage(items: list[dict[str, Any]], expected_weeks: list[int]) -> dict[str, list[int]]:
+        annotated = {item["week_number"] for item in items if item.get("week_number") is not None}
+        expected = set(expected_weeks)
+        return {"expected_weeks": sorted(expected), "annotated_weeks": sorted(annotated),
+                "unannotated_expected_weeks": sorted(expected - annotated),
+                "unexpected_weeks": sorted(annotated - expected) if expected_weeks else []}
+
+    def create_outline(self, identity: IdentityContext, course_id: str, source_id: str,
+                       items: list[dict[str, Any]], expected_weeks: list[int]) -> dict[str, Any]:
+        source = self.read_source(identity, course_id, source_id)
+        source_kind = source["kind"]
+        item_kind = {"SYLLABUS": "OBJECTIVE", "WEEKLY_PLAN": "WEEK_PLAN",
+                     "LESSON_PLAN": "LESSON_FRAGMENT"}.get(source_kind)
+        if item_kind is None:
+            raise ValueError("this source kind cannot be structured as a teaching outline")
+        if not 1 <= len(items) <= 100 or len(expected_weeks) != len(set(expected_weeks)):
+            raise ValueError("outline items or expected weeks are invalid")
+        if source_kind == "WEEKLY_PLAN":
+            if not expected_weeks or any(not 1 <= week <= 60 for week in expected_weeks):
+                raise ValueError("weekly plan needs explicit expected weeks")
+        elif expected_weeks:
+            raise ValueError("expected weeks belong only to a weekly plan")
+        block_by_index = {block["index"]: block for block in source["blocks"]}
+        references: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for item in items:
+            item_id, kind = item["item_id"], item["kind"]
+            if item_id in seen_ids or kind != item_kind:
+                raise ValueError("outline item IDs or kinds are invalid for this source")
+            seen_ids.add(item_id)
+            week = item.get("week_number")
+            if (kind == "WEEK_PLAN" and week is None) or (kind == "OBJECTIVE" and week is not None):
+                raise ValueError("outline week number does not match item kind")
+            block = block_by_index.get(item["block_index"])
+            if block is None:
+                raise ValueError("outline citation block does not exist")
+            text, quote = block["text"], item["quote"]
+            offset = item.get("start_offset")
+            if offset is None:
+                offset = text.find(quote)
+                if offset < 0 or text.find(quote, offset + 1) >= 0:
+                    raise ValueError("outline quote is missing or ambiguous in the cited block")
+            if offset < 0 or text[offset:offset + len(quote)] != quote:
+                raise ValueError("outline quote does not match the cited position")
+            references.append({
+                "item_id": item_id, "kind": kind, "week_number": week,
+                "block_index": block["index"], "start_offset": offset,
+                "end_offset": offset + len(quote),
+                "block_hash": hashlib.sha256(text.encode()).hexdigest(),
+                "quote_hash": hashlib.sha256(quote.encode()).hexdigest(),
+            })
+        payload = {"items": references, "expected_weeks": sorted(expected_weeks)}
+        outline_hash = hashlib.sha256(self.store._json(payload).encode()).hexdigest()
+        outline_id = "outline-" + secrets.token_hex(12)
+        event = self._audit(identity, "TEACHING_OUTLINE_CREATED",
+                            {"course_id": course_id, "source_id": source_id,
+                             "outline_id": outline_id, "hash": outline_hash})
+        with self.store.teaching_transaction() as connection:
+            actor = connection.execute(
+                "SELECT active, external_ref_hash FROM actors WHERE actor_id = ? AND tenant_id = ?",
+                (identity.actor_id, identity.tenant_id),
+            ).fetchone()
+            member = connection.execute(
+                "SELECT active FROM teaching_course_members WHERE tenant_id = ? AND course_id = ? AND actor_id = ?",
+                (identity.tenant_id, course_id, identity.actor_id),
+            ).fetchone()
+            pinned = connection.execute(
+                "SELECT revision_id, content_hash FROM teaching_sources "
+                "WHERE tenant_id = ? AND course_id = ? AND source_id = ?",
+                (identity.tenant_id, course_id, source_id),
+            ).fetchone()
+            if (actor is None or not actor["active"] or actor["external_ref_hash"] != identity.subject_ref_hash
+                    or member is None or not member["active"]):
+                raise PermissionError("course or member authorization was revoked during annotation")
+            if (pinned is None or pinned["revision_id"] != source["revision_id"]
+                    or pinned["content_hash"] != source["content_hash"]):
+                raise SourceChanged("source snapshot changed during annotation")
+            connection.execute(
+                "INSERT INTO teaching_outlines(outline_id, tenant_id, course_id, source_id, source_revision, "
+                "source_hash, outline_hash, data_json, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (outline_id, identity.tenant_id, course_id, source_id, source["revision_id"],
+                 source["content_hash"], outline_hash, self.store._json(payload), identity.actor_id),
+            )
+            self.store.teaching_audit_in_transaction(connection, event)
+        return {"outline_id": outline_id, "source_id": source_id, "source_revision": source["revision_id"],
+                "outline_hash": outline_hash, "item_count": len(references),
+                "coverage": self._week_coverage(references, expected_weeks)}
+
+    def list_outlines(self, identity: IdentityContext, course_id: str, source_id: str) -> list[dict[str, Any]]:
+        self._course_member(identity, course_id)
+        if self.store.get_teaching_source(identity.tenant_id, course_id, source_id) is None:
+            raise KeyError("teaching source is not in this course")
+        return [dict(row) for row in self.store.list_teaching_outlines(identity.tenant_id, course_id, source_id)]
+
+    def read_outline(self, identity: IdentityContext, course_id: str, source_id: str,
+                     outline_id: str) -> dict[str, Any]:
+        self._course_member(identity, course_id)
+        row = self.store.get_teaching_outline(identity.tenant_id, course_id, source_id, outline_id)
+        if row is None:
+            raise KeyError("teaching outline is not in this course and source")
+        source = self.read_source(identity, course_id, source_id)
+        if (row["source_revision"] != source["revision_id"]
+                or row["source_hash"] != source["content_hash"]):
+            raise SourceChanged("outline source has changed")
+        payload = json.loads(row["data_json"])
+        if hashlib.sha256(self.store._json(payload).encode()).hexdigest() != row["outline_hash"]:
+            raise SourceChanged("outline integrity check failed")
+        blocks = {block["index"]: block["text"] for block in source["blocks"]}
+        resolved = []
+        for reference in payload["items"]:
+            block_text = blocks.get(reference["block_index"])
+            if block_text is None or hashlib.sha256(block_text.encode()).hexdigest() != reference["block_hash"]:
+                raise SourceChanged("outline citation block changed")
+            quote = block_text[reference["start_offset"]:reference["end_offset"]]
+            if hashlib.sha256(quote.encode()).hexdigest() != reference["quote_hash"]:
+                raise SourceChanged("outline citation quote changed")
+            resolved.append({"item_id": reference["item_id"], "kind": reference["kind"],
+                             "week_number": reference["week_number"], "quote": quote,
+                             "citation": {"source_id": source_id, "revision_id": source["revision_id"],
+                                          "block_index": reference["block_index"],
+                                          "start_offset": reference["start_offset"],
+                                          "end_offset": reference["end_offset"]}})
+        self.store.save_audit(self._audit(identity, "TEACHING_OUTLINE_READ",
+                                         {"course_id": course_id, "source_id": source_id,
+                                          "outline_id": outline_id, "hash": row["outline_hash"]}))
+        return {"outline_id": outline_id, "source_id": source_id, "source_revision": source["revision_id"],
+                "outline_hash": row["outline_hash"], "created_by": row["created_by"],
+                "items": resolved, "coverage": self._week_coverage(payload["items"], payload["expected_weeks"])}

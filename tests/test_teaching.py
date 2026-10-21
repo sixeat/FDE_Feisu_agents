@@ -11,7 +11,10 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from fde_control_plane import Actor, ActorType, ControlPlane, IdentityContext, SQLiteOAuthSessionIssuer, SQLiteStore
+from fde_control_plane import (
+    Actor, ActorType, AgentVersion, AssistantBinding, ControlPlane, IdentityContext,
+    SQLiteOAuthSessionIssuer, SQLiteStore, TaskRunStatus,
+)
 from fde_control_plane.teaching import TeachingService
 from fde_control_plane.teaching_web import build_teaching_router
 from fde_control_plane.user_document_access import DOC_READ_SCOPE
@@ -74,6 +77,128 @@ def setup(tmp_path):
         return {"X-CSRF-Token": token, "Origin": "https://example.test"}
 
     return cp, reader, client, contexts, login
+
+
+def teaching_handoff_fixture(tmp_path):
+    cp, reader, client, contexts, login = setup(tmp_path)
+    caps = frozenset({"doc.read"})
+    cp.register_actor(Actor("assistant", "tenant", ActorType.PERSONAL_ASSISTANT, caps))
+    cp.register_actor(Actor("source-agent", "tenant", ActorType.BUSINESS_AGENT, caps))
+    cp.register_agent_version(AgentVersion("source-agent", 1, caps))
+    cp.bind_assistant(AssistantBinding("lead-binding", "tenant", "lead", "assistant"))
+    cp.register_actor(Actor("lead", "tenant", ActorType.USER, caps,
+                            external_ref_hash=contexts["lead"].subject_ref_hash))
+    create_course(client, login("admin"))
+    login("lead")
+    source_id = client.post("/api/teaching/courses/demo/sources", json={
+        "kind": "SYLLABUS", "document_url": DOC_URL, "attested_no_student_data": True,
+    }, headers=login("lead")).json()["source_id"]
+    outline_id = client.post(f"/api/teaching/courses/demo/sources/{source_id}/outlines", json={
+        "items": [{"item_id": "objective-1", "kind": "OBJECTIVE", "block_index": 1,
+                   "quote": "递归", "week_number": None}],
+    }, headers=login("lead")).json()["outline_id"]
+    return cp, reader, client, contexts, source_id, outline_id
+
+
+def test_readonly_teaching_handoff_is_durable_idempotent_and_has_no_tools(tmp_path):
+    cp, reader, _, contexts, source_id, outline_id = teaching_handoff_fixture(tmp_path)
+    service = TeachingService(cp, reader)
+    args = (contexts["lead"], "demo", source_id, outline_id, "source-agent", 1)
+    first = service.handoff_outline(*args)
+    second = service.handoff_outline(*args)
+    assert second == first
+    assert cp._task(first["task_run_id"]).status == TaskRunStatus.SUCCEEDED
+    assert cp.store.list_task_steps(first["task_run_id"])[0]["status"] == "SUCCEEDED"
+    delegation = cp.store.list_delegations(first["task_run_id"])
+    assert len(delegation) == 1 and delegation[0]["scope"] == ["doc.read"]
+    assert cp.store.list_tool_calls(first["task_run_id"]) == []
+    assert cp.store.list_approvals(first["task_run_id"]) == []
+    assert cp.store.list_runtime_events(first["task_run_id"]) == []
+    reopened = SQLiteStore(tmp_path / "course.sqlite3")
+    saved = dict(reopened.get_teaching_handoff(first["task_run_id"]))
+    assert saved["outline_hash"] == first["outline_hash"]
+    assert reader.text not in str(saved)
+    reopened.close()
+    assert sum(e["event_type"] == "TEACHING_READONLY_HANDOFF"
+               for e in cp.store.list_tenant_audits("tenant")) == 1
+
+
+def test_readonly_handoff_rechecks_course_source_version_and_agent_scope(tmp_path):
+    cp, reader, _, contexts, source_id, outline_id = teaching_handoff_fixture(tmp_path)
+    service = TeachingService(cp, reader)
+    args = (contexts["lead"], "demo", source_id, outline_id, "source-agent", 1)
+    with pytest.raises(PermissionError, match="course membership"):
+        service.handoff_outline(contexts["lead"], "other", source_id, outline_id, "source-agent", 1)
+    reader.revision = "2"
+    with pytest.raises(Exception, match="source revision or content changed"):
+        service.handoff_outline(*args)
+    reader.revision = "1"
+    cp.register_agent_version(AgentVersion("source-agent", 2, frozenset()))
+    with pytest.raises(PermissionError, match="read-only teaching delegation"):
+        service.handoff_outline(*args[:-1], 2)
+    assert cp.store.connection.execute("SELECT count(*) FROM teaching_handoffs").fetchone()[0] == 0
+    assert cp.store.connection.execute("SELECT count(*) FROM task_runs").fetchone()[0] == 0
+
+
+def test_readonly_handoff_denies_revoked_member_on_replay_and_during_handoff(tmp_path):
+    cp, reader, _, contexts, source_id, outline_id = teaching_handoff_fixture(tmp_path)
+    service = TeachingService(cp, reader)
+    args = (contexts["lead"], "demo", source_id, outline_id, "source-agent", 1)
+    first = service.handoff_outline(*args)
+    cp.store.connection.execute(
+        "UPDATE teaching_course_members SET active = 0 WHERE course_id = 'demo' AND actor_id = 'lead'"
+    )
+    cp.store.connection.commit()
+    with pytest.raises(PermissionError, match="course membership"):
+        service.handoff_outline(*args)
+    assert len(cp.store.list_delegations(first["task_run_id"])) == 1
+
+    cp.store.connection.execute(
+        "UPDATE teaching_course_members SET active = 1 WHERE course_id = 'demo' AND actor_id = 'lead'"
+    )
+    cp.store.connection.commit()
+    original_read = service.read_outline
+
+    def revoke_after_read(*params):
+        result = original_read(*params)
+        cp.store.connection.execute(
+            "UPDATE teaching_course_members SET active = 0 WHERE course_id = 'demo' AND actor_id = 'lead'"
+        )
+        cp.store.connection.commit()
+        return result
+
+    service.read_outline = revoke_after_read
+    cp.register_agent_version(AgentVersion("source-agent", 2, frozenset({"doc.read"})))
+    with pytest.raises(PermissionError, match="revoked during handoff"):
+        service.handoff_outline(*args[:-1], 2)
+    failed = cp.store.connection.execute(
+        "SELECT data_json FROM task_runs WHERE task_run_id != ?", (first["task_run_id"],)
+    ).fetchone()
+    assert failed is not None and json.loads(failed["data_json"])["status"] == "FAILED"
+    assert cp.store.connection.execute("SELECT count(*) FROM teaching_handoffs").fetchone()[0] == 1
+
+
+def test_readonly_handoff_requires_binding_and_current_source_share(tmp_path):
+    cp, reader, _, contexts, source_id, outline_id = teaching_handoff_fixture(tmp_path)
+    service = TeachingService(cp, reader)
+    cp.store.connection.execute("DELETE FROM assistant_bindings WHERE member_actor_id = 'lead'")
+    cp.store.connection.commit()
+    with pytest.raises(PermissionError, match="personal assistant binding"):
+        service.handoff_outline(contexts["lead"], "demo", source_id, outline_id, "source-agent", 1)
+    cp.bind_assistant(AssistantBinding("lead-binding-2", "tenant", "lead", "assistant"))
+    cp.register_actor(Actor("teacher", "tenant", ActorType.USER, frozenset({"doc.read"}),
+                            external_ref_hash=contexts["teacher"].subject_ref_hash))
+    cp.bind_assistant(AssistantBinding("teacher-binding", "tenant", "teacher", "assistant"))
+    service.set_teacher(contexts["lead"], "demo", "teacher", active=True, reason="课程负责人授予资料访问")
+    service.set_source_reader(contexts["lead"], "demo", source_id, "teacher",
+                              active=True, reason="课程负责人逐项共享大纲")
+    args = (contexts["teacher"], "demo", source_id, outline_id, "source-agent", 1)
+    first = service.handoff_outline(*args)
+    service.set_source_reader(contexts["lead"], "demo", source_id, "teacher",
+                              active=False, reason="课程负责人撤销大纲共享")
+    with pytest.raises(PermissionError, match="source access"):
+        service.handoff_outline(*args)
+    assert len(cp.store.list_delegations(first["task_run_id"])) == 1
 
 
 def create_course(client, headers, course_id="demo"):

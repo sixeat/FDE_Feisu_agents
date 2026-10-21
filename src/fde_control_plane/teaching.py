@@ -6,10 +6,12 @@ import hashlib
 import json
 import re
 import secrets
+from contextlib import contextmanager
+from dataclasses import replace
 from typing import Any, Protocol
 
 from .feishu_review import FeishuMeetingReviewGateway
-from .models import ActorType, AuditEvent, IdentityContext
+from .models import ActorType, AuditEvent, Delegation, IdentityContext, TaskRunStatus, TaskStep
 from .service import ControlPlane
 from .user_document_access import DOC_READ_SCOPE
 
@@ -35,6 +37,16 @@ class TeachingService:
         self.cp = control_plane
         self.store = control_plane.store
         self.reader = reader
+
+    @contextmanager
+    def _handoff_transaction(self, task_run_id: str):
+        try:
+            with self.store.teaching_transaction() as connection:
+                yield connection
+        except Exception as exc:
+            self.cp.transition_task(task_run_id, TaskRunStatus.FAILED,
+                                    f"TEACHING_HANDOFF_{type(exc).__name__}")
+            raise
 
     def _member(self, identity: IdentityContext):
         actor = self.cp.verify_identity(identity)
@@ -504,3 +516,151 @@ class TeachingService:
         return {"outline_id": outline_id, "source_id": source_id, "source_revision": source["revision_id"],
                 "outline_hash": row["outline_hash"], "created_by": row["created_by"],
                 "items": resolved, "coverage": self._week_coverage(payload["items"], payload["expected_weeks"])}
+
+    def handoff_outline(self, identity: IdentityContext, course_id: str, source_id: str,
+                        outline_id: str, agent_id: str, agent_version: int) -> dict[str, Any]:
+        """Record a verified read-only handoff; teaching Agent execution comes later."""
+        outline = self.read_outline(identity, course_id, source_id, outline_id)
+        member = self._member(identity)
+        binding = self.store.get_binding(member.actor_id, identity.tenant_id)
+        if binding is None:
+            raise PermissionError("member has no personal assistant binding")
+        assistant_id = binding["assistant_actor_id"]
+        assistant = self.cp._actor(assistant_id)
+        agent = self.cp._actor(agent_id)
+        version = self.cp._agent_version(agent_id, agent_version)
+        read_scope = frozenset({"doc.read"})
+        if (agent.actor_type != ActorType.BUSINESS_AGENT
+                or assistant.actor_type != ActorType.PERSONAL_ASSISTANT
+                or any(actor.tenant_id != identity.tenant_id for actor in (assistant, agent))
+                or not read_scope.issubset(member.capabilities & assistant.capabilities
+                                           & agent.capabilities & version.capabilities)):
+            raise PermissionError("read-only teaching delegation is not authorized")
+        reference = {
+            "tenant_id": identity.tenant_id, "course_id": course_id,
+            "source_id": source_id, "outline_id": outline_id,
+            "source_revision": outline["source_revision"],
+            "source_hash": self.store.get_teaching_source(identity.tenant_id, course_id, source_id)["content_hash"],
+            "outline_hash": outline["outline_hash"], "requested_by": member.actor_id,
+            "agent_id": agent_id, "agent_version": agent_version,
+        }
+        digest = hashlib.sha256(self.store._json(reference).encode()).hexdigest()
+        task = self.cp.create_task_run(
+            member.actor_id, assistant_id, agent_id, agent_version,
+            input_ref_hash=digest, identity=identity, dispatch_key=f"teaching:readonly:{digest}",
+        )
+        existing = self.store.get_teaching_handoff(task.task_run_id)
+        if existing is None and task.status not in {
+            TaskRunStatus.QUEUED, TaskRunStatus.PLANNING, TaskRunStatus.RUNNING,
+        }:
+            raise RuntimeError("teaching handoff has no completed reference; inspect task status")
+        if existing is None:
+            if task.status == TaskRunStatus.QUEUED:
+                self.cp.transition_task(task.task_run_id, TaskRunStatus.PLANNING)
+            steps = self.store.list_task_steps(task.task_run_id)
+            if not steps:
+                self.cp.create_task_step(TaskStep(
+                    "teaching-step-" + task.task_run_id, task.task_run_id,
+                    "personal_assistant.delegate.teaching_source_readonly", sequence=1,
+                ))
+            delegations = self.store.list_delegations(task.task_run_id)
+            if not delegations:
+                self.cp.delegate(Delegation(
+                    "teaching-delegation-" + task.task_run_id, task.task_run_id,
+                    assistant_id, agent_id, read_scope,
+                ))
+            if self.cp._task(task.task_run_id).status == TaskRunStatus.PLANNING:
+                self.cp.transition_task(task.task_run_id, TaskRunStatus.RUNNING)
+            event = self._audit(identity, "TEACHING_READONLY_HANDOFF", reference)
+            event = replace(event, task_run_id=task.task_run_id, correlation_id=task.task_run_id)
+            with self._handoff_transaction(task.task_run_id) as connection:
+                member_row = connection.execute(
+                    "SELECT active, external_ref_hash, capabilities_json FROM actors "
+                    "WHERE tenant_id = ? AND actor_id = ?",
+                    (identity.tenant_id, member.actor_id),
+                ).fetchone()
+                course_member = connection.execute(
+                    "SELECT role, active FROM teaching_course_members "
+                    "WHERE tenant_id = ? AND course_id = ? AND actor_id = ?",
+                    (identity.tenant_id, course_id, member.actor_id),
+                ).fetchone()
+                source = connection.execute(
+                    "SELECT revision_id, content_hash, submitted_by FROM teaching_sources "
+                    "WHERE tenant_id = ? AND course_id = ? AND source_id = ?",
+                    (identity.tenant_id, course_id, source_id),
+                ).fetchone()
+                current_outline = connection.execute(
+                    "SELECT outline_hash FROM teaching_outlines WHERE tenant_id = ? AND course_id = ? "
+                    "AND source_id = ? AND outline_id = ?",
+                    (identity.tenant_id, course_id, source_id, outline_id),
+                ).fetchone()
+                bound = connection.execute(
+                    "SELECT 1 FROM assistant_bindings WHERE tenant_id = ? AND member_actor_id = ? "
+                    "AND assistant_actor_id = ? AND is_default = 1",
+                    (identity.tenant_id, member.actor_id, assistant_id),
+                ).fetchone()
+                actor_rows = connection.execute(
+                    "SELECT actor_id, active, capabilities_json FROM actors "
+                    "WHERE tenant_id = ? AND actor_id IN (?, ?)",
+                    (identity.tenant_id, assistant_id, agent_id),
+                ).fetchall()
+                current_version = connection.execute(
+                    "SELECT active, capabilities_json FROM agent_versions WHERE agent_id = ? AND version = ?",
+                    (agent_id, agent_version),
+                ).fetchone()
+                route = connection.execute(
+                    "SELECT stable_version, canary_version, volunteer_ids_json, status "
+                    "FROM agent_routes WHERE tenant_id = ? AND agent_id = ?",
+                    (identity.tenant_id, agent_id),
+                ).fetchone()
+                if (member_row is None or not member_row["active"]
+                        or member_row["external_ref_hash"] != identity.subject_ref_hash
+                        or "doc.read" not in json.loads(member_row["capabilities_json"])
+                        or course_member is None or not course_member["active"]):
+                    raise PermissionError("course membership was revoked during handoff")
+                if (bound is None or len(actor_rows) != 2 or current_version is None
+                        or not current_version["active"]
+                        or any(not row["active"] or "doc.read" not in json.loads(row["capabilities_json"])
+                               for row in actor_rows)
+                        or "doc.read" not in json.loads(current_version["capabilities_json"])):
+                    raise PermissionError("assistant or Agent authorization was revoked during handoff")
+                if route is not None:
+                    selected = (route["canary_version"] if route["status"] == "CANARY"
+                                and member.actor_id in json.loads(route["volunteer_ids_json"])
+                                else route["stable_version"])
+                    if route["status"] == "ARCHIVED" or selected != agent_version:
+                        raise PermissionError("Agent routing changed during handoff")
+                if (source is None or source["revision_id"] != reference["source_revision"]
+                        or source["content_hash"] != reference["source_hash"]
+                        or current_outline is None
+                        or current_outline["outline_hash"] != reference["outline_hash"]):
+                    raise SourceChanged("teaching reference changed during handoff")
+                if course_member["role"] != "LEAD" and source["submitted_by"] != member.actor_id:
+                    reader = connection.execute(
+                        "SELECT active FROM teaching_source_readers WHERE tenant_id = ? AND course_id = ? "
+                        "AND source_id = ? AND actor_id = ?",
+                        (identity.tenant_id, course_id, source_id, member.actor_id),
+                    ).fetchone()
+                    if reader is None or not reader["active"]:
+                        raise PermissionError("source reader authorization was revoked during handoff")
+                inserted = connection.execute(
+                    "INSERT OR IGNORE INTO teaching_handoffs(task_run_id, tenant_id, course_id, source_id, outline_id, "
+                    "source_revision, source_hash, outline_hash, requested_by) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (task.task_run_id, identity.tenant_id, course_id, source_id, outline_id,
+                     reference["source_revision"], reference["source_hash"],
+                     reference["outline_hash"], member.actor_id),
+                )
+                if inserted.rowcount:
+                    self.store.teaching_audit_in_transaction(connection, event)
+        if self.cp._task(task.task_run_id).status == TaskRunStatus.RUNNING:
+            self.store.save_task_step(TaskStep(
+                "teaching-step-" + task.task_run_id, task.task_run_id,
+                "personal_assistant.delegate.teaching_source_readonly", "SUCCEEDED", 1,
+            ))
+            self.cp.transition_task(task.task_run_id, TaskRunStatus.SUCCEEDED)
+        return {"task_run_id": task.task_run_id,
+                "delegation_id": "teaching-delegation-" + task.task_run_id,
+                "course_id": course_id, "source_id": source_id, "outline_id": outline_id,
+                "source_revision": outline["source_revision"], "outline_hash": outline["outline_hash"],
+                "status": "READONLY_HANDOFF", "allowed_tools": []}

@@ -423,6 +423,18 @@ class SQLiteStore:
             BEFORE UPDATE ON teaching_outlines BEGIN SELECT RAISE(ABORT, 'immutable teaching outline'); END;
             CREATE TRIGGER IF NOT EXISTS teaching_outlines_no_delete
             BEFORE DELETE ON teaching_outlines BEGIN SELECT RAISE(ABORT, 'immutable teaching outline'); END;
+            CREATE TABLE IF NOT EXISTS teaching_handoffs (
+                task_run_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                course_id TEXT NOT NULL, source_id TEXT NOT NULL, outline_id TEXT NOT NULL,
+                source_revision TEXT NOT NULL, source_hash TEXT NOT NULL,
+                outline_hash TEXT NOT NULL, requested_by TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (task_run_id) REFERENCES task_runs(task_run_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS teaching_handoffs_no_update
+            BEFORE UPDATE ON teaching_handoffs BEGIN SELECT RAISE(ABORT, 'immutable teaching handoff'); END;
+            CREATE TRIGGER IF NOT EXISTS teaching_handoffs_no_delete
+            BEFORE DELETE ON teaching_handoffs BEGIN SELECT RAISE(ABORT, 'immutable teaching handoff'); END;
             CREATE INDEX IF NOT EXISTS idx_audit_triage_tenant
                 ON audit_triage(tenant_id, status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_approvals_task ON approvals(task_run_id);
@@ -2556,6 +2568,11 @@ class SQLiteStore:
             "SELECT * FROM teaching_outlines WHERE tenant_id = ? AND course_id = ? "
             "AND source_id = ? AND outline_id = ?",
             (tenant_id, course_id, source_id, outline_id),
+        ).fetchone()
+
+    def get_teaching_handoff(self, task_run_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM teaching_handoffs WHERE task_run_id = ?", (task_run_id,)
         ).fetchone()
 
     def list_teaching_outlines(self, tenant_id: str, course_id: str, source_id: str) -> list[sqlite3.Row]:

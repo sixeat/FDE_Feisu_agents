@@ -210,7 +210,8 @@ function renderAgents() {
     if(agentState.canConfirm){
       const actions=node("div",undefined,"commands agent-review-actions");
       const add=(label,fn)=>{const button=node("button",label);button.type="button";button.addEventListener("click",()=>fn(button));actions.append(button);};
-      add("运行诊断与版本对比",button=>inspectAgent(agent,button));
+      const comparisonPanel=node("div",undefined,"agent-draft-row");comparisonPanel.hidden=true;
+      add("运行诊断与版本对比",button=>inspectAgent(agent,comparisonPanel,button));
       const history=node("div",undefined,"agent-draft-row");history.hidden=true;
       add("查看转正证据历史",button=>loadPromotionHistory(agent,history,button));
       if(agent.status!=="ARCHIVED" && agent.current_version!=null){
@@ -223,7 +224,7 @@ function renderAgents() {
         if(agent.status==="CANARY" || agent.current_version>1)add("人工回退",button=>changeAgentRoute(agent,"rollback",button));
         add("下架归档",button=>changeAgentRoute(agent,"archive",button));
       }
-      card.append(actions,history);
+      card.append(actions,comparisonPanel,history);
     }
     panel.append(card);
   });
@@ -292,21 +293,37 @@ async function changeAgentVolunteer(agent,button){
   catch(error){agentNotice(error.message,"error");button.disabled=false;}
   finally{agentState.busy=false;}
 }
-async function inspectAgent(agent,button){
-  button.disabled=true;
+async function inspectAgent(agent,panel,button){
+  button.disabled=true;panel.hidden=false;panel.replaceChildren(node("p","正在读取运行与版本记录…","muted"));
   try{
     const base=`/api/meetings/agents/${encodeURIComponent(agent.agent_id)}`;
     const diagnostic=await api(`${base}/diagnostics`);
     const versions=agent.versions;
-    let report=`${agent.agent_id}：累计 ${diagnostic.total} 次运行。\n`;
-    for(const [version,item] of Object.entries(diagnostic.versions))report+=`v${version}：${item.total} 次，异常 ${item.failures} 次；状态 ${JSON.stringify(item.statuses)}\n`;
+    panel.replaceChildren(node("h4","运行诊断"),node("p",`累计 ${diagnostic.total} 次运行。`,"muted"));
+    for(const [version,item] of Object.entries(diagnostic.versions)){
+      panel.append(node("p",`v${version}：${item.total} 次，异常 ${item.failures} 次；状态 ${JSON.stringify(item.statuses)}`,"muted"));
+    }
     if(versions.length>1){
       const newer=agent.canary_version||versions[0],older=versions.find(version=>version<newer);
       if(older){const comparison=await api(`${base}/compare?old_version=${older}&new_version=${newer}`);
-        report+=`v${older} → v${newer} 配置差异：${JSON.stringify(comparison.changes)}`;}
+        panel.append(node("h4",`v${older} → v${newer}`));
+        if(Object.keys(comparison.changes).length){
+          for(const [field,values] of Object.entries(comparison.changes)){
+            panel.append(node("p",`${field}：${JSON.stringify(values.old)} → ${JSON.stringify(values.new)}`,"muted"));
+          }
+        }else panel.append(node("p","配置字段没有变化。","muted"));
+        const cases=Object.entries(comparison.sample_comparison);
+        if(!cases.length)panel.append(node("p","这两个版本还没有可对比的样例回答。","muted"));
+        for(const [caseId,answers] of cases){
+          panel.append(node("h4",caseId==="read_only"?"只读建议样例":"写入边界样例"));
+          for(const [label,answer] of [[`v${older}`,answers.old],[`v${newer}`,answers.new]]){
+            panel.append(node("p",answer?`${label} · ${answer.task_run_id} · ${answer.created_at}`:`${label} · 尚无样例回答`,"muted"));
+            if(answer)panel.append(node("p",answer.response,"agent-draft-description"));
+          }
+        }
+      }
     }
-    window.alert(report);
-  }catch(error){agentNotice(error.message,"error");}
+  }catch(error){panel.replaceChildren(node("p",error.message,"error"));}
   finally{button.disabled=false;}
 }
 function promotionReadinessText(readiness){

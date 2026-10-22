@@ -385,12 +385,30 @@ class MeetingReviewWebService:
             raise HTTPException(404, "版本快照不存在")
         old, new = [json.loads(snapshot["config_json"]) for snapshot in snapshots]
         diagnostics = self.cp.store.agent_run_diagnostics(identity.tenant_id, agent_id)["versions"]
+        samples = self.cp.store.latest_agent_samples(identity.tenant_id, agent_id,
+                                                      (old_version, new_version))
+        for version, snapshot in zip((old_version, new_version), snapshots):
+            for sample in samples[version].values():
+                if (sample["config_hash"] != snapshot["config_hash"] or
+                        hashlib.sha256(sample["response_text"].encode()).hexdigest()
+                        != sample["response_hash"]):
+                    raise HTTPException(409, "样例运行结果摘要或版本不匹配")
+        def sample_view(sample):
+            return ({"task_run_id": sample["task_run_id"],
+                     "response": sample["response_text"],
+                     "response_hash": sample["response_hash"],
+                     "created_at": sample["created_at"]} if sample is not None else None)
         return {"agent_id": agent_id, "old_version": old_version, "new_version": new_version,
                 "changes": {key: {"old": old.get(key), "new": new.get(key)}
                             for key in ("description", "capabilities", "skill_version")
                             if old.get(key) != new.get(key)},
                 "runs": {str(version): diagnostics.get(version, {"total": 0, "statuses": {}, "failures": 0})
                          for version in (old_version, new_version)},
+                "sample_comparison": {
+                    case_id: {"old": sample_view(samples[old_version].get(case_id)),
+                              "new": sample_view(samples[new_version].get(case_id))}
+                    for case_id in sorted(samples[old_version].keys() | samples[new_version].keys())
+                },
                 "config_hashes": {str(old_version): snapshots[0]["config_hash"],
                                   str(new_version): snapshots[1]["config_hash"]}}
 

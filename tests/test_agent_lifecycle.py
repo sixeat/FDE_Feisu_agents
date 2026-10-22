@@ -60,7 +60,7 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
             return RuntimeResult("SUCCEEDED", {
                 "schema_version": "agent-sample.v1",
                 "case_id": request.input_ref["case_id"],
-                "response": "仅给出建议，等待人工确认。",
+                "response": f"v{request.input_ref['version']} 仅给出建议，等待人工确认。",
             }, None, events=(RunEvent(request.task_run_id, request.trace_id, 1,
                                       "completed", "2026-10-22T00:00:00Z", "sample completed"),))
 
@@ -112,6 +112,13 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
             ("0" * 64, "sample-lifecycle-agent"),
         )
     assert cp.store.select_agent_version("tenant", "sample-lifecycle-agent", "member") == 1
+    member_headers = switch_user(cp, client, "member", hashlib.sha256(b"ou_submitter").hexdigest())
+    stable_sample = client.post(
+        "/api/meetings/agents/sample-lifecycle-agent/sample-runs",
+        json={"case_id": "read_only"}, headers=member_headers,
+    )
+    assert stable_sample.status_code == 200
+    assert stable_sample.json()["agent_version"] == 1
     run1 = cp.create_task_run("member", "assistant", "sample-lifecycle-agent", 1)
     run1.status = TaskRunStatus.FAILED
     run1.failure_reason = "sample failure"
@@ -210,6 +217,7 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
     reviewer_headers = switch_user(cp, client, "reviewer", "reviewer-subject")
     assert client.get(readiness_url).status_code == 403
     assert client.get(route + "/promotion-history").status_code == 403
+    assert client.get(route + "/compare?old_version=1&new_version=2").status_code == 403
     candidate_runs = client.get(route + "/canary-runs").json()["runs"]
     assert {item["task_run_id"] for item in candidate_runs} == {
         run2.task_run_id, run3.task_run_id, fabricated.task_run_id,
@@ -281,10 +289,18 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
         assert client.post(route + f"/canary-runs/{run.task_run_id}/review", json=passed_review,
                            headers=reviewer_headers).status_code == 200
     admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    assert client.get(route + "/compare?old_version=1&new_version=99").status_code == 404
     diagnostics = client.get(route + "/diagnostics").json()
-    assert diagnostics["total"] == 6 and diagnostics["versions"]["1"]["failures"] == 1
+    assert diagnostics["total"] == 7 and diagnostics["versions"]["1"]["failures"] == 1
     comparison = client.get(route + "/compare?old_version=1&new_version=2").json()
     assert comparison["changes"]["description"]["old"] != comparison["changes"]["description"]["new"]
+    read_answers = comparison["sample_comparison"]["read_only"]
+    assert read_answers["old"]["task_run_id"] == stable_sample.json()["task_run_id"]
+    assert read_answers["old"]["response"] == stable_sample.json()["response"]
+    assert read_answers["new"]["task_run_id"] == fresh_runs[0].task_run_id
+    assert read_answers["new"]["response"] != read_answers["old"]["response"]
+    assert comparison["sample_comparison"]["write_boundary"]["old"] is None
+    assert comparison["sample_comparison"]["write_boundary"]["new"]["task_run_id"] == fresh_runs[1].task_run_id
     ready = client.get(readiness_url).json()
     assert ready["can_promote"] and ready["blockers"] == []
     assert ready["sample_count"] == 2 and ready["unreviewed_count"] == 0
@@ -335,6 +351,9 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
                 if agent["agent_id"] == "sample-lifecycle-agent")["status"] == "ARCHIVED"
     assert dict(cp.store.get_agent_snapshot("tenant", "sample-lifecycle-agent", 1)) == snapshot1
     assert len(client.get(route + "/promotion-history").json()["promotions"]) == 1
+    assert client.get(route + "/compare?old_version=1&new_version=2").json()[
+        "sample_comparison"
+    ] == comparison["sample_comparison"]
     events = [event["event_type"] for event in cp.store.list_audits()]
     assert all(name in events for name in ("AGENT_EVALUATED", "AGENT_CANARY", "AGENT_CANARY_REVIEWED", "AGENT_PROMOTE",
                                       "AGENT_ROLLBACK", "AGENT_ARCHIVE"))

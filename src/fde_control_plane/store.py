@@ -1787,6 +1787,18 @@ class SQLiteStore:
             "SELECT * FROM agent_sample_results WHERE task_run_id = ?", (task_run_id,),
         ).fetchone()
 
+    def latest_agent_samples(self, tenant_id: str, agent_id: str,
+                             versions: tuple[int, int]) -> dict[int, dict[str, sqlite3.Row]]:
+        rows = self.connection.execute(
+            "SELECT * FROM agent_sample_results WHERE tenant_id = ? AND agent_id = ? "
+            "AND agent_version IN (?, ?) ORDER BY rowid DESC",
+            (tenant_id, agent_id, *versions),
+        ).fetchall()
+        latest: dict[int, dict[str, sqlite3.Row]] = {version: {} for version in versions}
+        for row in rows:
+            latest[row["agent_version"]].setdefault(row["case_id"], row)
+        return latest
+
     def save_agent_sample_result(self, task_run_id: str, case_id: str,
                                  config_hash: str, response: str,
                                  subject_ref_hash: str, event: Any) -> None:

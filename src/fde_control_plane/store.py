@@ -445,6 +445,27 @@ class SQLiteStore:
             BEFORE UPDATE ON teaching_handoffs BEGIN SELECT RAISE(ABORT, 'immutable teaching handoff'); END;
             CREATE TRIGGER IF NOT EXISTS teaching_handoffs_no_delete
             BEFORE DELETE ON teaching_handoffs BEGIN SELECT RAISE(ABORT, 'immutable teaching handoff'); END;
+            CREATE TABLE IF NOT EXISTS teaching_alignments (
+                alignment_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, course_id TEXT NOT NULL,
+                input_hash TEXT NOT NULL, data_json TEXT NOT NULL, created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (tenant_id, course_id) REFERENCES teaching_courses(tenant_id, course_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS teaching_alignments_no_update
+            BEFORE UPDATE ON teaching_alignments BEGIN SELECT RAISE(ABORT, 'immutable teaching alignment'); END;
+            CREATE TRIGGER IF NOT EXISTS teaching_alignments_no_delete
+            BEFORE DELETE ON teaching_alignments BEGIN SELECT RAISE(ABORT, 'immutable teaching alignment'); END;
+            CREATE TABLE IF NOT EXISTS teaching_alignment_reviews (
+                alignment_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, course_id TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK(outcome IN ('ACCEPTED', 'RETURNED')),
+                reason TEXT NOT NULL, reviewed_by TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (alignment_id) REFERENCES teaching_alignments(alignment_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS teaching_alignment_reviews_no_update
+            BEFORE UPDATE ON teaching_alignment_reviews BEGIN SELECT RAISE(ABORT, 'immutable teaching alignment review'); END;
+            CREATE TRIGGER IF NOT EXISTS teaching_alignment_reviews_no_delete
+            BEFORE DELETE ON teaching_alignment_reviews BEGIN SELECT RAISE(ABORT, 'immutable teaching alignment review'); END;
             CREATE INDEX IF NOT EXISTS idx_audit_triage_tenant
                 ON audit_triage(tenant_id, status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_approvals_task ON approvals(task_run_id);
@@ -2589,6 +2610,26 @@ class SQLiteStore:
     def get_teaching_handoff(self, task_run_id: str) -> sqlite3.Row | None:
         return self.connection.execute(
             "SELECT * FROM teaching_handoffs WHERE task_run_id = ?", (task_run_id,)
+        ).fetchone()
+
+    def get_teaching_alignment(self, tenant_id: str, course_id: str,
+                               alignment_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM teaching_alignments WHERE tenant_id = ? AND course_id = ? AND alignment_id = ?",
+            (tenant_id, course_id, alignment_id),
+        ).fetchone()
+
+    def list_teaching_alignments(self, tenant_id: str, course_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT alignment_id, input_hash, data_json, created_by, created_at FROM teaching_alignments "
+            "WHERE tenant_id = ? AND course_id = ? ORDER BY created_at DESC, alignment_id DESC",
+            (tenant_id, course_id),
+        ).fetchall()
+
+    def get_teaching_alignment_review(self, alignment_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT outcome, reason, reviewed_by, created_at FROM teaching_alignment_reviews "
+            "WHERE alignment_id = ?", (alignment_id,),
         ).fetchone()
 
     def list_teaching_outlines(self, tenant_id: str, course_id: str, source_id: str) -> list[sqlite3.Row]:

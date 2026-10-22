@@ -12,6 +12,7 @@ from .feishu_oauth_web import SQLiteOAuthSessionIssuer, build_session_dependency
 from .meeting_review_web import csrf_token
 from .models import IdentityContext
 from .teaching import SourceChanged, TeachingService
+from .teaching_alignment import TeachingAlignmentService
 
 
 class CourseCreateRequest(BaseModel):
@@ -51,10 +52,38 @@ class TeachingOutlineRequest(BaseModel):
     expected_weeks: list[StrictInt] = Field(default_factory=list, max_length=60)
 
 
+class AlignmentReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_id: StrictStr = Field(min_length=1, max_length=100)
+    outline_id: StrictStr = Field(min_length=1, max_length=100)
+
+
+class AlignmentLink(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    objective_item_id: StrictStr = Field(min_length=1, max_length=80)
+    week_item_id: StrictStr = Field(min_length=1, max_length=80)
+
+
+class AlignmentCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    syllabus: AlignmentReference
+    weekly_plan: AlignmentReference
+    lesson_plan: AlignmentReference
+    links: list[AlignmentLink] = Field(default_factory=list, max_length=100)
+
+
+class AlignmentReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    outcome: Literal["ACCEPTED", "RETURNED"]
+    reason_code: Literal["EVIDENCE_CONFIRMED", "SOURCE_INCOMPLETE",
+                         "MAPPING_INCORRECT", "EVIDENCE_INSUFFICIENT"]
+
+
 def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSessionIssuer,
                           *, public_origin: str) -> APIRouter:
     router = APIRouter(prefix="/api/teaching")
     require_identity = build_session_dependency(sessions)
+    alignment = TeachingAlignmentService(service)
 
     def check_csrf(request: Request) -> None:
         origin = request.headers.get("origin")
@@ -77,6 +106,7 @@ def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSession
             status = 409 if str(exc) in {
                 "course already exists", "teacher is already active", "teacher is not active",
                 "source reader is already active", "source reader is not active",
+                "alignment was already reviewed",
             } else 422
             raise HTTPException(status, str(exc)) from exc
         except RuntimeError as exc:
@@ -168,5 +198,30 @@ def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSession
     def read_outline(course_id: str, source_id: str, outline_id: str,
                      identity: IdentityContext = Depends(require_identity)):
         return call(service.read_outline, identity, course_id, source_id, outline_id)
+
+    @router.post("/courses/{course_id}/alignments")
+    def create_alignment(course_id: str, body: AlignmentCreateRequest, request: Request,
+                         identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        references = {role: getattr(body, role).model_dump()
+                      for role in ("syllabus", "weekly_plan", "lesson_plan")}
+        return call(alignment.create, identity, course_id, references,
+                    [link.model_dump() for link in body.links])
+
+    @router.get("/courses/{course_id}/alignments")
+    def list_alignments(course_id: str, identity: IdentityContext = Depends(require_identity)):
+        return {"alignments": call(alignment.list, identity, course_id)}
+
+    @router.get("/courses/{course_id}/alignments/{alignment_id}")
+    def read_alignment(course_id: str, alignment_id: str,
+                       identity: IdentityContext = Depends(require_identity)):
+        return call(alignment.read, identity, course_id, alignment_id)
+
+    @router.post("/courses/{course_id}/alignments/{alignment_id}/review")
+    def review_alignment(course_id: str, alignment_id: str, body: AlignmentReviewRequest,
+                         request: Request, identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        return call(alignment.review, identity, course_id, alignment_id,
+                    body.outcome, body.reason_code)
 
     return router

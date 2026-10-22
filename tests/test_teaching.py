@@ -33,11 +33,14 @@ class FakeUserReader:
         self.blocks = None
         self.calls: list[tuple[str, str]] = []
         self.change_during_read = False
+        self.documents: dict[str, dict] = {}
 
     def read_document(self, identity, document_id):
         self.calls.append((identity.actor_id, document_id))
         if identity.actor_id not in self.allowed:
             raise PermissionError("member cannot read the Feishu document")
+        if document_id in self.documents:
+            return dict(self.documents[document_id])
         snapshot = {"document_id": document_id, "revision_id": self.revision, "title": self.title,
                     "blocks": self.blocks or [{"index": 1, "block_type": 2, "text": self.text}]}
         if self.change_during_read:
@@ -48,6 +51,8 @@ class FakeUserReader:
         self.calls.append((identity.actor_id, document_id))
         if identity.actor_id not in self.allowed:
             raise PermissionError("member cannot read the Feishu document")
+        if document_id in self.documents:
+            return self.documents[document_id]["revision_id"]
         return self.revision
 
 
@@ -98,6 +103,184 @@ def teaching_handoff_fixture(tmp_path):
                    "quote": "递归", "week_number": None}],
     }, headers=login("lead")).json()["outline_id"]
     return cp, reader, client, contexts, source_id, outline_id
+
+
+def teaching_alignment_fixture(tmp_path):
+    cp, reader, client, contexts, login = setup(tmp_path)
+    create_course(client, login("admin"))
+    documents = {
+        "course-syllabus": ("SYLLABUS", ["理解递归", "分析算法复杂度"],
+                            [{"item_id": "objective-1", "kind": "OBJECTIVE", "block_index": 1,
+                              "quote": "理解递归"},
+                             {"item_id": "objective-2", "kind": "OBJECTIVE", "block_index": 2,
+                              "quote": "分析算法复杂度"}], []),
+        "course-weekly": ("WEEKLY_PLAN", ["第 1 周：递归定义", "第 2 周：递归练习"],
+                          [{"item_id": "week-1", "kind": "WEEK_PLAN", "block_index": 1,
+                            "quote": "递归定义", "week_number": 1},
+                           {"item_id": "week-2", "kind": "WEEK_PLAN", "block_index": 2,
+                            "quote": "递归练习", "week_number": 2}], [1, 2, 3]),
+        "course-lesson": ("LESSON_PLAN", ["第 1 周：递归示例", "第 4 周：树结构示例"],
+                          [{"item_id": "lesson-1", "kind": "LESSON_FRAGMENT", "block_index": 1,
+                            "quote": "递归示例", "week_number": 1},
+                           {"item_id": "lesson-4", "kind": "LESSON_FRAGMENT", "block_index": 2,
+                            "quote": "树结构示例", "week_number": 4}], []),
+    }
+    references = {}
+    for document_id, (kind, texts, items, expected) in documents.items():
+        reader.documents[document_id] = {
+            "document_id": document_id, "revision_id": "1", "title": "虚构教研资料",
+            "blocks": [{"index": index, "block_type": 2, "text": text}
+                       for index, text in enumerate(texts, 1)],
+        }
+        source = client.post("/api/teaching/courses/demo/sources", json={
+            "kind": kind, "document_url": f"https://demo.feishu.cn/docx/{document_id}",
+            "attested_no_student_data": True,
+        }, headers=login("lead"))
+        assert source.status_code == 200
+        source_id = source.json()["source_id"]
+        outline = client.post(f"/api/teaching/courses/demo/sources/{source_id}/outlines", json={
+            "items": items, "expected_weeks": expected,
+        }, headers=login("lead"))
+        assert outline.status_code == 200
+        role = {"SYLLABUS": "syllabus", "WEEKLY_PLAN": "weekly_plan",
+                "LESSON_PLAN": "lesson_plan"}[kind]
+        references[role] = {"source_id": source_id, "outline_id": outline.json()["outline_id"]}
+    body = {**references, "links": [{"objective_item_id": "objective-1", "week_item_id": "week-1"}]}
+    return cp, reader, client, contexts, login, body
+
+
+def test_alignment_candidates_are_cited_immutable_and_lead_reviewed(tmp_path):
+    cp, reader, client, contexts, login, body = teaching_alignment_fixture(tmp_path)
+    path = "/api/teaching/courses/demo/alignments"
+    response = client.post(path, json=body, headers=login("lead"))
+    assert response.status_code == 200
+    created = response.json()
+    assert created["status"] == "PENDING_REVIEW"
+    assert {issue["code"] for issue in created["issues"]} == {
+        "OBJECTIVE_UNLINKED", "WEEK_WITHOUT_OBJECTIVE_LINK",
+        "WEEK_WITHOUT_LESSON_ANNOTATION", "LESSON_WITHOUT_WEEK_PLAN_ANNOTATION",
+        "EXPECTED_WEEK_UNANNOTATED",
+    }
+    assert created["issues"][0]["evidence"][0]["citation"]["source_id"] == body["syllabus"]["source_id"]
+    alignment_id = created["alignment_id"]
+    assert client.get(path).json()["alignments"][0]["issue_count"] == 5
+    saved = dict(cp.store.get_teaching_alignment("tenant", "demo", alignment_id))
+    assert "理解递归" not in saved["data_json"]
+    assert "树结构示例" not in saved["data_json"]
+    with pytest.raises(sqlite3.IntegrityError, match="immutable teaching alignment"):
+        cp.store.connection.execute(
+            "UPDATE teaching_alignments SET input_hash = 'x' WHERE alignment_id = ?", (alignment_id,)
+        )
+    review_path = f"{path}/{alignment_id}/review"
+    accepted = client.post(review_path, json={"outcome": "ACCEPTED",
+                                              "reason_code": "EVIDENCE_CONFIRMED"},
+                           headers=login("lead"))
+    assert accepted.status_code == 200
+    with pytest.raises(sqlite3.IntegrityError, match="immutable teaching alignment review"):
+        cp.store.connection.execute(
+            "UPDATE teaching_alignment_reviews SET outcome = 'RETURNED' WHERE alignment_id = ?",
+            (alignment_id,),
+        )
+    assert client.get(f"{path}/{alignment_id}").json()["status"] == "ACCEPTED"
+    assert client.post(review_path, json={"outcome": "RETURNED",
+                                               "reason_code": "SOURCE_INCOMPLETE"},
+                       headers=login("lead")).status_code == 409
+    second_id = client.post(path, json={**body, "links": []},
+                            headers=login("lead")).json()["alignment_id"]
+    assert client.post(f"{path}/{second_id}/review", json={
+        "outcome": "ACCEPTED", "reason_code": "MAPPING_INCORRECT",
+    }, headers=login("lead")).status_code == 422
+    returned = client.post(f"{path}/{second_id}/review", json={
+        "outcome": "RETURNED", "reason_code": "MAPPING_INCORRECT",
+    }, headers=login("lead"))
+    assert returned.status_code == 200
+    assert client.get(f"{path}/{second_id}").json()["status"] == "RETURNED"
+    reopened = SQLiteStore(tmp_path / "course.sqlite3")
+    assert reopened.get_teaching_alignment_review(alignment_id)["outcome"] == "ACCEPTED"
+    reopened.close()
+    assert cp.store.connection.execute("SELECT count(*) FROM tool_calls").fetchone()[0] == 0
+    audits = cp.store.list_tenant_audits("tenant")
+    assert {event["event_type"] for event in audits} >= {
+        "TEACHING_ALIGNMENT_CREATED", "TEACHING_ALIGNMENT_REVIEWED",
+    }
+    assert all("理解递归" not in str(event) for event in audits)
+
+
+def test_alignment_requires_all_source_access_and_current_revisions(tmp_path):
+    cp, reader, client, contexts, login, body = teaching_alignment_fixture(tmp_path)
+    path = "/api/teaching/courses/demo/alignments"
+    assert client.post(path, json=body).status_code == 403
+    assert client.post(path, json={**body, "links": [{"objective_item_id": "unknown",
+                                                     "week_item_id": "week-1"}]},
+                       headers=login("lead")).status_code == 422
+    assert client.post(path, json={**body, "links": body["links"] * 2},
+                       headers=login("lead")).status_code == 422
+    assert client.post(path, json={**body, "syllabus": body["weekly_plan"],
+                                   "weekly_plan": body["syllabus"]},
+                       headers=login("lead")).status_code == 422
+    assert create_course(client, login("admin"), "other").status_code == 200
+    assert client.post("/api/teaching/courses/other/alignments", json=body,
+                       headers=login("lead")).status_code == 404
+    assert client.post("/api/teaching/courses/demo/teachers", json={
+        "actor_id": "teacher", "reason": "负责人授权教师参加教研",
+    }, headers=login("lead")).status_code == 200
+    for ref in body.values():
+        if not isinstance(ref, dict):
+            continue
+        assert client.post(f"/api/teaching/courses/demo/sources/{ref['source_id']}/readers", json={
+            "actor_id": "teacher", "reason": "负责人共享教研资料",
+        }, headers=login("lead")).status_code == 200
+    created = client.post(path, json=body, headers=login("teacher"))
+    assert created.status_code == 200
+    alignment_id = created.json()["alignment_id"]
+    assert [row["alignment_id"] for row in client.get(path).json()["alignments"]] == [alignment_id]
+    assert client.post(f"{path}/{alignment_id}/review", json={
+        "outcome": "ACCEPTED", "reason_code": "EVIDENCE_CONFIRMED",
+    }, headers=login("teacher")).status_code == 403
+    ref = body["weekly_plan"]
+    assert client.delete(f"/api/teaching/courses/demo/sources/{ref['source_id']}/readers/teacher",
+                         params={"reason": "负责人撤销该来源共享"}, headers=login("lead")).status_code == 200
+    login("teacher")
+    assert client.get(path).json()["alignments"] == []
+    before = len(reader.calls)
+    assert client.get(f"{path}/{alignment_id}").status_code == 403
+    assert len(reader.calls) > before  # Earlier authorized sources may be rechecked first.
+    reader.documents["course-weekly"]["revision_id"] = "2"
+    login("lead")
+    assert client.get(f"{path}/{alignment_id}").status_code == 409
+    assert client.post(f"{path}/{alignment_id}/review", json={
+        "outcome": "RETURNED", "reason_code": "SOURCE_INCOMPLETE",
+    }, headers=login("lead")).status_code == 409
+    assert cp.store.get_teaching_alignment_review(alignment_id) is None
+
+
+def test_alignment_rechecks_earlier_source_after_last_document_read(tmp_path):
+    cp, reader, client, contexts, login, body = teaching_alignment_fixture(tmp_path)
+    path = "/api/teaching/courses/demo/alignments"
+    assert client.post("/api/teaching/courses/demo/teachers", json={
+        "actor_id": "teacher", "reason": "负责人授权教师参加教研",
+    }, headers=login("lead")).status_code == 200
+    for role in ("syllabus", "weekly_plan", "lesson_plan"):
+        ref = body[role]
+        assert client.post(f"/api/teaching/courses/demo/sources/{ref['source_id']}/readers", json={
+            "actor_id": "teacher", "reason": "负责人逐项共享教研来源",
+        }, headers=login("lead")).status_code == 200
+    alignment_id = client.post(path, json=body, headers=login("teacher")).json()["alignment_id"]
+    original_read = reader.read_document
+
+    def revoke_during_last_read(identity, document_id):
+        document = original_read(identity, document_id)
+        if document_id == "course-lesson" and identity.actor_id == "teacher":
+            cp.store.connection.execute(
+                "UPDATE teaching_source_readers SET active = 0 WHERE source_id = ? AND actor_id = 'teacher'",
+                (body["syllabus"]["source_id"],),
+            )
+            cp.store.connection.commit()
+        return document
+
+    reader.read_document = revoke_during_last_read
+    assert client.get(f"{path}/{alignment_id}").status_code == 403
+    assert client.get(path).json()["alignments"] == []
 
 
 def test_readonly_teaching_handoff_is_durable_idempotent_and_has_no_tools(tmp_path):

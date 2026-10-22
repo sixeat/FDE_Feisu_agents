@@ -14,6 +14,7 @@ from .models import IdentityContext
 from .teaching import SourceChanged, TeachingService
 from .teaching_alignment import TeachingAlignmentService
 from .teaching_execution import TeachingSourceExecutionService
+from .teaching_preparation import TeachingPreparationService
 
 
 class CourseCreateRequest(BaseModel):
@@ -99,6 +100,13 @@ class TeachingExtractionReviewRequest(BaseModel):
                          "WRONG_WEEK", "SOURCE_INCOMPLETE"]
     coverage_confirmed: StrictBool
     decisions: list[TeachingExtractionDecision] = Field(max_length=100)
+
+
+class TeachingPreparationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    syllabus: StrictStr = Field(min_length=1, max_length=100)
+    weekly_plan: StrictStr = Field(min_length=1, max_length=100)
+    lesson_plan: StrictStr = Field(min_length=1, max_length=100)
 
 
 def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSessionIssuer,
@@ -224,6 +232,8 @@ def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSession
         return call(service.read_outline, identity, course_id, source_id, outline_id)
 
     if extraction is not None:
+        preparation = TeachingPreparationService(extraction)
+
         @router.post("/courses/{course_id}/sources/{source_id}/extractions")
         def execute_source(course_id: str, source_id: str, body: TeachingExtractionRequest,
                            request: Request, identity: IdentityContext = Depends(require_identity)):
@@ -250,6 +260,17 @@ def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSession
             return call(extraction.review_candidates, identity, course_id, task_run_id,
                         body.outcome, body.reason_code, body.coverage_confirmed,
                         [item.model_dump() for item in body.decisions])
+
+        @router.post("/courses/{course_id}/preparations")
+        def create_preparation(course_id: str, body: TeachingPreparationRequest, request: Request,
+                               identity: IdentityContext = Depends(require_identity)):
+            check_csrf(request)
+            return call(preparation.create, identity, course_id, body.model_dump())
+
+        @router.get("/courses/{course_id}/preparations/{draft_id}")
+        def read_preparation(course_id: str, draft_id: str,
+                             identity: IdentityContext = Depends(require_identity)):
+            return call(preparation.read, identity, course_id, draft_id)
 
     @router.post("/courses/{course_id}/alignments")
     def create_alignment(course_id: str, body: AlignmentCreateRequest, request: Request,

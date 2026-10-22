@@ -480,6 +480,17 @@ class SQLiteStore:
             BEFORE UPDATE ON teaching_extraction_reviews BEGIN SELECT RAISE(ABORT, 'immutable teaching extraction review'); END;
             CREATE TRIGGER IF NOT EXISTS teaching_extraction_reviews_no_delete
             BEFORE DELETE ON teaching_extraction_reviews BEGIN SELECT RAISE(ABORT, 'immutable teaching extraction review'); END;
+            CREATE TABLE IF NOT EXISTS teaching_preparation_drafts (
+                draft_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, course_id TEXT NOT NULL,
+                created_by TEXT NOT NULL, input_hash TEXT NOT NULL, data_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (tenant_id, course_id, created_by, input_hash),
+                FOREIGN KEY (tenant_id, course_id) REFERENCES teaching_courses(tenant_id, course_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS teaching_preparation_drafts_no_update
+            BEFORE UPDATE ON teaching_preparation_drafts BEGIN SELECT RAISE(ABORT, 'immutable teaching preparation draft'); END;
+            CREATE TRIGGER IF NOT EXISTS teaching_preparation_drafts_no_delete
+            BEFORE DELETE ON teaching_preparation_drafts BEGIN SELECT RAISE(ABORT, 'immutable teaching preparation draft'); END;
             CREATE TABLE IF NOT EXISTS teaching_alignments (
                 alignment_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, course_id TEXT NOT NULL,
                 input_hash TEXT NOT NULL, data_json TEXT NOT NULL, created_by TEXT NOT NULL,

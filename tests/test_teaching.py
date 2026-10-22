@@ -19,6 +19,7 @@ from fde_control_plane import (
 )
 from fde_control_plane.teaching import TeachingService
 from fde_control_plane.teaching_execution import TeachingSourceExecutionService
+from fde_control_plane.teaching_preparation import TeachingPreparationService
 from fde_control_plane.runtime import RunEvent, RuntimeResult
 from fde_control_plane.teaching_web import build_teaching_router
 from fde_control_plane.user_document_access import DOC_READ_SCOPE
@@ -670,6 +671,101 @@ def test_teaching_extraction_review_requires_every_item_and_is_immutable(tmp_pat
     reopened.close()
     assert sum(event["event_type"] == "TEACHING_EXTRACTION_REVIEWED"
                for event in cp.store.list_tenant_audits("tenant")) == 1
+
+
+def test_reviewed_three_sources_create_recheckable_preparation_draft(tmp_path):
+    cp, reader, client, contexts, login, body = teaching_alignment_fixture(tmp_path)
+    caps = frozenset({"doc.read"})
+    cp.register_actor(Actor("assistant", "tenant", ActorType.PERSONAL_ASSISTANT, caps))
+    cp.register_actor(Actor("source-agent", "tenant", ActorType.BUSINESS_AGENT, caps))
+    cp.register_agent_version(AgentVersion("source-agent", 1, caps))
+    cp.bind_assistant(AssistantBinding("lead-binding", "tenant", "lead", "assistant"))
+    cp.register_actor(Actor("lead", "tenant", ActorType.USER, caps,
+                            external_ref_hash=contexts["lead"].subject_ref_hash))
+
+    class ThreeSourceRuntime:
+        def run_once(self, request):
+            source = request.input_ref
+            kind = {"SYLLABUS": "OBJECTIVE", "WEEKLY_PLAN": "WEEK_PLAN",
+                    "LESSON_PLAN": "LESSON_FRAGMENT"}[source["kind"]]
+            items = []
+            for index, block in enumerate(source["blocks"], 1):
+                week = (index if source["kind"] == "WEEKLY_PLAN" else
+                        (1 if index == 1 else 4) if source["kind"] == "LESSON_PLAN" else None)
+                items.append({"item_id": f"item-{index}", "kind": kind,
+                              "week_number": week, "block_index": index,
+                              "start_offset": 0, "end_offset": len(block["text"]),
+                              "quote": block["text"]})
+            return RuntimeResult("SUCCEEDED", {
+                "schema_version": "teaching-source-agent.v1",
+                "source": {key: source[key] for key in
+                           ("source_id", "revision_id", "content_hash", "kind")},
+                "items": items,
+            }, None)
+
+    extraction = TeachingSourceExecutionService(TeachingService(cp, reader), ThreeSourceRuntime())
+    preparation = TeachingPreparationService(extraction)
+    task_ids = {}
+    for role, source_ref in body.items():
+        if role == "links":
+            continue
+        task_id = extraction.execute(contexts["lead"], "demo", source_ref["source_id"],
+                                     "source-agent", 1)["task_run_id"]
+        task_ids[role] = task_id
+    with pytest.raises(ValueError, match="accepted lead reviews"):
+        preparation.create(contexts["lead"], "demo", task_ids)
+    for task_id in task_ids.values():
+        items = extraction.read_candidates(contexts["lead"], "demo", task_id)["items"]
+        extraction.review_candidates(contexts["lead"], "demo", task_id, "ACCEPTED",
+                                     "EVIDENCE_CONFIRMED", True,
+                                     [{"item_id": item["item_id"], "verdict": "CONFIRMED"}
+                                      for item in items])
+
+    draft = preparation.create(contexts["lead"], "demo", task_ids)
+    assert draft["status"] == "NEEDS_TEACHER_REVIEW"
+    assert [item["code"] for item in draft["suggestions"]] == [
+        "OBJECTIVE_MAPPING_TO_CONFIRM", "OBJECTIVE_MAPPING_TO_CONFIRM",
+        "WEEK_PREPARATION", "LESSON_NOT_ANNOTATED", "PLAN_NOT_ANNOTATED",
+    ]
+    assert draft["suggestions"][2]["evidence"][0]["item"]["quote"] == "第 1 周：递归定义"
+    assert preparation.create(contexts["lead"], "demo", task_ids) == draft
+    assert preparation.read(contexts["lead"], "demo", draft["draft_id"]) == draft
+    route = f"/api/teaching/courses/demo/preparations/{draft['draft_id']}"
+    assert client.get(route).status_code == 404
+    sessions = SQLiteOAuthSessionIssuer(cp, tenant_id="tenant")
+    app = FastAPI()
+    app.include_router(build_teaching_router(
+        TeachingService(cp, reader), sessions, public_origin="https://example.test",
+        extraction=extraction,
+    ))
+    api = TestClient(app)
+    token = sessions(contexts["lead"])
+    api.cookies.set("fde_auth_session", token)
+    headers = {"Origin": "https://example.test",
+               "X-CSRF-Token": hashlib.sha256(("meeting-review-csrf:" + token).encode()).hexdigest()}
+    assert api.get(route).json() == draft
+    assert api.post("/api/teaching/courses/demo/preparations", json=task_ids).status_code == 403
+    assert api.post("/api/teaching/courses/demo/preparations", json=task_ids,
+                    headers=headers).json() == draft
+
+    extraction.teaching.set_teacher(contexts["lead"], "demo", "teacher",
+                                    active=True, reason="负责人邀请教师核对备课清单")
+    with pytest.raises(PermissionError, match="source access"):
+        preparation.read(contexts["teacher"], "demo", draft["draft_id"])
+    row = cp.store.connection.execute("SELECT data_json FROM teaching_preparation_drafts").fetchone()
+    assert "递归定义" not in row["data_json"]
+    with pytest.raises(sqlite3.IntegrityError, match="immutable teaching preparation draft"):
+        cp.store.connection.execute(
+            "UPDATE teaching_preparation_drafts SET input_hash = 'changed' WHERE draft_id = ?",
+            (draft["draft_id"],),
+        )
+    assert sum(event["event_type"] == "TEACHING_PREPARATION_CREATED"
+               for event in cp.store.list_tenant_audits("tenant")) == 1
+    assert cp.store.list_tool_calls(task_ids["syllabus"]) == []
+
+    reader.documents["course-weekly"]["revision_id"] = "2"
+    with pytest.raises(Exception, match="source revision or content changed"):
+        preparation.read(contexts["lead"], "demo", draft["draft_id"])
 
 
 def test_teaching_extraction_review_rechecks_lead_during_commit(tmp_path):

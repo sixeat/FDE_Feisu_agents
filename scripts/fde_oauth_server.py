@@ -21,9 +21,10 @@ from urllib.parse import urlsplit
 from fde_control_plane.feishu_review import FeishuDocumentRevisionReader, FeishuMeetingReviewGateway
 from fde_control_plane.meeting_review_web import MeetingReviewWebService, build_meeting_review_router
 from fde_control_plane.orchestration import AgentOrchestrator
-from fde_control_plane.runtime import HermesRuntimeAdapter
+from fde_control_plane.runtime import HermesRuntimeAdapter, HermesTeachingSourceAdapter
 from fde_control_plane.user_document_access import FeishuUserDocumentReader, UserTokenVault
 from fde_control_plane.teaching import TeachingService
+from fde_control_plane.teaching_execution import TeachingSourceExecutionService
 from fde_control_plane.teaching_web import build_teaching_router
 
 from fde_control_plane import (
@@ -159,10 +160,22 @@ def create_app() -> FastAPI:
         MeetingReviewWebService(review_gateway, meeting_agent_id=meeting_agent_id), sessions,
         public_origin=f"{uri.scheme}://{uri.netloc}",
     ))
+    teaching = TeachingService(
+        control_plane, FeishuUserDocumentReader(user_token_store, client)
+        if user_token_store is not None else None,
+    )
+    extraction_enabled = os.environ.get("FDE_TEACHING_EXTRACTION_ENABLED", "false").lower() == "true"
+    if extraction_enabled and (user_token_store is None or not os.environ.get("HERMES_PROVIDER")
+                               or not os.environ.get("HERMES_MODEL")
+                               or not os.environ.get("FDE_TEACHING_SOURCE_AGENT_ID", "").strip()):
+        raise RuntimeError("teaching extraction requires member OAuth tokens, a fixed Agent and Hermes model")
     app.include_router(build_teaching_router(
-        TeachingService(control_plane, FeishuUserDocumentReader(user_token_store, client)
-                        if user_token_store is not None else None),
-        sessions, public_origin=f"{uri.scheme}://{uri.netloc}",
+        teaching, sessions, public_origin=f"{uri.scheme}://{uri.netloc}",
+        extraction=(TeachingSourceExecutionService(
+            teaching, HermesTeachingSourceAdapter(),
+            allowed_agent_id=os.environ["FDE_TEACHING_SOURCE_AGENT_ID"].strip(),
+        )
+                    if extraction_enabled else None),
     ))
 
     @app.get("/health")

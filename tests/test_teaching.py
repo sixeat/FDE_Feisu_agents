@@ -523,6 +523,89 @@ def test_teaching_source_reconcile_persisted_result_after_interruption(tmp_path,
     assert result["status"] == "WAITING_REVIEW" and result["item_count"] == 0
 
 
+def test_teaching_extraction_api_is_opt_in_and_rechecks_source_access(tmp_path):
+    cp, reader, closed_client, contexts, source_id, _ = teaching_handoff_fixture(tmp_path)
+    path = f"/api/teaching/courses/demo/sources/{source_id}/extractions"
+    assert closed_client.post(path, json={"agent_id": "source-agent", "agent_version": 1}).status_code == 404
+    calls = []
+
+    class FakeRuntime:
+        def run_once(self, request):
+            calls.append(request)
+            source = request.input_ref
+            return RuntimeResult("SUCCEEDED", {
+                "schema_version": "teaching-source-agent.v1",
+                "source": {key: source[key] for key in
+                           ("source_id", "revision_id", "content_hash", "kind")},
+                "items": [],
+            }, None)
+
+    teaching = TeachingService(cp, reader)
+    sessions = SQLiteOAuthSessionIssuer(cp, tenant_id="tenant")
+    app = FastAPI()
+    app.include_router(build_teaching_router(
+        teaching, sessions, public_origin="https://example.test",
+        extraction=TeachingSourceExecutionService(
+            teaching, FakeRuntime(), allowed_agent_id="source-agent"),
+    ))
+    client = TestClient(app)
+    token = sessions(contexts["lead"])
+    client.cookies.set("fde_auth_session", token)
+    body = {"agent_id": "source-agent", "agent_version": 1}
+    assert client.post(path, json=body).status_code == 403
+    assert client.post(path, json=body, headers={"Origin": "https://other.test",
+                                                "X-CSRF-Token": hashlib.sha256(
+                                                    ("meeting-review-csrf:" + token).encode()).hexdigest()}).status_code == 403
+    assert calls == []
+    headers = {"Origin": "https://example.test",
+               "X-CSRF-Token": hashlib.sha256(("meeting-review-csrf:" + token).encode()).hexdigest()}
+    assert client.post(path, json={"agent_id": "other-agent", "agent_version": 1},
+                       headers=headers).status_code == 403
+    first = client.post(path, json=body, headers=headers)
+    assert first.status_code == 200 and first.json()["status"] == "WAITING_REVIEW"
+    again = client.post(path, json=body, headers=headers)
+    assert again.status_code == 200 and again.json()["deduplicated"] is True
+    assert len(calls) == 1
+    result_path = f"/api/teaching/courses/demo/extractions/{first.json()['task_run_id']}"
+    assert client.get(result_path).json()["items"] == []
+    cp.store.connection.execute(
+        "UPDATE teaching_course_members SET active = 0 WHERE course_id = 'demo' AND actor_id = 'lead'")
+    cp.store.connection.commit()
+    assert client.get(result_path).status_code == 403
+    assert client.post(path, json=body, headers=headers).status_code == 403
+    assert len(calls) == 1
+
+
+def test_teaching_extraction_detects_persisted_result_corruption(tmp_path):
+    cp, reader, _, contexts, source_id, _ = teaching_handoff_fixture(tmp_path)
+
+    class EmptyRuntime:
+        def run_once(self, request):
+            source = request.input_ref
+            return RuntimeResult("SUCCEEDED", {
+                "schema_version": "teaching-source-agent.v1",
+                "source": {key: source[key] for key in
+                           ("source_id", "revision_id", "content_hash", "kind")},
+                "items": [],
+            }, None)
+
+    service = TeachingSourceExecutionService(TeachingService(cp, reader), EmptyRuntime())
+    task = service.execute(contexts["lead"], "demo", source_id, "source-agent", 1)
+    row = cp.store.connection.execute(
+        "SELECT output_hash, data_json FROM teaching_extraction_results WHERE task_run_id = ?",
+        (task["task_run_id"],),
+    ).fetchone()
+    assert row["output_hash"] == hashlib.sha256(row["data_json"].encode()).hexdigest()
+    cp.store.connection.execute("DROP TRIGGER teaching_extraction_results_no_update")
+    cp.store.connection.execute(
+        "UPDATE teaching_extraction_results SET data_json = ? WHERE task_run_id = ?",
+        ('{"items":[],"source":{}}', task["task_run_id"]),
+    )
+    cp.store.connection.commit()
+    with pytest.raises(Exception, match="integrity check failed"):
+        service.read_candidates(contexts["lead"], "demo", task["task_run_id"])
+
+
 def test_readonly_handoff_rechecks_course_source_version_and_agent_scope(tmp_path):
     cp, reader, _, contexts, source_id, outline_id = teaching_handoff_fixture(tmp_path)
     service = TeachingService(cp, reader)

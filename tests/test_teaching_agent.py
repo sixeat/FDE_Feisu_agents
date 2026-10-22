@@ -1,6 +1,8 @@
 import hashlib
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -130,3 +132,26 @@ def test_offline_eval_does_not_count_bad_contract_as_quality_pass():
     assert report["all_contracts_valid"] is False
     assert report["cases"][0]["error_code"] == "TEACHING_CONTRACT_INVALID"
     assert report["cases"][0]["omitted"] == 2
+
+
+def test_hermes_teaching_eval_refuses_unconfigured_model():
+    env = {key: value for key, value in os.environ.items()
+           if key not in {"HERMES_MODEL", "HERMES_PROVIDER", "HERMES_BIN", "HERMES_PYTHON"}}
+    script = Path(__file__).parents[1] / "scripts" / "hermes_teaching_source_eval.py"
+    completed = subprocess.run([sys.executable, str(script), "--group", "development"],
+                               capture_output=True, text=True, env=env, check=False)
+    assert completed.returncode == 2
+    assert "HERMES_EVAL_NOT_CONFIGURED" in completed.stderr
+    assert completed.stdout == ""
+
+
+def test_teaching_eval_cli_fixture_groups_are_distinct():
+    from scripts.hermes_teaching_source_eval import load_cases
+
+    development, dev_hash = load_cases("development")
+    holdout, holdout_hash = load_cases("holdout")
+    assert dev_hash == holdout_hash
+    assert {case["case_id"] for case in development}.isdisjoint(
+        {case["case_id"] for case in holdout})
+    for case in development + holdout:
+        validate_teaching_source_output(case["source"], output_for(case))

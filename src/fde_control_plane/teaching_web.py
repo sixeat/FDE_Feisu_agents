@@ -13,6 +13,7 @@ from .meeting_review_web import csrf_token
 from .models import IdentityContext
 from .teaching import SourceChanged, TeachingService
 from .teaching_alignment import TeachingAlignmentService
+from .teaching_execution import TeachingSourceExecutionService
 
 
 class CourseCreateRequest(BaseModel):
@@ -79,8 +80,15 @@ class AlignmentReviewRequest(BaseModel):
                          "MAPPING_INCORRECT", "EVIDENCE_INSUFFICIENT"]
 
 
+class TeachingExtractionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    agent_id: StrictStr = Field(min_length=1, max_length=100)
+    agent_version: StrictInt = Field(ge=1)
+
+
 def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSessionIssuer,
-                          *, public_origin: str) -> APIRouter:
+                          *, public_origin: str,
+                          extraction: TeachingSourceExecutionService | None = None) -> APIRouter:
     router = APIRouter(prefix="/api/teaching")
     require_identity = build_session_dependency(sessions)
     alignment = TeachingAlignmentService(service)
@@ -198,6 +206,25 @@ def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSession
     def read_outline(course_id: str, source_id: str, outline_id: str,
                      identity: IdentityContext = Depends(require_identity)):
         return call(service.read_outline, identity, course_id, source_id, outline_id)
+
+    if extraction is not None:
+        @router.post("/courses/{course_id}/sources/{source_id}/extractions")
+        def execute_source(course_id: str, source_id: str, body: TeachingExtractionRequest,
+                           request: Request, identity: IdentityContext = Depends(require_identity)):
+            check_csrf(request)
+            return call(extraction.execute, identity, course_id, source_id,
+                        body.agent_id, body.agent_version)
+
+        @router.get("/courses/{course_id}/extractions/{task_run_id}")
+        def read_extraction(course_id: str, task_run_id: str,
+                            identity: IdentityContext = Depends(require_identity)):
+            return call(extraction.read_candidates, identity, course_id, task_run_id)
+
+        @router.post("/courses/{course_id}/extractions/{task_run_id}/reconcile")
+        def reconcile_extraction(course_id: str, task_run_id: str, request: Request,
+                                 identity: IdentityContext = Depends(require_identity)):
+            check_csrf(request)
+            return call(extraction.reconcile_stale, identity, course_id, task_run_id)
 
     @router.post("/courses/{course_id}/alignments")
     def create_alignment(course_id: str, body: AlignmentCreateRequest, request: Request,

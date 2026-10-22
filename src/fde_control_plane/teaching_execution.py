@@ -15,13 +15,17 @@ from .teaching_agent import TeachingContractError, validate_teaching_source_outp
 
 
 class TeachingSourceExecutionService:
-    def __init__(self, teaching: TeachingService, runtime: RuntimeAdapter) -> None:
+    def __init__(self, teaching: TeachingService, runtime: RuntimeAdapter,
+                 *, allowed_agent_id: str | None = None) -> None:
         self.teaching = teaching
         self.cp = teaching.cp
         self.store = teaching.store
         self.runtime = runtime
+        self.allowed_agent_id = allowed_agent_id
 
     def _authorized_agent(self, identity: IdentityContext, agent_id: str, version: int) -> str:
+        if self.allowed_agent_id is not None and agent_id != self.allowed_agent_id:
+            raise PermissionError("teaching extraction Agent is not configured")
         member = self.teaching._member(identity)
         binding = self.store.get_binding(member.actor_id, identity.tenant_id)
         if binding is None:
@@ -226,7 +230,7 @@ class TeachingSourceExecutionService:
                      | {"quote_hash": hashlib.sha256(item["quote"].encode()).hexdigest()}
                      for item in validated["items"]]
             stored = {"source": ref, "items": items}
-            output_hash = hashlib.sha256(self.store._json(validated).encode()).hexdigest()
+            output_hash = hashlib.sha256(self.store._json(stored).encode()).hexdigest()
             event = self.teaching._audit(identity, "TEACHING_EXTRACTION_CREATED",
                                          {"task_run_id": task_id, "output_hash": output_hash})
             with self.store.teaching_transaction() as connection:
@@ -255,6 +259,8 @@ class TeachingSourceExecutionService:
         if row is None:
             raise KeyError("teaching extraction result is not in this course")
         stored = json.loads(row["data_json"])
+        if hashlib.sha256(self.store._json(stored).encode()).hexdigest() != row["output_hash"]:
+            raise SourceChanged("teaching extraction result integrity check failed")
         source = self.teaching.read_source(identity, course_id, row["source_id"])
         if any(source[key] != stored["source"][key] for key in stored["source"]):
             raise SourceChanged("teaching extraction source changed")

@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -16,6 +18,8 @@ from fde_control_plane import (
     SQLiteOAuthSessionIssuer, SQLiteStore, TaskRunStatus,
 )
 from fde_control_plane.teaching import TeachingService
+from fde_control_plane.teaching_execution import TeachingSourceExecutionService
+from fde_control_plane.runtime import RunEvent, RuntimeResult
 from fde_control_plane.teaching_web import build_teaching_router
 from fde_control_plane.user_document_access import DOC_READ_SCOPE
 
@@ -304,6 +308,219 @@ def test_readonly_teaching_handoff_is_durable_idempotent_and_has_no_tools(tmp_pa
     reopened.close()
     assert sum(e["event_type"] == "TEACHING_READONLY_HANDOFF"
                for e in cp.store.list_tenant_audits("tenant")) == 1
+
+
+def test_teaching_source_runtime_persists_review_candidates_without_body(tmp_path):
+    cp, reader, _, contexts, source_id, _ = teaching_handoff_fixture(tmp_path)
+    calls = []
+
+    class FakeRuntime:
+        def run_once(self, request):
+            calls.append(request)
+            source = request.input_ref
+            quote = "递归"
+            offset = source["blocks"][0]["text"].index(quote)
+            return RuntimeResult("SUCCEEDED", {
+                "schema_version": "teaching-source-agent.v1",
+                "source": {key: source[key] for key in
+                           ("source_id", "revision_id", "content_hash", "kind")},
+                "items": [{"item_id": "objective-1", "kind": "OBJECTIVE", "week_number": None,
+                           "block_index": 1, "start_offset": offset,
+                           "end_offset": offset + len(quote), "quote": quote}],
+            }, None, events=(RunEvent(request.task_run_id, request.trace_id, 1,
+                                      "completed", "2026-10-22T00:00:00Z", "candidate ready"),))
+
+    service = TeachingSourceExecutionService(TeachingService(cp, reader), FakeRuntime())
+    args = (contexts["lead"], "demo", source_id, "source-agent", 1)
+    first = service.execute(*args)
+    assert first["status"] == "WAITING_REVIEW" and first["item_count"] == 1
+    assert service.execute(*args) == first | {"deduplicated": True}
+    assert len(calls) == 1 and calls[0].tool_policy_snapshot == {"allowed_tools": []}
+    assert cp.store.list_delegations(first["task_run_id"])[0]["scope"] == ["doc.read"]
+    assert len(cp.store.list_runtime_events(first["task_run_id"])) == 1
+    assert cp.store.list_tool_calls(first["task_run_id"]) == []
+    assert cp.store.list_approvals(first["task_run_id"]) == []
+    row = cp.store.connection.execute("SELECT data_json FROM teaching_extraction_results").fetchone()
+    assert "递归" not in row["data_json"] and "quote_hash" in row["data_json"]
+    assert service.read_candidates(contexts["lead"], "demo", first["task_run_id"])["items"][0]["quote"] == "递归"
+    reopened = SQLiteStore(tmp_path / "course.sqlite3")
+    assert reopened.connection.execute("SELECT count(*) FROM teaching_extraction_results").fetchone()[0] == 1
+    reopened.close()
+
+
+def test_teaching_source_runtime_rejects_bad_output_and_does_not_retry(tmp_path):
+    cp, _, _, contexts, source_id, _ = teaching_handoff_fixture(tmp_path)
+    calls = []
+
+    class BadRuntime:
+        def run_once(self, request):
+            calls.append(request)
+            return RuntimeResult("SUCCEEDED", {"schema_version": "teaching-source-agent.v1",
+                                               "source": dict(request.input_ref, blocks=[]),
+                                               "items": []}, None)
+
+    service = TeachingSourceExecutionService(TeachingService(cp, FakeUserReader()), BadRuntime())
+    args = (contexts["lead"], "demo", source_id, "source-agent", 1)
+    first = service.execute(*args)
+    assert first["status"] == "FAILED"
+    assert service.execute(*args)["deduplicated"] is True
+    assert len(calls) == 1
+    assert cp.store.connection.execute("SELECT count(*) FROM teaching_extraction_results").fetchone()[0] == 0
+
+
+def test_teaching_source_runtime_rechecks_revision_after_model(tmp_path):
+    cp, reader, _, contexts, source_id, _ = teaching_handoff_fixture(tmp_path)
+
+    class ChangingRuntime:
+        def run_once(self, request):
+            reader.revision = "2"
+            source = request.input_ref
+            return RuntimeResult("SUCCEEDED", {
+                "schema_version": "teaching-source-agent.v1",
+                "source": {key: source[key] for key in
+                           ("source_id", "revision_id", "content_hash", "kind")},
+                "items": [],
+            }, None)
+
+    service = TeachingSourceExecutionService(TeachingService(cp, reader), ChangingRuntime())
+    result = service.execute(contexts["lead"], "demo", source_id, "source-agent", 1)
+    assert result["status"] == "FAILED"
+    assert cp.store.connection.execute("SELECT count(*) FROM teaching_extraction_results").fetchone()[0] == 0
+
+
+def test_teaching_source_runtime_rechecks_member_and_unknown_is_not_retried(tmp_path):
+    cp, reader, _, contexts, source_id, _ = teaching_handoff_fixture(tmp_path)
+    calls = []
+
+    class UnknownRuntime:
+        def run_once(self, request):
+            calls.append(request)
+            return RuntimeResult("UNKNOWN", None, None, error_code="RUNTIME_TIMEOUT")
+
+    service = TeachingSourceExecutionService(TeachingService(cp, reader), UnknownRuntime())
+    args = (contexts["lead"], "demo", source_id, "source-agent", 1)
+    result = service.execute(*args)
+    assert result["status"] == "RECONCILING"
+    assert service.execute(*args)["deduplicated"] is True
+    assert len(calls) == 1
+    cp.store.connection.execute(
+        "UPDATE teaching_course_members SET active = 0 WHERE course_id = 'demo' AND actor_id = 'lead'")
+    cp.store.connection.commit()
+    with pytest.raises(PermissionError, match="course membership"):
+        service.execute(*args)
+
+
+def test_teaching_source_runtime_rechecks_authorization_in_result_transaction(tmp_path):
+    cp, reader, _, contexts, source_id, _ = teaching_handoff_fixture(tmp_path)
+
+    class RevokingRuntime:
+        def run_once(self, request):
+            source = request.input_ref
+            payload = {"schema_version": "teaching-source-agent.v1",
+                       "source": {key: source[key] for key in
+                                  ("source_id", "revision_id", "content_hash", "kind")},
+                       "items": []}
+            cp.store.connection.execute(
+                "UPDATE teaching_course_members SET active = 0 "
+                "WHERE course_id = 'demo' AND actor_id = 'lead'")
+            cp.store.connection.commit()
+            return RuntimeResult("SUCCEEDED", payload, None)
+
+    service = TeachingSourceExecutionService(TeachingService(cp, reader), RevokingRuntime())
+    result = service.execute(contexts["lead"], "demo", source_id, "source-agent", 1)
+    assert result["status"] == "FAILED"
+    assert cp.store.connection.execute("SELECT count(*) FROM teaching_extraction_results").fetchone()[0] == 0
+
+
+def test_teaching_source_concurrent_replay_calls_runtime_once(tmp_path):
+    cp, reader, _, contexts, source_id, _ = teaching_handoff_fixture(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    class BlockingRuntime:
+        def run_once(self, request):
+            calls.append(request.task_run_id)
+            entered.set()
+            assert release.wait(5)
+            source = request.input_ref
+            return RuntimeResult("SUCCEEDED", {
+                "schema_version": "teaching-source-agent.v1",
+                "source": {key: source[key] for key in
+                           ("source_id", "revision_id", "content_hash", "kind")},
+                "items": [],
+            }, None)
+
+    first = TeachingSourceExecutionService(TeachingService(cp, reader), BlockingRuntime())
+    other_cp = ControlPlane(SQLiteStore(tmp_path / "course.sqlite3"))
+    second = TeachingSourceExecutionService(TeachingService(other_cp, reader), BlockingRuntime())
+    args = (contexts["lead"], "demo", source_id, "source-agent", 1)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(first.execute, *args)
+            assert entered.wait(5)
+            replay = second.execute(*args)
+            assert replay["deduplicated"] is True
+            assert replay["status"] == "RUNNING"
+            assert len(calls) == 1
+            release.set()
+            assert future.result(timeout=5)["status"] == "WAITING_REVIEW"
+    finally:
+        release.set()
+        other_cp.close()
+
+
+def test_teaching_source_interrupted_run_requires_reconciliation(tmp_path):
+    cp, reader, _, contexts, source_id, _ = teaching_handoff_fixture(tmp_path)
+    calls = []
+
+    class InterruptedRuntime:
+        def run_once(self, request):
+            calls.append(request.task_run_id)
+            raise KeyboardInterrupt("simulated process interruption")
+
+    service = TeachingSourceExecutionService(TeachingService(cp, reader), InterruptedRuntime())
+    args = (contexts["lead"], "demo", source_id, "source-agent", 1)
+    with pytest.raises(KeyboardInterrupt):
+        service.execute(*args)
+    replay = service.execute(*args)
+    assert replay["status"] == "RUNNING" and replay["deduplicated"] is True
+    assert len(calls) == 1
+    reconciled = service.reconcile_stale(contexts["lead"], "demo", calls[0], grace_seconds=0)
+    assert reconciled["status"] == "RECONCILING"
+    assert service.execute(*args)["status"] == "RECONCILING"
+    assert len(calls) == 1
+
+
+def test_teaching_source_reconcile_persisted_result_after_interruption(tmp_path, monkeypatch):
+    cp, reader, _, contexts, source_id, _ = teaching_handoff_fixture(tmp_path)
+
+    class EmptyRuntime:
+        def run_once(self, request):
+            source = request.input_ref
+            return RuntimeResult("SUCCEEDED", {
+                "schema_version": "teaching-source-agent.v1",
+                "source": {key: source[key] for key in
+                           ("source_id", "revision_id", "content_hash", "kind")},
+                "items": [],
+            }, None)
+
+    service = TeachingSourceExecutionService(TeachingService(cp, reader), EmptyRuntime())
+    transition = cp.transition_task
+
+    def interrupt_on_review(task_run_id, status, reason=None):
+        if status == TaskRunStatus.WAITING_REVIEW:
+            raise KeyboardInterrupt("simulated interruption after result commit")
+        return transition(task_run_id, status, reason)
+
+    monkeypatch.setattr(cp, "transition_task", interrupt_on_review)
+    with pytest.raises(KeyboardInterrupt):
+        service.execute(contexts["lead"], "demo", source_id, "source-agent", 1)
+    monkeypatch.setattr(cp, "transition_task", transition)
+    task_id = cp.store.connection.execute("SELECT task_run_id FROM teaching_extraction_results").fetchone()[0]
+    assert cp._task(task_id).status == TaskRunStatus.RUNNING
+    result = service.reconcile_stale(contexts["lead"], "demo", task_id, grace_seconds=0)
+    assert result["status"] == "WAITING_REVIEW" and result["item_count"] == 0
 
 
 def test_readonly_handoff_rechecks_course_source_version_and_agent_scope(tmp_path):

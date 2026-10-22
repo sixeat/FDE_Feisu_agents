@@ -445,6 +445,27 @@ class SQLiteStore:
             BEFORE UPDATE ON teaching_handoffs BEGIN SELECT RAISE(ABORT, 'immutable teaching handoff'); END;
             CREATE TRIGGER IF NOT EXISTS teaching_handoffs_no_delete
             BEFORE DELETE ON teaching_handoffs BEGIN SELECT RAISE(ABORT, 'immutable teaching handoff'); END;
+            CREATE TABLE IF NOT EXISTS teaching_extraction_attempts (
+                task_run_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, course_id TEXT NOT NULL,
+                source_id TEXT NOT NULL, source_revision TEXT NOT NULL,
+                source_hash TEXT NOT NULL, requested_by TEXT NOT NULL,
+                started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (task_run_id) REFERENCES task_runs(task_run_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS teaching_extraction_attempts_no_update
+            BEFORE UPDATE ON teaching_extraction_attempts BEGIN SELECT RAISE(ABORT, 'immutable teaching extraction attempt'); END;
+            CREATE TRIGGER IF NOT EXISTS teaching_extraction_attempts_no_delete
+            BEFORE DELETE ON teaching_extraction_attempts BEGIN SELECT RAISE(ABORT, 'immutable teaching extraction attempt'); END;
+            CREATE TABLE IF NOT EXISTS teaching_extraction_results (
+                task_run_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, course_id TEXT NOT NULL,
+                source_id TEXT NOT NULL, output_hash TEXT NOT NULL, data_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (task_run_id) REFERENCES teaching_extraction_attempts(task_run_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS teaching_extraction_results_no_update
+            BEFORE UPDATE ON teaching_extraction_results BEGIN SELECT RAISE(ABORT, 'immutable teaching extraction result'); END;
+            CREATE TRIGGER IF NOT EXISTS teaching_extraction_results_no_delete
+            BEFORE DELETE ON teaching_extraction_results BEGIN SELECT RAISE(ABORT, 'immutable teaching extraction result'); END;
             CREATE TABLE IF NOT EXISTS teaching_alignments (
                 alignment_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, course_id TEXT NOT NULL,
                 input_hash TEXT NOT NULL, data_json TEXT NOT NULL, created_by TEXT NOT NULL,

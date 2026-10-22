@@ -1381,7 +1381,7 @@ class SQLiteStore:
             if hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=True).encode()).hexdigest() != input_hash:
                 raise ValueError("PRECHECK_VERSION_STALE")
             review = self.connection.execute(
-                "SELECT review_id, input_hash, status FROM agent_config_reviews "
+                "SELECT review_id, input_hash, status, report_json FROM agent_config_reviews "
                 "WHERE review_id = ? AND draft_id = ? AND tenant_id = ?",
                 (review_id, draft_id, tenant_id),
             ).fetchone()
@@ -1389,6 +1389,13 @@ class SQLiteStore:
                 raise ValueError("PRECHECK_VERSION_STALE")
             if review["status"] != "READY_FOR_ADMIN":
                 raise ValueError("PRECHECK_NOT_READY")
+            evaluation = self.latest_agent_evaluation(tenant_id, draft_id, input_hash)
+            if evaluation is None or evaluation["status"] != "PASSED":
+                raise ValueError("AGENT_EVALUATION_REQUIRED")
+            if json.loads(review["report_json"]).get("evaluation_id") != evaluation["evaluation_id"]:
+                raise ValueError("PRECHECK_VERSION_STALE")
+            if evaluation["evaluator_id"] == approver_id:
+                raise ValueError("SELF_EVALUATION_APPROVAL")
             base_version = data.get("base_version")
             actor = self.connection.execute("SELECT * FROM actors WHERE actor_id = ?", (agent_id,)).fetchone()
             if base_version is None:
@@ -1411,11 +1418,6 @@ class SQLiteStore:
                         or not actor["active"] or route is None or route["status"] != "ACTIVE"
                         or int(route["stable_version"]) != base_version):
                     raise ValueError("AGENT_BASE_VERSION_STALE")
-                evaluation = self.latest_agent_evaluation(tenant_id, draft_id, input_hash)
-                if evaluation is None or evaluation["status"] != "PASSED":
-                    raise ValueError("AGENT_EVALUATION_REQUIRED")
-                if evaluation["evaluator_id"] == approver_id:
-                    raise ValueError("SELF_EVALUATION_APPROVAL")
                 latest = self.connection.execute(
                     "SELECT MAX(version) AS version FROM agent_versions WHERE agent_id = ?", (agent_id,),
                 ).fetchone()

@@ -679,6 +679,8 @@ class MeetingReviewWebService:
             blockers.append("UNKNOWN_CAPABILITY:" + ",".join(unknown))
         if row["created_by"] == identity.actor_id:
             blockers.append("SELF_REVIEW")
+        if evaluation is None or evaluation["status"] != "PASSED":
+            blockers.append("AGENT_EVALUATION_REQUIRED")
         existing = self.cp.store.list_agent_actors(identity.tenant_id)
         matched = [item for item in existing if str(item["actor_id"]).casefold() == str(data["name"]).casefold()]
         if data.get("base_version") is None:
@@ -690,9 +692,6 @@ class MeetingReviewWebService:
                     or not matched[0]["active"] or route is None or route["status"] != "ACTIVE"
                     or route["stable_version"] != data["base_version"]):
                 blockers.append("AGENT_BASE_VERSION_STALE")
-            evaluation = self.cp.store.latest_agent_evaluation(identity.tenant_id, draft_id, input_hash)
-            if evaluation is None or evaluation["status"] != "PASSED":
-                blockers.append("AGENT_EVALUATION_REQUIRED")
         high_risk = sorted(capabilities & HIGH_RISK_AGENT_CAPABILITIES)
         if high_risk:
             warnings.append("HIGH_RISK_CAPABILITY:" + ",".join(high_risk))

@@ -629,13 +629,14 @@ def test_agent_config_precheck_is_role_gated_deterministic_and_idempotent(tmp_pa
     assert listing["can_precheck"] is True
     first = client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck", headers=admin_headers)
     assert first.status_code == 200
-    assert first.json()["status"] == "READY_FOR_ADMIN"
+    assert first.json()["status"] == "BLOCKED"
+    assert first.json()["blockers"] == ["AGENT_EVALUATION_REQUIRED"]
     assert first.json()["warnings"] == ["HIGH_RISK_CAPABILITY:task.write"]
     second = client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck", headers=admin_headers)
     assert second.status_code == 200 and second.json()["duplicate"] is True
     item = next(item for item in client.get("/api/meetings/agent-drafts").json()["drafts"] if item["draft_id"] == draft_id)
-    assert item["review_status"] == "READY_FOR_ADMIN"
-    assert cp.store.get_latest_agent_config_review(draft_id, "tenant")["status"] == "READY_FOR_ADMIN"
+    assert item["review_status"] == "BLOCKED"
+    assert cp.store.get_latest_agent_config_review(draft_id, "tenant")["status"] == "BLOCKED"
     assert not any(agent["agent_id"] == "审核测试 Agent" for agent in client.get("/api/meetings/agents").json()["agents"])
 
 
@@ -650,7 +651,9 @@ def test_agent_config_precheck_blocks_unknown_capability(tmp_path):
     result = client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck", headers=admin_headers)
     assert result.status_code == 200
     assert result.json()["status"] == "BLOCKED"
-    assert result.json()["blockers"] == ["UNKNOWN_CAPABILITY:unknown.tool"]
+    assert set(result.json()["blockers"]) == {
+        "UNKNOWN_CAPABILITY:unknown.tool", "AGENT_EVALUATION_REQUIRED",
+    }
 
 
 def test_admin_confirmation_requires_current_precheck_and_publishes_immutable_v1(tmp_path):
@@ -666,8 +669,42 @@ def test_admin_confirmation_requires_current_precheck_and_publishes_immutable_v1
     assert client.post(f"/api/meetings/agent-drafts/{draft_id}/confirm", json={
         "review_id": "missing", "input_hash": "0" * 64,
     }, headers=admin_headers).status_code == 409
-    review = client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck", headers=admin_headers).json()
+    blocked = client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck", headers=admin_headers).json()
+    assert blocked["blockers"] == ["AGENT_EVALUATION_REQUIRED"]
+    assert client.post(f"/api/meetings/agent-drafts/{draft_id}/confirm", json={
+        "review_id": blocked["review_id"], "input_hash": blocked["input_hash"],
+    }, headers=admin_headers).status_code == 409
+    digest = hashlib.sha256(b"READ_ONLY").hexdigest()
+    cases = [{"case_id": name, "expected_hash": digest, "evidence_ref": name}
+             for name in ("case-one", "case-two")]
+    assert client.post("/api/meetings/agent-evaluation-datasets", json={
+        "dataset_id": "initial-version-check", "cases": cases,
+    }, headers=admin_headers).status_code == 200
+    cp.register_actor(Actor("independent-reviewer", "tenant", ActorType.USER,
+                            roles=frozenset({"agent_reviewer"}),
+                            external_ref_hash="independent-reviewer-subject"))
+    reviewer_headers = switch_user(cp, client, "independent-reviewer", "independent-reviewer-subject")
+    evaluation = client.post(f"/api/meetings/agent-drafts/{draft_id}/evaluate", json={
+        "input_hash": blocked["input_hash"], "dataset_id": "initial-version-check",
+        "cases": [case | {"observed_hash": digest} for case in cases],
+    }, headers=reviewer_headers)
+    assert evaluation.status_code == 200 and evaluation.json()["status"] == "PASSED"
+    review = client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck",
+                         headers=reviewer_headers).json()
     assert review["status"] == "READY_FOR_ADMIN"
+    assert client.post(f"/api/meetings/agent-drafts/{draft_id}/evaluate", json={
+        "input_hash": blocked["input_hash"], "dataset_id": "initial-version-check",
+        "cases": [case | {"observed_hash": digest} for case in cases],
+    }, headers=reviewer_headers).status_code == 200
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    assert client.post(f"/api/meetings/agent-drafts/{draft_id}/confirm", json={
+        "review_id": review["review_id"], "input_hash": review["input_hash"],
+    }, headers=admin_headers).status_code == 409
+    reviewer_headers = switch_user(cp, client, "independent-reviewer", "independent-reviewer-subject")
+    review = client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck",
+                         headers=reviewer_headers).json()
+    assert review["status"] == "READY_FOR_ADMIN" and not review["duplicate"]
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
     result = client.post(f"/api/meetings/agent-drafts/{draft_id}/confirm", json={
         "review_id": review["review_id"], "input_hash": review["input_hash"],
     }, headers=admin_headers)

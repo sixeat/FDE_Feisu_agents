@@ -86,6 +86,21 @@ class TeachingExtractionRequest(BaseModel):
     agent_version: StrictInt = Field(ge=1)
 
 
+class TeachingExtractionDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    item_id: StrictStr = Field(min_length=1, max_length=64)
+    verdict: Literal["CONFIRMED", "REJECTED"]
+
+
+class TeachingExtractionReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    outcome: Literal["ACCEPTED", "RETURNED"]
+    reason_code: Literal["EVIDENCE_CONFIRMED", "MISSED_CONTENT", "INCORRECT_CITATION",
+                         "WRONG_WEEK", "SOURCE_INCOMPLETE"]
+    coverage_confirmed: StrictBool
+    decisions: list[TeachingExtractionDecision] = Field(max_length=100)
+
+
 def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSessionIssuer,
                           *, public_origin: str,
                           extraction: TeachingSourceExecutionService | None = None) -> APIRouter:
@@ -115,6 +130,7 @@ def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSession
                 "course already exists", "teacher is already active", "teacher is not active",
                 "source reader is already active", "source reader is not active",
                 "alignment was already reviewed",
+                "teaching extraction was already reviewed",
             } else 422
             raise HTTPException(status, str(exc)) from exc
         except RuntimeError as exc:
@@ -225,6 +241,15 @@ def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSession
                                  identity: IdentityContext = Depends(require_identity)):
             check_csrf(request)
             return call(extraction.reconcile_stale, identity, course_id, task_run_id)
+
+        @router.post("/courses/{course_id}/extractions/{task_run_id}/review")
+        def review_extraction(course_id: str, task_run_id: str,
+                              body: TeachingExtractionReviewRequest, request: Request,
+                              identity: IdentityContext = Depends(require_identity)):
+            check_csrf(request)
+            return call(extraction.review_candidates, identity, course_id, task_run_id,
+                        body.outcome, body.reason_code, body.coverage_confirmed,
+                        [item.model_dump() for item in body.decisions])
 
     @router.post("/courses/{course_id}/alignments")
     def create_alignment(course_id: str, body: AlignmentCreateRequest, request: Request,

@@ -466,6 +466,20 @@ class SQLiteStore:
             BEFORE UPDATE ON teaching_extraction_results BEGIN SELECT RAISE(ABORT, 'immutable teaching extraction result'); END;
             CREATE TRIGGER IF NOT EXISTS teaching_extraction_results_no_delete
             BEFORE DELETE ON teaching_extraction_results BEGIN SELECT RAISE(ABORT, 'immutable teaching extraction result'); END;
+            CREATE TABLE IF NOT EXISTS teaching_extraction_reviews (
+                task_run_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, course_id TEXT NOT NULL,
+                source_id TEXT NOT NULL, output_hash TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK(outcome IN ('ACCEPTED', 'RETURNED')),
+                reason_code TEXT NOT NULL, coverage_confirmed INTEGER NOT NULL
+                    CHECK(coverage_confirmed IN (0, 1)),
+                decisions_json TEXT NOT NULL, reviewed_by TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (task_run_id) REFERENCES teaching_extraction_results(task_run_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS teaching_extraction_reviews_no_update
+            BEFORE UPDATE ON teaching_extraction_reviews BEGIN SELECT RAISE(ABORT, 'immutable teaching extraction review'); END;
+            CREATE TRIGGER IF NOT EXISTS teaching_extraction_reviews_no_delete
+            BEFORE DELETE ON teaching_extraction_reviews BEGIN SELECT RAISE(ABORT, 'immutable teaching extraction review'); END;
             CREATE TABLE IF NOT EXISTS teaching_alignments (
                 alignment_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, course_id TEXT NOT NULL,
                 input_hash TEXT NOT NULL, data_json TEXT NOT NULL, created_by TEXT NOT NULL,

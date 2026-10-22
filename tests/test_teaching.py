@@ -568,6 +568,13 @@ def test_teaching_extraction_api_is_opt_in_and_rechecks_source_access(tmp_path):
     assert len(calls) == 1
     result_path = f"/api/teaching/courses/demo/extractions/{first.json()['task_run_id']}"
     assert client.get(result_path).json()["items"] == []
+    review_path = result_path + "/review"
+    review_body = {"outcome": "ACCEPTED", "reason_code": "EVIDENCE_CONFIRMED",
+                   "coverage_confirmed": True, "decisions": []}
+    assert client.post(review_path, json=review_body).status_code == 403
+    assert client.post(review_path, json=review_body, headers=headers).status_code == 200
+    assert client.get(result_path).json()["review"]["outcome"] == "ACCEPTED"
+    assert client.post(review_path, json=review_body, headers=headers).status_code == 409
     cp.store.connection.execute(
         "UPDATE teaching_course_members SET active = 0 WHERE course_id = 'demo' AND actor_id = 'lead'")
     cp.store.connection.commit()
@@ -604,6 +611,111 @@ def test_teaching_extraction_detects_persisted_result_corruption(tmp_path):
     cp.store.connection.commit()
     with pytest.raises(Exception, match="integrity check failed"):
         service.read_candidates(contexts["lead"], "demo", task["task_run_id"])
+
+
+def test_teaching_extraction_review_requires_every_item_and_is_immutable(tmp_path):
+    cp, reader, _, contexts, source_id, _ = teaching_handoff_fixture(tmp_path)
+
+    class OneItemRuntime:
+        def run_once(self, request):
+            source = request.input_ref
+            quote = "递归"
+            start = source["blocks"][0]["text"].index(quote)
+            return RuntimeResult("SUCCEEDED", {
+                "schema_version": "teaching-source-agent.v1",
+                "source": {key: source[key] for key in
+                           ("source_id", "revision_id", "content_hash", "kind")},
+                "items": [{"item_id": "objective-1", "kind": "OBJECTIVE", "week_number": None,
+                           "block_index": 1, "start_offset": start,
+                           "end_offset": start + len(quote), "quote": quote}],
+            }, None)
+
+    service = TeachingSourceExecutionService(TeachingService(cp, reader), OneItemRuntime())
+    task_id = service.execute(contexts["lead"], "demo", source_id, "source-agent", 1)["task_run_id"]
+    args = (contexts["lead"], "demo", task_id)
+    with pytest.raises(ValueError, match="every teaching candidate"):
+        service.review_candidates(*args, "ACCEPTED", "EVIDENCE_CONFIRMED", True, [])
+    with pytest.raises(ValueError, match="outcome and reason"):
+        service.review_candidates(*args, "ACCEPTED", "EVIDENCE_CONFIRMED", False,
+                                  [{"item_id": "objective-1", "verdict": "CONFIRMED"}])
+    with pytest.raises(ValueError, match="every teaching candidate"):
+        service.review_candidates(*args, "ACCEPTED", "EVIDENCE_CONFIRMED", True,
+                                  [{"item_id": "objective-1", "verdict": "REJECTED"}])
+    with pytest.raises(ValueError, match="every teaching candidate"):
+        service.review_candidates(*args, "RETURNED", "WRONG_WEEK", False,
+                                  [{"item_id": "objective-1", "verdict": "CONFIRMED"}])
+    service.teaching.set_teacher(contexts["lead"], "demo", "teacher",
+                                 active=True, reason="课程负责人邀请普通教师")
+    with pytest.raises(PermissionError, match="course lead authorization"):
+        service.review_candidates(contexts["teacher"], "demo", task_id, "ACCEPTED",
+                                  "EVIDENCE_CONFIRMED", True,
+                                  [{"item_id": "objective-1", "verdict": "CONFIRMED"}])
+    decision = [{"item_id": "objective-1", "verdict": "CONFIRMED"}]
+    reviewed = service.review_candidates(*args, "ACCEPTED", "EVIDENCE_CONFIRMED", True, decision)
+    assert reviewed["outcome"] == "ACCEPTED"
+    assert service.read_candidates(*args)["review"]["decisions"] == decision
+    with pytest.raises(ValueError, match="already reviewed"):
+        service.review_candidates(*args, "ACCEPTED", "EVIDENCE_CONFIRMED", True, decision)
+    row = cp.store.connection.execute("SELECT * FROM teaching_extraction_reviews").fetchone()
+    assert row["output_hash"] and "递归" not in row["decisions_json"]
+    with pytest.raises(sqlite3.IntegrityError, match="immutable teaching extraction review"):
+        cp.store.connection.execute(
+            "UPDATE teaching_extraction_reviews SET outcome = 'RETURNED' WHERE task_run_id = ?",
+            (task_id,),
+        )
+    reopened = SQLiteStore(tmp_path / "course.sqlite3")
+    assert reopened.connection.execute(
+        "SELECT outcome FROM teaching_extraction_reviews WHERE task_run_id = ?", (task_id,),
+    ).fetchone()["outcome"] == "ACCEPTED"
+    reopened.close()
+    assert sum(event["event_type"] == "TEACHING_EXTRACTION_REVIEWED"
+               for event in cp.store.list_tenant_audits("tenant")) == 1
+
+
+def test_teaching_extraction_review_rechecks_lead_during_commit(tmp_path):
+    cp, reader, _, contexts, source_id, _ = teaching_handoff_fixture(tmp_path)
+
+    class EmptyRuntime:
+        def run_once(self, request):
+            source = request.input_ref
+            return RuntimeResult("SUCCEEDED", {
+                "schema_version": "teaching-source-agent.v1",
+                "source": {key: source[key] for key in
+                           ("source_id", "revision_id", "content_hash", "kind")},
+                "items": [],
+            }, None)
+
+    service = TeachingSourceExecutionService(TeachingService(cp, reader), EmptyRuntime())
+    task_id = service.execute(contexts["lead"], "demo", source_id, "source-agent", 1)["task_run_id"]
+    original_read = service.read_candidates
+
+    def revoke_after_read(*args):
+        result = original_read(*args)
+        cp.store.connection.execute(
+            "UPDATE teaching_course_members SET active = 0 WHERE course_id = 'demo' AND actor_id = 'lead'")
+        cp.store.connection.commit()
+        return result
+
+    service.read_candidates = revoke_after_read
+    with pytest.raises(PermissionError, match="revoked during review"):
+        service.review_candidates(contexts["lead"], "demo", task_id,
+                                  "RETURNED", "MISSED_CONTENT", False, [])
+    assert cp.store.connection.execute("SELECT count(*) FROM teaching_extraction_reviews").fetchone()[0] == 0
+    cp.store.connection.execute(
+        "UPDATE teaching_course_members SET active = 1 WHERE course_id = 'demo' AND actor_id = 'lead'")
+    cp.store.connection.commit()
+    service.read_candidates = original_read
+    reader.revision = "2"
+    with pytest.raises(Exception, match="source revision or content changed"):
+        service.review_candidates(contexts["lead"], "demo", task_id,
+                                  "RETURNED", "MISSED_CONTENT", False, [])
+    reader.revision = "1"
+    returned = service.review_candidates(contexts["lead"], "demo", task_id,
+                                         "RETURNED", "MISSED_CONTENT", False, [])
+    assert returned["outcome"] == "RETURNED"
+    assert service.read_candidates(contexts["lead"], "demo", task_id)["review"]["outcome"] == "RETURNED"
+    assert cp.store.list_tool_calls(task_id) == []
+    assert cp.store.list_approvals(task_id) == []
 
 
 def test_readonly_handoff_rechecks_course_source_version_and_agent_scope(tmp_path):

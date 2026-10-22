@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -12,6 +13,9 @@ from .models import ActorType, Delegation, IdentityContext, TaskRunStatus, TaskS
 from .runtime import RunRequest, RuntimeAdapter, RuntimeResult
 from .teaching import SourceChanged, TeachingService
 from .teaching_agent import TeachingContractError, validate_teaching_source_output
+
+
+_RETURN_REASONS = {"MISSED_CONTENT", "INCORRECT_CITATION", "WRONG_WEEK", "SOURCE_INCOMPLETE"}
 
 
 class TeachingSourceExecutionService:
@@ -271,8 +275,113 @@ class TeachingSourceExecutionService:
             if hashlib.sha256(quote.encode()).hexdigest() != item["quote_hash"]:
                 raise SourceChanged("teaching extraction citation changed")
             items.append({key: value for key, value in item.items() if key != "quote_hash"} | {"quote": quote})
+        review = self.store.connection.execute(
+            "SELECT * FROM teaching_extraction_reviews WHERE task_run_id = ?", (task_run_id,),
+        ).fetchone()
+        if review is not None and review["output_hash"] != row["output_hash"]:
+            raise SourceChanged("teaching extraction review no longer matches its result")
         return {"task_run_id": task_run_id, "status": self.cp._task(task_run_id).status.value,
-                "source": stored["source"], "items": items}
+                "source": stored["source"], "items": items,
+                "review": ({"outcome": review["outcome"], "reason_code": review["reason_code"],
+                            "coverage_confirmed": bool(review["coverage_confirmed"]),
+                            "decisions": json.loads(review["decisions_json"]),
+                            "reviewed_by": review["reviewed_by"]} if review else None)}
+
+    def review_candidates(self, identity: IdentityContext, course_id: str,
+                          task_run_id: str, outcome: str, reason_code: str,
+                          coverage_confirmed: bool,
+                          decisions: list[dict[str, str]]) -> dict[str, Any]:
+        if (outcome not in {"ACCEPTED", "RETURNED"}
+                or (outcome == "ACCEPTED" and
+                    (reason_code != "EVIDENCE_CONFIRMED" or coverage_confirmed is not True))
+                or (outcome == "RETURNED" and reason_code not in _RETURN_REASONS)):
+            raise ValueError("teaching extraction review outcome and reason do not match")
+        self.teaching._course_member(identity, course_id, lead=True)
+        result = self.read_candidates(identity, course_id, task_run_id)
+        if result["review"] is not None:
+            raise ValueError("teaching extraction was already reviewed")
+        if result["status"] != "WAITING_REVIEW":
+            raise ValueError("teaching extraction is not pending review")
+        expected = {item["item_id"] for item in result["items"]}
+        if (type(coverage_confirmed) is not bool or not isinstance(decisions, list)
+                or len(decisions) != len(expected)
+                or any(not isinstance(item, dict) or set(item) != {"item_id", "verdict"}
+                       or not isinstance(item["item_id"], str)
+                       or item["verdict"] not in {"CONFIRMED", "REJECTED"}
+                       for item in decisions)
+                or {item["item_id"] for item in decisions} != expected
+                or (outcome == "ACCEPTED" and
+                    any(item["verdict"] != "CONFIRMED" for item in decisions))
+                or (outcome == "RETURNED" and reason_code in
+                    {"INCORRECT_CITATION", "WRONG_WEEK"} and
+                    not any(item["verdict"] == "REJECTED" for item in decisions))):
+            raise ValueError("every teaching candidate needs an explicit review decision")
+        normalized = sorted(decisions, key=lambda item: item["item_id"])
+        source = result["source"]
+        row = self.store.connection.execute(
+            "SELECT output_hash FROM teaching_extraction_results WHERE task_run_id = ?",
+            (task_run_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError("teaching extraction result is missing")
+        output_hash = row["output_hash"]
+        event = replace(self.teaching._audit(identity, "TEACHING_EXTRACTION_REVIEWED",
+                                             {"task_run_id": task_run_id, "output_hash": output_hash,
+                                              "outcome": outcome, "reason_code": reason_code,
+                                              "coverage_confirmed": coverage_confirmed,
+                                              "decisions": normalized}),
+                        task_run_id=task_run_id, correlation_id=task_run_id)
+        with self.store.teaching_transaction() as connection:
+            actor = connection.execute(
+                "SELECT active, external_ref_hash FROM actors WHERE tenant_id = ? AND actor_id = ?",
+                (identity.tenant_id, identity.actor_id),
+            ).fetchone()
+            member = connection.execute(
+                "SELECT role, active FROM teaching_course_members WHERE tenant_id = ? "
+                "AND course_id = ? AND actor_id = ?",
+                (identity.tenant_id, course_id, identity.actor_id),
+            ).fetchone()
+            pinned = connection.execute(
+                "SELECT revision_id, content_hash, kind, data_reviewed FROM teaching_sources "
+                "WHERE tenant_id = ? AND course_id = ? AND source_id = ?",
+                (identity.tenant_id, course_id, source["source_id"]),
+            ).fetchone()
+            saved = connection.execute(
+                "SELECT output_hash, data_json FROM teaching_extraction_results WHERE task_run_id = ? "
+                "AND tenant_id = ? AND course_id = ? AND source_id = ?",
+                (task_run_id, identity.tenant_id, course_id, source["source_id"]),
+            ).fetchone()
+            task = connection.execute(
+                "SELECT data_json FROM task_runs WHERE task_run_id = ?", (task_run_id,),
+            ).fetchone()
+            if (actor is None or not actor["active"]
+                    or actor["external_ref_hash"] != identity.subject_ref_hash
+                    or member is None or not member["active"] or member["role"] != "LEAD"):
+                raise PermissionError("course lead authorization was revoked during review")
+            if (pinned is None or not pinned["data_reviewed"]
+                    or any(pinned[key] != source[key] for key in
+                           ("revision_id", "content_hash", "kind"))
+                    or saved is None or saved["output_hash"] != output_hash
+                    or hashlib.sha256(saved["data_json"].encode()).hexdigest() != output_hash):
+                raise SourceChanged("teaching extraction changed during review")
+            if task is None or json.loads(task["data_json"])["status"] != "WAITING_REVIEW":
+                raise ValueError("teaching extraction is not pending review")
+            if connection.execute(
+                "SELECT 1 FROM teaching_extraction_reviews WHERE task_run_id = ?", (task_run_id,),
+            ).fetchone():
+                raise ValueError("teaching extraction was already reviewed")
+            connection.execute(
+                "INSERT INTO teaching_extraction_reviews(task_run_id, tenant_id, course_id, source_id, "
+                "output_hash, outcome, reason_code, coverage_confirmed, decisions_json, reviewed_by) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (task_run_id, identity.tenant_id, course_id, source["source_id"], output_hash,
+                 outcome, reason_code, int(coverage_confirmed), self.store._json(normalized),
+                 identity.actor_id),
+            )
+            self.store.teaching_audit_in_transaction(connection, event)
+        return {"task_run_id": task_run_id, "outcome": outcome, "reason_code": reason_code,
+                "coverage_confirmed": coverage_confirmed, "decisions": normalized,
+                "reviewed_by": identity.actor_id}
 
     def reconcile_stale(self, identity: IdentityContext, course_id: str,
                         task_run_id: str, *, grace_seconds: int = 300) -> dict[str, Any]:

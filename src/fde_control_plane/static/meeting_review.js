@@ -14,7 +14,7 @@ const reasonNames = {ASSIGNEE_UNMAPPED:"负责人待确认",ASSIGNEE_INVALID:"�
 const executionNames = {PREPARED:"待执行",DISPATCHED:"执行中",SUCCEEDED:"已创建",FAILED:"已阻断/失败",UNKNOWN:"结果待核验",RECONCILING:"结果待核验"};
 const agentTypeNames = {PERSONAL_ASSISTANT:"个人助手",BUSINESS_AGENT:"业务 Agent",MANAGEMENT_AGENT:"管理 Agent"};
 const agentStatusNames = {ACTIVE:"运行中",CANARY:"志愿者灰度",PAUSED:"已暂停",ARCHIVED:"已归档",UNVERSIONED:"待接入"};
-const promotionBlockerNames = {AGENT_INACTIVE:"Agent 已停用",OBSERVATION_PERIOD:"观察期不足 60 秒",SAMPLE_COUNT:"灰度样本不足 2 条",RUN_NOT_WAITING_REVIEW:"仍有运行未进入人工核对",RUN_FAILURE:"灰度运行有失败",REVIEW_MISSING:"仍有运行未评审",REVIEW_FAILED:"存在未通过评审",SELF_REVIEW_PROMOTION:"转正管理员不能批准自己的评审",CANDIDATE_SNAPSHOT_MISSING:"候选配置快照缺失"};
+const promotionBlockerNames = {AGENT_INACTIVE:"Agent 已停用",OBSERVATION_PERIOD:"观察期不足 60 秒",SAMPLE_COUNT:"灰度样本不足 2 条",RUN_NOT_WAITING_REVIEW:"仍有运行未进入人工核对",RUN_EVIDENCE_MISSING:"运行缺少完成轨迹",RUN_FAILURE:"灰度运行有失败",REVIEW_MISSING:"仍有运行未评审",REVIEW_FAILED:"存在未通过评审",SELF_REVIEW_PROMOTION:"转正管理员不能批准自己的评审",CANDIDATE_SNAPSHOT_MISSING:"候选配置快照缺失"};
 const draftStatusNames = {PENDING_REVIEW:"待审核",APPROVED:"已批准",REJECTED:"已拒绝",PUBLISHED:"已发布"};
 const reviewStatusNames = {READY_FOR_ADMIN:"预审通过，待管理员确认",BLOCKED:"预审阻断"};
 function node(tag, text, cls) { const el=document.createElement(tag); if(text!==undefined) el.textContent=text; if(cls) el.className=cls; return el; }
@@ -185,6 +185,14 @@ function renderAgents() {
       button.type="button";button.addEventListener("click",()=>changeAgentVolunteer(agent,button));
       actions.append(button);card.append(actions);
     }
+    if(agent.can_run_sample){
+      const actions=node("div",undefined,"commands agent-review-actions");
+      for(const [caseId,label] of [["read_only","运行只读样例"],["write_boundary","运行写入边界样例"]]){
+        const button=node("button",label);button.type="button";
+        button.addEventListener("click",()=>runAgentSample(agent,caseId,button));actions.append(button);
+      }
+      card.append(actions);
+    }
     if(agent.status==="CANARY" && agentState.canPrecheck){
       const actions=node("div",undefined,"commands agent-review-actions");
       const button=node("button","查看并评审灰度运行");button.type="button";
@@ -229,6 +237,7 @@ async function loadCanaryRuns(agent,panel,button){
     result.runs.forEach(run=>{
       const row=node("div",undefined,"agent-draft-row");
       row.append(node("p",`运行 ${run.task_run_id} · ${taskNames[run.status]||run.status} · ${run.review_outcome||"待独立评审"}`,"muted"));
+      if(run.sample_response)row.append(node("p",`${run.sample_case_id}：${run.sample_response}`,"agent-draft-description"));
       if(run.review_outcome)row.append(node("p",`审核人：${run.reviewer_id} · 证据编号：${run.evidence_ref}`,"muted"));
       if(run.status==="WAITING_REVIEW" && !run.review_outcome){
         for(const [outcome,label] of [["PASS","通过"],["FAIL","未通过"]]){
@@ -241,6 +250,20 @@ async function loadCanaryRuns(agent,panel,button){
     });
   }catch(error){panel.replaceChildren(node("p",error.message,"error"));}
   finally{button.disabled=false;}
+}
+async function runAgentSample(agent,caseId,button){
+  if(agentState.busy)return;
+  agentState.busy=true;button.disabled=true;
+  try{
+    const result=await api(`/api/meetings/agents/${encodeURIComponent(agent.agent_id)}/sample-runs`,{
+      method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":agentState.csrf},
+      body:JSON.stringify({case_id:caseId})
+    });
+    agentNotice(result.status==="WAITING_REVIEW"?`样例运行完成，等待审核官核对。运行编号：${result.task_run_id}`:
+      `样例运行状态：${taskNames[result.status]||result.status}。运行编号：${result.task_run_id}`,
+      result.status==="WAITING_REVIEW"?"success":"error");
+  }catch(error){agentNotice(error.message,"error");}
+  finally{agentState.busy=false;button.disabled=false;}
 }
 async function submitCanaryReview(agent,run,outcome,panel,button){
   if(agentState.busy)return;
@@ -287,7 +310,7 @@ async function inspectAgent(agent,button){
   finally{button.disabled=false;}
 }
 function promotionReadinessText(readiness){
-  const counts=`灰度窗口 ${readiness.canary_epoch} · 观察 ${readiness.observation_seconds}/${readiness.required_observation_seconds} 秒 · 样本 ${readiness.sample_count}/${readiness.required_sample_count} 条 · 未评审 ${readiness.unreviewed_count} · 未通过评审 ${readiness.failed_review_count} · 失败运行 ${readiness.failed_run_count}`;
+  const counts=`灰度窗口 ${readiness.canary_epoch} · 观察 ${readiness.observation_seconds}/${readiness.required_observation_seconds} 秒 · 样本 ${readiness.sample_count}/${readiness.required_sample_count} 条 · 缺运行轨迹 ${readiness.missing_runtime_count} · 未评审 ${readiness.unreviewed_count} · 未通过评审 ${readiness.failed_review_count} · 失败运行 ${readiness.failed_run_count}`;
   return readiness.can_promote?`${counts}\n已满足本地转正门槛，仍须管理员人工确认。`:
     `${counts}\n待处理：${readiness.blockers.map(code=>promotionBlockerNames[code]||code).join("；")}`;
 }

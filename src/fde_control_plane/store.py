@@ -256,6 +256,17 @@ class SQLiteStore:
                 sequence INTEGER NOT NULL, data_json TEXT NOT NULL,
                 UNIQUE(task_run_id, sequence)
             );
+            CREATE TABLE IF NOT EXISTS agent_sample_results (
+                task_run_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+                agent_version INTEGER NOT NULL, case_id TEXT NOT NULL,
+                config_hash TEXT NOT NULL, response_text TEXT NOT NULL,
+                response_hash TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (task_run_id) REFERENCES task_runs(task_run_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS agent_sample_results_no_update
+            BEFORE UPDATE ON agent_sample_results BEGIN SELECT RAISE(ABORT, 'immutable agent sample result'); END;
+            CREATE TRIGGER IF NOT EXISTS agent_sample_results_no_delete
+            BEFORE DELETE ON agent_sample_results BEGIN SELECT RAISE(ABORT, 'immutable agent sample result'); END;
             CREATE TABLE IF NOT EXISTS wake_events (
                 wake_key TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
                 task_run_id TEXT NOT NULL, trigger_type TEXT NOT NULL,
@@ -1154,6 +1165,8 @@ class SQLiteStore:
                     or route["canary_version"] != expected_version or draft is None
                     or draft["created_by"] == reviewer_id or run is None
                     or task_run_id not in current_ids or run.get("status") != "WAITING_REVIEW"
+                    or not any(event.get("event_type") == "completed"
+                               for event in self.list_runtime_events(task_run_id))
                     or self.connection.execute(
                         "SELECT 1 FROM agent_canary_reviews WHERE task_run_id = ?", (task_run_id,),
                     ).fetchone() is not None):
@@ -1190,10 +1203,13 @@ class SQLiteStore:
         runs = self.agent_canary_runs(tenant_id, agent_id)
         reviews = self.list_agent_canary_reviews(tenant_id, agent_id,
                                                  [run["task_run_id"] for run in runs])
-        missing = failed_reviews = self_reviews = failed_runs = incomplete_runs = 0
+        missing = failed_reviews = self_reviews = failed_runs = incomplete_runs = missing_runtime = 0
         for run in runs:
             if run.get("status") != "WAITING_REVIEW":
                 incomplete_runs += 1
+            if not any(event.get("event_type") == "completed"
+                       for event in self.list_runtime_events(run["task_run_id"])):
+                missing_runtime += 1
             if run.get("failure_reason") or run.get("status") in {"FAILED", "RECONCILING"}:
                 failed_runs += 1
             review = reviews.get(run["task_run_id"])
@@ -1211,6 +1227,8 @@ class SQLiteStore:
             blockers.append("SAMPLE_COUNT")
         if incomplete_runs:
             blockers.append("RUN_NOT_WAITING_REVIEW")
+        if missing_runtime:
+            blockers.append("RUN_EVIDENCE_MISSING")
         if failed_runs:
             blockers.append("RUN_FAILURE")
         if missing:
@@ -1228,6 +1246,7 @@ class SQLiteStore:
                 "sample_count": len(runs), "required_sample_count": 2,
                 "unreviewed_count": missing, "failed_review_count": failed_reviews,
                 "failed_run_count": failed_runs, "incomplete_run_count": incomplete_runs,
+                "missing_runtime_count": missing_runtime,
                 "self_review_count": self_reviews}
 
     def list_agent_promotion_evidence(self, tenant_id: str, agent_id: str) -> list[dict[str, Any]]:
@@ -1762,6 +1781,69 @@ class SQLiteStore:
             "SELECT data_json FROM runtime_events WHERE task_run_id = ? ORDER BY sequence", (task_run_id,)
         ).fetchall()
         return [json.loads(row["data_json"]) for row in rows]
+
+    def get_agent_sample_result(self, task_run_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM agent_sample_results WHERE task_run_id = ?", (task_run_id,),
+        ).fetchone()
+
+    def save_agent_sample_result(self, task_run_id: str, case_id: str,
+                                 config_hash: str, response: str,
+                                 subject_ref_hash: str, event: Any) -> None:
+        """Accept a model result only while its member, version and route remain current."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            task = self.get_task_run(task_run_id)
+            if task is None or task["status"] != "RUNNING":
+                raise ValueError("AGENT_SAMPLE_STALE")
+            tenant, agent_id = task["tenant_id"], task["agent_id"]
+            route = self.get_agent_route(tenant, agent_id)
+            actor = self.connection.execute(
+                "SELECT active FROM actors WHERE tenant_id = ? AND actor_id = ?",
+                (tenant, agent_id),
+            ).fetchone()
+            member = self.connection.execute(
+                "SELECT active, external_ref_hash FROM actors WHERE tenant_id = ? "
+                "AND actor_id = ? AND actor_type = 'USER'",
+                (tenant, task["requested_by"]),
+            ).fetchone()
+            assistant = self.connection.execute(
+                "SELECT active FROM actors WHERE tenant_id = ? AND actor_id = ? "
+                "AND actor_type = 'PERSONAL_ASSISTANT'",
+                (tenant, task["assistant_actor_id"]),
+            ).fetchone()
+            binding = self.get_binding(task["requested_by"], tenant)
+            version = self.get_agent_version(agent_id, task["agent_version"])
+            snapshot = self.get_agent_snapshot(tenant, agent_id, task["agent_version"])
+            selected = (route["canary_version"] if route is not None and route["status"] == "CANARY"
+                        and task["requested_by"] in json.loads(route["volunteer_ids_json"])
+                        else route["stable_version"] if route is not None else None)
+            if (route is None or route["status"] == "ARCHIVED" or selected != task["agent_version"]
+                    or actor is None or not actor["active"]
+                    or member is None or not member["active"]
+                    or member["external_ref_hash"] != subject_ref_hash
+                    or assistant is None or not assistant["active"]
+                    or binding is None or binding["assistant_actor_id"] != task["assistant_actor_id"]
+                    or version is None or not version["active"]
+                    or snapshot is None or snapshot["config_hash"] != config_hash):
+                raise ValueError("AGENT_SAMPLE_STALE")
+            digest = hashlib.sha256(response.encode()).hexdigest()
+            self.connection.execute(
+                "INSERT INTO agent_sample_results(task_run_id, tenant_id, agent_id, agent_version, "
+                "case_id, config_hash, response_text, response_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (task_run_id, tenant, agent_id, task["agent_version"], case_id,
+                 config_hash, response, digest),
+            )
+            task["status"] = "WAITING_REVIEW"
+            self.connection.execute(
+                "UPDATE task_runs SET data_json = ? WHERE task_run_id = ?",
+                (self._json(task), task_run_id),
+            )
+            self._insert_agent_audit(event)
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def claim_wake(
         self,

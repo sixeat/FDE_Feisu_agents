@@ -22,14 +22,14 @@ from fde_control_plane.meeting_review_web import MeetingReviewWebService, build_
 from test_feishu_review import setup_review, DOCUMENT_ID, SUBJECT, CAPS, FailedRuntime
 
 
-def web_setup(tmp_path, revision="5", identity=None):
+def web_setup(tmp_path, revision="5", identity=None, sample_runtime=None):
     cp, gateway, reader, owner, task_id, edits = setup_review(tmp_path, revision)
     cp.store.save_meeting_source("record", {
         "document_id": DOCUMENT_ID, "title": "会议纪要",
         "revision_id": "5", "evidence": [{"block_id": 2, "text": "张三整理部署文档"}],
     })
     sessions = SQLiteOAuthSessionIssuer(cp, tenant_id="tenant")
-    service = MeetingReviewWebService(gateway)
+    service = MeetingReviewWebService(gateway, sample_runtime=sample_runtime)
     app = FastAPI()
     app.include_router(build_meeting_review_router(service, sessions, public_origin="https://example.test"))
     client = TestClient(app)

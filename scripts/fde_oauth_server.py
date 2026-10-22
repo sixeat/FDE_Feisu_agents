@@ -21,7 +21,8 @@ from urllib.parse import urlsplit
 from fde_control_plane.feishu_review import FeishuDocumentRevisionReader, FeishuMeetingReviewGateway
 from fde_control_plane.meeting_review_web import MeetingReviewWebService, build_meeting_review_router
 from fde_control_plane.orchestration import AgentOrchestrator
-from fde_control_plane.runtime import HermesRuntimeAdapter, HermesTeachingSourceAdapter
+from fde_control_plane.runtime import (HermesAgentSampleAdapter, HermesRuntimeAdapter,
+                                       HermesTeachingSourceAdapter)
 from fde_control_plane.user_document_access import FeishuUserDocumentReader, UserTokenVault
 from fde_control_plane.teaching import TeachingService
 from fde_control_plane.teaching_execution import TeachingSourceExecutionService
@@ -150,14 +151,19 @@ def create_app() -> FastAPI:
             cookie_secure=True,
         )
     )
-    # This router only reviews persisted Agent output; it exposes no run or worker endpoint.
+    sample_enabled = os.environ.get("FDE_AGENT_SAMPLE_RUNTIME_ENABLED", "false").lower() == "true"
+    if sample_enabled and (not os.environ.get("HERMES_PROVIDER") or not os.environ.get("HERMES_MODEL")):
+        raise RuntimeError("Agent sample runtime requires a configured Hermes provider and model")
     review_gateway = FeishuMeetingReviewGateway(
         control_plane, AgentOrchestrator(control_plane, HermesRuntimeAdapter()),
         FeishuDocumentRevisionReader(client),
     )
     uri = urlsplit(redirect_uri)
     app.include_router(build_meeting_review_router(
-        MeetingReviewWebService(review_gateway, meeting_agent_id=meeting_agent_id), sessions,
+        MeetingReviewWebService(
+            review_gateway, meeting_agent_id=meeting_agent_id,
+            sample_runtime=HermesAgentSampleAdapter() if sample_enabled else None,
+        ), sessions,
         public_origin=f"{uri.scheme}://{uri.netloc}",
     ))
     teaching = TeachingService(

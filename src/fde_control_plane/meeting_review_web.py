@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr
 
+from .agent_sample import AgentSampleExecutionService
 from .feishu_oauth_web import SQLiteOAuthSessionIssuer, build_session_dependency
 from .feishu_review import FeishuMeetingReviewGateway
 from .follow_up import (
@@ -23,6 +24,7 @@ from .follow_up import (
 )
 from .meeting import meeting_review_snapshot, review_todo_ref
 from .models import ActorType, AuditEvent, IdentityContext, TaskRunStatus
+from .runtime import RuntimeAdapter
 from .task_due_correction import (
     approve_due_correction, correction_for_task, latest_remote_observation, propose_due_correction,
 )
@@ -132,6 +134,11 @@ class AgentCanaryReviewRequest(BaseModel):
                                     pattern=r"^[A-Za-z0-9_.:-]+$")
 
 
+class AgentSampleRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    case_id: Literal["read_only", "write_boundary"]
+
+
 class AgentPauseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_version: int | None = Field(default=None, ge=1)
@@ -195,10 +202,13 @@ class DueCorrectionApproval(BaseModel):
 
 
 class MeetingReviewWebService:
-    def __init__(self, gateway: FeishuMeetingReviewGateway, *, meeting_agent_id: str = "meeting-agent") -> None:
+    def __init__(self, gateway: FeishuMeetingReviewGateway, *, meeting_agent_id: str = "meeting-agent",
+                 sample_runtime: RuntimeAdapter | None = None) -> None:
         self.gateway = gateway
         self.cp = gateway.control_plane
         self.meeting_agent_id = meeting_agent_id
+        self.sample = (AgentSampleExecutionService(self.cp, sample_runtime)
+                       if sample_runtime is not None else None)
         self.lock = RLock()
 
     def start_meeting(self, identity: IdentityContext, body: MeetingStartRequest) -> dict[str, Any]:
@@ -221,6 +231,7 @@ class MeetingReviewWebService:
         actors = self.cp.store.list_agent_actors(identity.tenant_id)
         versions = self.cp.store.list_agent_versions([row["actor_id"] for row in actors])
         can_manage = self.can_confirm_agent_config(identity)
+        sample_binding = self.cp.store.get_binding(identity.actor_id, identity.tenant_id)
         pauses = self.cp.store.latest_agent_pauses(identity.tenant_id) if can_manage else {}
         by_agent: dict[str, list[Any]] = {}
         for version in versions:
@@ -253,6 +264,16 @@ class MeetingReviewWebService:
                 "candidate_version": candidate_version,
                 "volunteer_enrolled": bool(consent["active"]) and consent["candidate_version"] == candidate_version
                 if consent is not None else False,
+                "can_run_sample": self.sample is not None and sample_binding is not None
+                and route is not None
+                and status in {"ACTIVE", "CANARY"}
+                and actor["actor_type"] == "BUSINESS_AGENT"
+                and self.cp.store.get_agent_snapshot(
+                    identity.tenant_id, actor["actor_id"],
+                    int(route["canary_version"] if route["status"] == "CANARY"
+                        and identity.actor_id in json.loads(route["volunteer_ids_json"])
+                        else route["stable_version"]),
+                ) is not None,
                 "version_count": len(history),
                 "versions": [int(version["version"]) for version in history] if can_manage else [],
                 "capabilities": sorted(json.loads(current["capabilities_json"])) if current is not None else [],
@@ -261,6 +282,17 @@ class MeetingReviewWebService:
             })
         return {"agents": items, "can_pause": can_manage, "can_resume": can_manage,
                 "can_manage_lifecycle": can_manage}
+
+    def run_agent_sample(self, agent_id: str, identity: IdentityContext,
+                         body: AgentSampleRunRequest) -> dict[str, Any]:
+        if self.sample is None:
+            raise HTTPException(404, "样例运行入口未启用")
+        try:
+            return self.sample.execute(identity, agent_id, body.case_id)
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     def agent_diagnostics(self, agent_id: str, identity: IdentityContext) -> dict[str, Any]:
         if not self.can_confirm_agent_config(identity):
@@ -280,9 +312,20 @@ class MeetingReviewWebService:
         reviews = self.cp.store.list_agent_canary_reviews(
             identity.tenant_id, agent_id, [run["task_run_id"] for run in runs],
         )
+        samples = {run["task_run_id"]: self.cp.store.get_agent_sample_result(run["task_run_id"])
+                   for run in runs}
+        if any(sample is not None and hashlib.sha256(sample["response_text"].encode()).hexdigest()
+               != sample["response_hash"] for sample in samples.values()):
+            raise HTTPException(409, "样例运行结果摘要不匹配")
         return {"agent_id": agent_id, "candidate_version": int(route["canary_version"]),
                 "runs": [{"task_run_id": run["task_run_id"], "status": run["status"],
                           "created_at": run["created_at"],
+                          "sample_case_id": samples[run["task_run_id"]]["case_id"]
+                          if samples[run["task_run_id"]] is not None else None,
+                          "sample_response": samples[run["task_run_id"]]["response_text"]
+                          if samples[run["task_run_id"]] is not None else None,
+                          "sample_response_hash": samples[run["task_run_id"]]["response_hash"]
+                          if samples[run["task_run_id"]] is not None else None,
                           "review_outcome": reviews[run["task_run_id"]]["outcome"]
                           if run["task_run_id"] in reviews else None,
                           "reviewer_id": reviews[run["task_run_id"]]["reviewer_id"]
@@ -1205,6 +1248,13 @@ def build_meeting_review_router(
     def get_agents(identity: IdentityContext = Depends(require_identity)):
         with service.lock:
             return service.agent_registry(identity)
+
+    @router.post("/agents/{agent_id}/sample-runs")
+    def run_agent_sample(agent_id: str, body: AgentSampleRunRequest, request: Request,
+                         identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        with service.lock:
+            return service.run_agent_sample(agent_id, identity, body)
 
     @router.get("/agents/{agent_id}/diagnostics")
     def agent_diagnostics(agent_id: str, identity: IdentityContext = Depends(require_identity)):

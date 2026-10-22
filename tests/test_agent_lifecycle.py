@@ -7,6 +7,8 @@ import sqlite3
 import pytest
 
 from fde_control_plane import Actor, ActorType, AgentVersion, RiskLevel, SQLiteStore, TaskRunStatus, ToolDefinition
+from fde_control_plane.runtime import (HermesAgentSampleAdapter, RunEvent, RunRequest,
+                                       RuntimeExecutionError, RuntimeResult)
 from test_meeting_review_web import switch_user, web_setup
 
 
@@ -52,7 +54,17 @@ def test_existing_agent_route_database_adds_canary_epoch_without_losing_route(tm
 
 
 def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
-    cp, _, client, member_headers, _, _, _ = web_setup(tmp_path)
+    class SampleRuntime:
+        def run_once(self, request):
+            assert request.tool_policy_snapshot == {"allowed_tools": []}
+            return RuntimeResult("SUCCEEDED", {
+                "schema_version": "agent-sample.v1",
+                "case_id": request.input_ref["case_id"],
+                "response": "仅给出建议，等待人工确认。",
+            }, None, events=(RunEvent(request.task_run_id, request.trace_id, 1,
+                                      "completed", "2026-10-22T00:00:00Z", "sample completed"),))
+
+    cp, _, client, member_headers, _, _, _ = web_setup(tmp_path, sample_runtime=SampleRuntime())
     cp.register_actor(Actor("reviewer", "tenant", ActorType.USER, frozenset(),
                             external_ref_hash="reviewer-subject"))
     reviewer_headers = switch_user(cp, client, "reviewer", "reviewer-subject")
@@ -157,33 +169,57 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
     assert client.post(route + "/volunteer", json=consent, headers=member_headers).status_code == 200
     admin_headers = switch_user(cp, client, "admin", "admin-subject")
     assert client.post(route + "/canary", json=payload, headers=admin_headers).status_code == 200
-    run2 = cp.create_task_run("member", "assistant", "sample-lifecycle-agent", 2)
+    member_headers = switch_user(cp, client, "member", hashlib.sha256(b"ou_submitter").hexdigest())
+    sample_url = route + "/sample-runs"
+    assert client.post(sample_url, json={"case_id": "read_only"}).status_code == 403
+    sample2 = client.post(sample_url, json={"case_id": "read_only"}, headers=member_headers)
+    assert sample2.status_code == 200 and sample2.json()["status"] == "WAITING_REVIEW"
+    run2 = cp._task(sample2.json()["task_run_id"])
+    sample_result = cp.store.get_agent_sample_result(run2.task_run_id)
+    assert sample_result["response_hash"] == hashlib.sha256(sample2.json()["response"].encode()).hexdigest()
+    with pytest.raises(sqlite3.IntegrityError, match="immutable agent sample result"):
+        cp.store.connection.execute(
+            "UPDATE agent_sample_results SET response_text = ? WHERE task_run_id = ?",
+            ("changed", run2.task_run_id),
+        )
     decision = cp.authorize_operation(run2.task_run_id, ToolDefinition(
         "read", frozenset({"doc.read"}), RiskLevel.LOW))
     assert not decision.allowed and "suggestion-only" in decision.reason
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
     assert client.get(readiness_url).json()["sample_count"] == 1
     assert client.post(route + "/promote", json={**payload, "volunteer_ids": []},
                        headers=admin_headers).status_code == 409
-    run2.status = TaskRunStatus.WAITING_REVIEW
-    cp.store.save_task_run(run2)
-    run3 = cp.create_task_run("member", "assistant", "sample-lifecycle-agent", 2)
-    run3.status = TaskRunStatus.WAITING_REVIEW
-    cp.store.save_task_run(run3)
+    member_headers = switch_user(cp, client, "member", hashlib.sha256(b"ou_submitter").hexdigest())
+    sample3 = client.post(sample_url, json={"case_id": "write_boundary"}, headers=member_headers)
+    assert sample3.status_code == 200 and sample3.json()["status"] == "WAITING_REVIEW"
+    run3 = cp._task(sample3.json()["task_run_id"])
     cp.store.connection.execute(
         "UPDATE agent_routes SET updated_at = datetime('now', '-2 minutes') WHERE agent_id = ?",
         ("sample-lifecycle-agent",),
     )
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
     pending_readiness = client.get(readiness_url).json()
     assert pending_readiness["blockers"] == ["REVIEW_MISSING"]
     assert pending_readiness["sample_count"] == 2 and pending_readiness["unreviewed_count"] == 2
     assert client.post(route + "/promote", json={**payload, "volunteer_ids": []},
                        headers=admin_headers).status_code == 409
+    fabricated = cp.create_task_run("member", "assistant", "sample-lifecycle-agent", 2)
+    fabricated.status = TaskRunStatus.WAITING_REVIEW
+    cp.store.save_task_run(fabricated)
+    assert "RUN_EVIDENCE_MISSING" in client.get(readiness_url).json()["blockers"]
     reviewer_headers = switch_user(cp, client, "reviewer", "reviewer-subject")
     assert client.get(readiness_url).status_code == 403
     assert client.get(route + "/promotion-history").status_code == 403
     candidate_runs = client.get(route + "/canary-runs").json()["runs"]
-    assert {item["task_run_id"] for item in candidate_runs} == {run2.task_run_id, run3.task_run_id}
+    assert {item["task_run_id"] for item in candidate_runs} == {
+        run2.task_run_id, run3.task_run_id, fabricated.task_run_id,
+    }
+    assert next(item for item in candidate_runs if item["task_run_id"] == run2.task_run_id)[
+        "sample_response"
+    ] == sample2.json()["response"]
     failed_review = {"expected_version": 2, "outcome": "FAIL", "evidence_ref": "fixture:badcase"}
+    assert client.post(route + f"/canary-runs/{fabricated.task_run_id}/review",
+                       json=failed_review, headers=reviewer_headers).status_code == 409
     assert client.post(route + f"/canary-runs/{run2.task_run_id}/review", json=failed_review,
                        headers=reviewer_headers).status_code == 200
     assert client.post(route + f"/canary-runs/{run2.task_run_id}/review", json=failed_review,
@@ -202,10 +238,14 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
         )
     admin_headers = switch_user(cp, client, "admin", "admin-subject")
     reviewed_runs = client.get(route + "/canary-runs").json()["runs"]
-    assert {run["reviewer_id"] for run in reviewed_runs} == {"reviewer"}
-    assert {run["evidence_ref"] for run in reviewed_runs} == {"fixture:badcase", "fixture:reviewed"}
+    assert {run["reviewer_id"] for run in reviewed_runs if run["reviewer_id"]} == {"reviewer"}
+    assert {run["evidence_ref"] for run in reviewed_runs if run["evidence_ref"]} == {
+        "fixture:badcase", "fixture:reviewed",
+    }
     failed_readiness = client.get(readiness_url).json()
-    assert failed_readiness["blockers"] == ["REVIEW_FAILED"]
+    assert {"RUN_EVIDENCE_MISSING", "REVIEW_MISSING", "REVIEW_FAILED"} <= set(
+        failed_readiness["blockers"]
+    )
     assert failed_readiness["failed_review_count"] == 1
     run2.status = TaskRunStatus.FAILED
     cp.store.save_task_run(run2)
@@ -222,12 +262,12 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
     assert client.post(route + "/volunteer", json=consent, headers=member_headers).status_code == 200
     admin_headers = switch_user(cp, client, "admin", "admin-subject")
     assert client.post(route + "/canary", json=payload, headers=admin_headers).status_code == 200
+    member_headers = switch_user(cp, client, "member", hashlib.sha256(b"ou_submitter").hexdigest())
     fresh_runs = []
-    for _ in range(2):
-        run = cp.create_task_run("member", "assistant", "sample-lifecycle-agent", 2)
-        run.status = TaskRunStatus.WAITING_REVIEW
-        cp.store.save_task_run(run)
-        fresh_runs.append(run)
+    for case_id in ("read_only", "write_boundary"):
+        response = client.post(sample_url, json={"case_id": case_id}, headers=member_headers)
+        assert response.status_code == 200 and response.json()["status"] == "WAITING_REVIEW"
+        fresh_runs.append(cp._task(response.json()["task_run_id"]))
     assert all(run.canary_epoch != first_epoch for run in fresh_runs)
     cp.store.connection.execute(
         "UPDATE agent_routes SET updated_at = datetime('now', '-2 minutes') WHERE agent_id = ?",
@@ -242,7 +282,7 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
                            headers=reviewer_headers).status_code == 200
     admin_headers = switch_user(cp, client, "admin", "admin-subject")
     diagnostics = client.get(route + "/diagnostics").json()
-    assert diagnostics["total"] == 5 and diagnostics["versions"]["1"]["failures"] == 1
+    assert diagnostics["total"] == 6 and diagnostics["versions"]["1"]["failures"] == 1
     comparison = client.get(route + "/compare?old_version=1&new_version=2").json()
     assert comparison["changes"]["description"]["old"] != comparison["changes"]["description"]["new"]
     ready = client.get(readiness_url).json()
@@ -306,3 +346,96 @@ def test_lifecycle_rejects_non_admin_and_cross_tenant_volunteer(tmp_path):
     assert client.get(route + "/diagnostics").status_code == 403
     assert client.post(route + "/archive", json={"expected_version": 1,
         "reason": "普通成员尝试下架"}, headers=headers).status_code == 403
+    assert client.post(route + "/sample-runs", json={"case_id": "read_only"},
+                       headers=headers).status_code == 404
+
+
+@pytest.mark.parametrize("failure,expected", [
+    ("invalid", "FAILED"), ("unknown", "RECONCILING"), ("revoked", "FAILED"),
+    ("rebound", "FAILED"),
+])
+def test_sample_run_fails_closed_before_human_review(tmp_path, failure, expected):
+    holder = {}
+
+    class SampleRuntime:
+        def run_once(self, request):
+            if failure == "revoked":
+                holder["cp"].store.connection.execute(
+                    "UPDATE actors SET active = 0 WHERE actor_id = 'member'"
+                )
+                holder["cp"].store.connection.commit()
+            if failure == "rebound":
+                holder["cp"].store.connection.execute(
+                    "UPDATE actors SET external_ref_hash = 'another-subject' WHERE actor_id = 'member'"
+                )
+                holder["cp"].store.connection.commit()
+            if failure == "unknown":
+                return RuntimeResult("UNKNOWN", None, None, error_code="RUNTIME_TIMEOUT")
+            return RuntimeResult("SUCCEEDED", {
+                "schema_version": "agent-sample.v1", "case_id": request.input_ref["case_id"],
+                "response": "" if failure == "invalid" else "需要人工确认。",
+            }, None, events=(RunEvent(request.task_run_id, request.trace_id, 1,
+                                      "completed", "2026-10-22T00:00:00Z", "completed"),))
+
+    cp, _, client, member_headers, _, _, _ = web_setup(tmp_path, sample_runtime=SampleRuntime())
+    holder["cp"] = cp
+    cp.register_actor(Actor("reviewer", "tenant", ActorType.USER, frozenset(),
+                            external_ref_hash="reviewer-subject"))
+    draft = _draft(client, member_headers)
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    assert client.post("/api/meetings/member-directory/reviewer/reviewer-role", json={
+        "expected_reviewer": False, "reviewer": True, "reason": "independent sample review",
+    }, headers=admin_headers).status_code == 200
+    reviewer_headers = switch_user(cp, client, "reviewer", "reviewer-subject")
+    dataset = {"dataset_id": "sample-regression-v1", "cases": [
+        {"case_id": case, "expected_hash": hashlib.sha256(value.encode()).hexdigest(),
+         "evidence_ref": evidence} for case, value, evidence in (
+             ("case-read", "READ", "fixture-read"),
+             ("case-human", "ASK_HUMAN", "fixture-human"),
+         )
+    ]}
+    assert client.post("/api/meetings/agent-evaluation-datasets", json=dataset,
+                       headers=reviewer_headers).status_code == 200
+    evaluation = _evaluation(cp, draft)
+    assert client.post(f"/api/meetings/agent-drafts/{draft}/evaluate", json=evaluation,
+                       headers=reviewer_headers).status_code == 200
+    review = client.post(f"/api/meetings/agent-drafts/{draft}/precheck",
+                         headers=reviewer_headers).json()
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    assert client.post(f"/api/meetings/agent-drafts/{draft}/confirm", json={
+        "review_id": review["review_id"], "input_hash": review["input_hash"],
+    }, headers=admin_headers).status_code == 200
+    member_headers = switch_user(cp, client, "member", hashlib.sha256(b"ou_submitter").hexdigest())
+    result = client.post("/api/meetings/agents/sample-lifecycle-agent/sample-runs",
+                         json={"case_id": "read_only"}, headers=member_headers)
+    assert result.status_code == 200 and result.json()["status"] == expected
+    assert cp.store.get_agent_sample_result(result.json()["task_run_id"]) is None
+    assert not any(event["event_type"] == "AGENT_SAMPLE_COMPLETED"
+                   for event in cp.store.list_audits())
+
+
+def test_hermes_agent_sample_uses_no_tools_and_requires_fixed_input():
+    import subprocess
+
+    captured = {}
+
+    def runner(command, **kwargs):
+        captured.update(command=command, prompt=kwargs["input"])
+        return subprocess.CompletedProcess(command, 0, json.dumps({
+            "schema_version": "agent-sample.v1", "case_id": "read_only",
+            "response": "请人工核对。",
+        }), "")
+
+    adapter = HermesAgentSampleAdapter(runner=runner)
+    request = RunRequest("run", "trace", "member", "sample@1", {
+        "agent_id": "sample", "version": 1, "description": "只读建议",
+        "case_id": "read_only", "question": "给出建议",
+    }, {"allowed_tools": []}, "offline")
+    result = adapter.run_once(request)
+    assert result.status == "SUCCEEDED"
+    assert result.events[-1].summary == "Hermes returned a agent-sample.v1 contract"
+    assert captured["command"][captured["command"].index("--toolsets") + 1] == "context_engine"
+    assert "Do not use tools" in captured["prompt"]
+    with pytest.raises(RuntimeExecutionError, match="INVALID_AGENT_SAMPLE"):
+        adapter.run_once(RunRequest("run", "trace", "member", "sample@1",
+                                    request.input_ref, {"allowed_tools": ["task.create"]}, "offline"))

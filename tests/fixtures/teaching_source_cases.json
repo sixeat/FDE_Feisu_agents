@@ -1,0 +1,55 @@
+{
+  "development": [
+    {
+      "case_id": "dev-syllabus-01",
+      "source": {
+        "source_id": "fictional-syllabus",
+        "revision_id": "dev-1",
+        "kind": "SYLLABUS",
+        "blocks": [
+          {"index": 1, "block_type": 2, "text": "教学目标：能解释数据来源。"},
+          {"index": 2, "block_type": 2, "text": "教学目标：能比较两种方案。"}
+        ]
+      },
+      "expected_items": [
+        {"kind": "OBJECTIVE", "week_number": null, "block_index": 1, "start_offset": 0, "end_offset": 13, "quote": "教学目标：能解释数据来源。"},
+        {"kind": "OBJECTIVE", "week_number": null, "block_index": 2, "start_offset": 0, "end_offset": 13, "quote": "教学目标：能比较两种方案。"}
+      ]
+    }
+  ],
+  "holdout": [
+    {
+      "case_id": "holdout-weekly-01",
+      "source": {
+        "source_id": "fictional-weekly-plan",
+        "revision_id": "holdout-1",
+        "kind": "WEEKLY_PLAN",
+        "blocks": [
+          {"index": 1, "block_type": 2, "text": "第1周：认识课程资料。"},
+          {"index": 2, "block_type": 2, "text": "第3周：比较案例。"},
+          {"index": 3, "block_type": 2, "text": "周次待课程负责人确认。"}
+        ]
+      },
+      "expected_items": [
+        {"kind": "WEEK_PLAN", "week_number": 1, "block_index": 1, "start_offset": 0, "end_offset": 11, "quote": "第1周：认识课程资料。"},
+        {"kind": "WEEK_PLAN", "week_number": 3, "block_index": 2, "start_offset": 0, "end_offset": 9, "quote": "第3周：比较案例。"}
+      ]
+    },
+    {
+      "case_id": "holdout-lesson-01",
+      "source": {
+        "source_id": "fictional-lesson-plan",
+        "revision_id": "holdout-2",
+        "kind": "LESSON_PLAN",
+        "blocks": [
+          {"index": 1, "block_type": 2, "text": "第1周：用两份资料讨论来源可靠性。"},
+          {"index": 2, "block_type": 2, "text": "课堂练习：列出待核实的问题。"}
+        ]
+      },
+      "expected_items": [
+        {"kind": "LESSON_FRAGMENT", "week_number": 1, "block_index": 1, "start_offset": 0, "end_offset": 18, "quote": "第1周：用两份资料讨论来源可靠性。"},
+        {"kind": "LESSON_FRAGMENT", "week_number": null, "block_index": 2, "start_offset": 0, "end_offset": 14, "quote": "课堂练习：列出待核实的问题。"}
+      ]
+    }
+  ]
+}

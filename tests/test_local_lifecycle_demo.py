@@ -12,7 +12,7 @@ from test_agent_lifecycle import _draft
 def _role(client, role):
     response = client.post(f"/local-demo/login/{role}", follow_redirects=False)
     assert response.status_code == 303
-    assert response.headers["location"] == "/h5#agents"
+    assert response.headers["location"] == "/local-demo/h5#agents"
     csrf = client.get("/api/meetings/agent-drafts").json()["csrf_token"]
     return {"X-CSRF-Token": csrf, "Origin": "http://127.0.0.1:8212"}
 
@@ -23,7 +23,11 @@ def test_browser_demo_runs_governance_without_feishu(tmp_path):
     assert client.get("/health").json()["mode"] == "synthetic-local-demo"
     assert client.get("/h5", follow_redirects=False).headers["location"] == "/local-demo"
     member_headers = _role(client, "member")
-    assert client.get("/h5").status_code == 200
+    assert client.get("/h5", follow_redirects=False).headers["location"] == "/local-demo/h5#agents"
+    workspace = client.get("/local-demo/h5")
+    assert workspace.status_code == 200
+    assert '/assets/local_demo_ui.js' in workspace.text
+    assert '/assets/local_demo.css' in workspace.text
     assert client.post("/api/meetings/start", json={}, headers=member_headers).status_code == 404
     draft = _draft(client, member_headers)
     reviewer_headers = _role(client, "reviewer")

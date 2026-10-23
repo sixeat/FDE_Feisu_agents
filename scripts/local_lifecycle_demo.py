@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from fde_control_plane import (Actor, ActorType, AgentOrchestrator, AssistantBinding,
@@ -111,7 +111,7 @@ def create_app(db_path: Path | None = None, *, port: int = 8212) -> FastAPI:
             "</style><h1>本地 Agent 生命周期</h1>"
             "<p>虚构身份与固定样例回答；不连接飞书，也不执行远端写入。</p>"
             f"<p>当前身份：<strong>{current}</strong></p>{buttons}"
-            "<p><a href='/h5#agents'>进入 Agent 工作台</a></p></html>",
+            "<p><a href='/local-demo/h5#agents'>进入 Agent 工作台</a></p></html>",
             headers={"Cache-Control": "no-store"},
         )
 
@@ -123,7 +123,7 @@ def create_app(db_path: Path | None = None, *, port: int = 8212) -> FastAPI:
         if origin is not None and origin != f"http://127.0.0.1:{port}":
             raise HTTPException(403, "invalid local origin")
         identity = IdentityContext(TENANT, role, "user_oauth", f"local-demo-{role}")
-        response = RedirectResponse("/h5#agents", status_code=303)
+        response = RedirectResponse("/local-demo/h5#agents", status_code=303)
         response.set_cookie("fde_auth_session", sessions(identity), max_age=86400,
                             httponly=True, secure=False, samesite="lax")
         response.headers["Cache-Control"] = "no-store"
@@ -137,7 +137,19 @@ def create_app(db_path: Path | None = None, *, port: int = 8212) -> FastAPI:
     def workspace(request: Request):
         if sessions.resolve(request.cookies.get("fde_auth_session", "")) is None:
             return RedirectResponse("/local-demo", status_code=303)
-        return FileResponse(STATIC / "meeting_review.html", headers={"Cache-Control": "no-store"})
+        return RedirectResponse("/local-demo/h5#agents", status_code=303)
+
+    @app.get("/local-demo/h5", response_class=HTMLResponse)
+    def demo_workspace(request: Request):
+        if sessions.resolve(request.cookies.get("fde_auth_session", "")) is None:
+            return RedirectResponse("/local-demo", status_code=303)
+        html = (STATIC / "meeting_review.html").read_text(encoding="utf-8")
+        script = '<script src="/assets/meeting_review.js" defer></script>'
+        if script not in html:
+            raise RuntimeError("Agent workspace script is missing")
+        html = html.replace(script, '<link rel="stylesheet" href="/assets/local_demo.css">'
+                            '<script src="/assets/local_demo_ui.js" defer></script>' + script, 1)
+        return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
     @app.get("/")
     def home():

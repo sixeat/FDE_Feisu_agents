@@ -272,6 +272,22 @@ class SQLiteStore:
             BEFORE UPDATE ON agent_sample_results BEGIN SELECT RAISE(ABORT, 'immutable agent sample result'); END;
             CREATE TRIGGER IF NOT EXISTS agent_sample_results_no_delete
             BEFORE DELETE ON agent_sample_results BEGIN SELECT RAISE(ABORT, 'immutable agent sample result'); END;
+            CREATE TABLE IF NOT EXISTS agent_sample_dispositions (
+                task_run_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+                agent_version INTEGER NOT NULL, decided_by TEXT NOT NULL,
+                decision TEXT NOT NULL CHECK(decision = 'DISCARD_UNVERIFIED'),
+                evidence_ref TEXT NOT NULL, audit_id TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (task_run_id) REFERENCES task_runs(task_run_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_sample_dispositions_agent
+                ON agent_sample_dispositions(tenant_id, agent_id);
+            CREATE TRIGGER IF NOT EXISTS agent_sample_dispositions_no_update
+            BEFORE UPDATE ON agent_sample_dispositions
+            BEGIN SELECT RAISE(ABORT, 'immutable sample disposition'); END;
+            CREATE TRIGGER IF NOT EXISTS agent_sample_dispositions_no_delete
+            BEFORE DELETE ON agent_sample_dispositions
+            BEGIN SELECT RAISE(ABORT, 'immutable sample disposition'); END;
             CREATE TABLE IF NOT EXISTS wake_events (
                 wake_key TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
                 task_run_id TEXT NOT NULL, trigger_type TEXT NOT NULL,
@@ -1662,8 +1678,80 @@ class SQLiteStore:
                 counts = by_version[version]["runtime_events"]
                 counts[event_type] = counts.get(event_type, 0) + 1
         issues.sort(key=lambda issue: (issue["created_at"] or "", issue["task_run_id"]), reverse=True)
+        recent = issues[:50]
+        sample_ids: set[str] = set()
+        if recent:
+            placeholders = ",".join("?" for _ in recent)
+            sample_ids = {row["task_run_id"] for row in self.connection.execute(
+                "SELECT task_run_id FROM task_steps WHERE "
+                "json_extract(data_json, '$.name') = 'agent.sample.read_only' "
+                f"AND task_run_id IN ({placeholders})",
+                [issue["task_run_id"] for issue in recent],
+            ).fetchall()}
+        dispositions = self.agent_sample_dispositions(tenant_id, agent_id)
+        for issue in recent:
+            issue["is_sample"] = issue["task_run_id"] in sample_ids
+            issue["disposition"] = dispositions.get(issue["task_run_id"])
         return {"versions": by_version, "total": sum(item["total"] for item in by_version.values()),
-                "issue_total": len(issues), "issues": issues[:50]}
+                "issue_total": len(issues), "issues": recent}
+
+    def agent_sample_dispositions(self, tenant_id: str, agent_id: str) -> dict[str, dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT task_run_id, decision, decided_by, evidence_ref, audit_id, created_at "
+            "FROM agent_sample_dispositions WHERE tenant_id = ? AND agent_id = ?",
+            (tenant_id, agent_id),
+        ).fetchall()
+        return {row["task_run_id"]: dict(row) for row in rows}
+
+    def open_agent_sample_unknown(self, tenant_id: str, agent_id: str, member_id: str,
+                                  version: int, input_ref_hash: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT task_run_id FROM task_runs WHERE tenant_id = ? "
+            "AND json_extract(data_json, '$.agent_id') = ? "
+            "AND json_extract(data_json, '$.requested_by') = ? "
+            "AND json_extract(data_json, '$.agent_version') = ? "
+            "AND json_extract(data_json, '$.input_ref_hash') = ? "
+            "AND json_extract(data_json, '$.status') = 'RECONCILING' "
+            "AND EXISTS (SELECT 1 FROM task_steps WHERE task_steps.task_run_id = task_runs.task_run_id "
+            "AND json_extract(task_steps.data_json, '$.name') = 'agent.sample.read_only') "
+            "AND NOT EXISTS (SELECT 1 FROM agent_sample_dispositions AS disposition "
+            "WHERE disposition.task_run_id = task_runs.task_run_id) LIMIT 1",
+            (tenant_id, agent_id, member_id, version, input_ref_hash),
+        ).fetchone()
+        return row["task_run_id"] if row else None
+
+    def save_agent_sample_disposition(self, tenant_id: str, agent_id: str, task_run_id: str,
+                                      expected_version: int, decided_by: str,
+                                      evidence_ref: str, event: Any) -> bool:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            task = self.get_task_run(task_run_id)
+            step = self.connection.execute(
+                "SELECT 1 FROM task_steps WHERE task_run_id = ? "
+                "AND json_extract(data_json, '$.name') = 'agent.sample.read_only' LIMIT 1",
+                (task_run_id,),
+            ).fetchone()
+            if (task is None or task["tenant_id"] != tenant_id or task["agent_id"] != agent_id
+                    or task["agent_version"] != expected_version or task["status"] != "RECONCILING"
+                    or step is None or self.get_agent_sample_result(task_run_id) is not None
+                    or self.connection.execute(
+                        "SELECT 1 FROM agent_sample_dispositions WHERE task_run_id = ?",
+                        (task_run_id,),
+                    ).fetchone() is not None):
+                self.connection.rollback()
+                return False
+            self.connection.execute(
+                "INSERT INTO agent_sample_dispositions(task_run_id, tenant_id, agent_id, agent_version, "
+                "decided_by, decision, evidence_ref, audit_id) VALUES (?, ?, ?, ?, ?, 'DISCARD_UNVERIFIED', ?, ?)",
+                (task_run_id, tenant_id, agent_id, expected_version, decided_by,
+                 evidence_ref, event.audit_id),
+            )
+            self._insert_agent_audit(event)
+            self.connection.commit()
+            return True
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def save_binding(self, binding: Any) -> None:
         self.connection.execute(

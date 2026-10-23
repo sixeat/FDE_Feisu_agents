@@ -245,7 +245,8 @@ async function loadCanaryRuns(agent,panel,button){
     result.runs.forEach(run=>{
       const row=node("div",undefined,"agent-draft-row");
       row.append(node("p",`运行 ${run.task_run_id} · ${taskNames[run.status]||run.status} · ${run.review_outcome|| (run.status==="WAITING_REVIEW"?"待独立评审":"不可评审")}`,"muted"));
-      if(run.error_code)row.append(node("p",`诊断码：${run.error_code} · ${run.status==="RECONCILING"?"先人工核验结果；本窗口不可转正。":"保留本次记录；核对后可新建样例运行。"}`,"agent-review-findings"));
+      if(run.error_code)row.append(node("p",`诊断码：${run.error_code} · ${run.status==="RECONCILING"?(run.disposition?"已登记不作证据；本窗口仍不可转正。":"先人工核验结果；本窗口不可转正。"):"保留本次记录；核对后可新建样例运行。"}`,"agent-review-findings"));
+      if(run.disposition)row.append(node("p",`已登记不作评审证据 · 核验人 ${run.disposition.decided_by} · 证据编号 ${run.disposition.evidence_ref}`,"muted"));
       if(run.sample_response)row.append(node("p",`${run.sample_case_id}：${run.sample_response}`,"agent-draft-description"));
       if(run.review_outcome)row.append(node("p",`审核人：${run.reviewer_id} · 证据编号：${run.evidence_ref}`,"muted"));
       if(run.status==="WAITING_REVIEW" && !run.review_outcome){
@@ -319,9 +320,15 @@ async function inspectAgent(agent,panel,button){
         const row=node("div",undefined,"agent-draft-row");
         row.append(node("p",`v${issue.version} · ${issue.task_run_id} · ${taskNames[issue.status]||issue.status} · ${issue.created_at||"时间未知"}`,"muted"));
         row.append(node("p",`诊断码：${issue.error_code} · ${issue.release_mode}${issue.canary_epoch==null?"":` · 灰度窗口 ${issue.canary_epoch}`}`,"agent-review-findings"));
+        if(issue.disposition)row.append(node("p",`已登记不作评审证据 · 核验人 ${issue.disposition.decided_by} · 证据编号 ${issue.disposition.evidence_ref}`,"muted"));
+        else if(issue.status==="RECONCILING" && issue.is_sample){
+          const resolveButton=node("button","登记核验结论");resolveButton.type="button";
+          resolveButton.addEventListener("click",()=>disposeAgentSampleUnknown(agent,issue,panel,button,resolveButton));
+          row.append(resolveButton);
+        }
         panel.append(row);
       });
-      panel.append(node("p","失败运行可核对后发起新样例；结果未知须先人工核验。当前灰度有异常时可暂停或回退，重新灰度将使用新窗口。","muted"));
+      panel.append(node("p","失败运行可核对后发起新样例；结果未知须登记人工核验结论后再运行同题。当前灰度有异常时可暂停或回退，重新灰度将使用新窗口。","muted"));
     }
     if(versions.length>1){
       const newer=agent.canary_version||versions[0],older=versions.find(version=>version<newer);
@@ -345,6 +352,23 @@ async function inspectAgent(agent,panel,button){
     }
   }catch(error){panel.replaceChildren(node("p",error.message,"error"));}
   finally{button.disabled=false;}
+}
+async function disposeAgentSampleUnknown(agent,issue,panel,inspectButton,button){
+  if(agentState.busy)return;
+  const evidence_ref=window.prompt("请输入核验材料编号（不填正文或链接）：");
+  if(evidence_ref===null)return;
+  if(!/^[A-Za-z0-9_.:-]{3,200}$/.test(evidence_ref)){agentNotice("证据引用需为 3–200 位编号。","error");return;}
+  if(!window.confirm(`确认将运行 ${issue.task_run_id} 登记为“不作评审证据”？原运行仍保持待核验，当前灰度仍不能转正。`))return;
+  agentState.busy=true;button.disabled=true;
+  try{
+    await api(`/api/meetings/agents/${encodeURIComponent(agent.agent_id)}/sample-runs/${encodeURIComponent(issue.task_run_id)}/disposition`,{
+      method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":agentState.csrf},
+      body:JSON.stringify({expected_version:issue.version,evidence_ref})
+    });
+    agentNotice("核验结论已保存；原运行仍为待核验。","success");
+    await inspectAgent(agent,panel,inspectButton);
+  }catch(error){agentNotice(error.message,"error");button.disabled=false;}
+  finally{agentState.busy=false;}
 }
 function promotionReadinessText(readiness){
   const counts=`灰度窗口 ${readiness.canary_epoch} · 观察 ${readiness.observation_seconds}/${readiness.required_observation_seconds} 秒 · 样本 ${readiness.sample_count}/${readiness.required_sample_count} 条 · 缺运行轨迹 ${readiness.missing_runtime_count} · 未评审 ${readiness.unreviewed_count} · 未通过评审 ${readiness.failed_review_count} · 失败运行 ${readiness.failed_run_count}`;

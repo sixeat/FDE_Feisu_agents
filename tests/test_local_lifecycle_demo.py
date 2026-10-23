@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import sqlite3
 
 from fastapi.testclient import TestClient
 
@@ -76,7 +77,42 @@ def test_browser_demo_runs_governance_without_feishu(tmp_path):
     issues = client.get("/api/meetings/agents/sample-lifecycle-agent/diagnostics").json()["issues"]
     assert {issue["task_run_id"] for issue in issues} == set(failures)
     assert {issue["error_code"] for issue in issues} == {"SAMPLE_DEMO_FAILURE", "SAMPLE_DEMO_UNKNOWN"}
+    assert all(issue["is_sample"] for issue in issues)
     member_headers = _role(client, "member")
+    repeat = client.post("/api/meetings/agents/sample-lifecycle-agent/sample-runs",
+                         json={"case_id": "read_only"}, headers=member_headers)
+    assert repeat.status_code == 409 and failures[1] in repeat.json()["detail"]
+    disposition_url = ("/api/meetings/agents/sample-lifecycle-agent/sample-runs/"
+                       + failures[1] + "/disposition")
+    decision = {"expected_version": 1, "evidence_ref": "local:checked-v1"}
+    assert client.post(disposition_url, json=decision, headers=member_headers).status_code == 403
+    admin_headers = _role(client, "admin")
+    assert client.post(disposition_url, json={**decision, "expected_version": 2},
+                       headers=admin_headers).status_code == 409
+    assert client.post(disposition_url.replace("sample-lifecycle-agent", "local-assistant"),
+                       json=decision, headers=admin_headers).status_code == 409
+    assert client.post(disposition_url, json={**decision, "evidence_ref": "private text here"},
+                       headers=admin_headers).status_code == 422
+    saved = client.post(disposition_url, json=decision, headers=admin_headers)
+    assert saved.status_code == 200 and saved.json()["decision"] == "DISCARD_UNVERIFIED"
+    assert client.post(disposition_url, json=decision, headers=admin_headers).status_code == 409
+    assert app.state.control_plane.store.get_task_run(failures[1])["status"] == "RECONCILING"
+    assert app.state.control_plane.store.get_agent_sample_result(failures[1]) is None
+    resolved_issues = client.get("/api/meetings/agents/sample-lifecycle-agent/diagnostics").json()["issues"]
+    disposition = next(issue for issue in resolved_issues if issue["task_run_id"] == failures[1])["disposition"]
+    assert disposition["evidence_ref"] == decision["evidence_ref"]
+    assert disposition["audit_id"] in {event["audit_id"] for event in app.state.control_plane.store.list_audits()}
+    with sqlite3.connect(tmp_path / "demo.sqlite3") as connection:
+        try:
+            connection.execute("DELETE FROM agent_sample_dispositions WHERE task_run_id = ?", (failures[1],))
+        except sqlite3.IntegrityError as exc:
+            assert "immutable sample disposition" in str(exc)
+        else:
+            raise AssertionError("sample disposition must be immutable")
+    member_headers = _role(client, "member")
+    retried = client.post("/api/meetings/agents/sample-lifecycle-agent/sample-runs",
+                          json={"case_id": "read_only"}, headers=member_headers)
+    assert retried.status_code == 200 and retried.json()["status"] == "WAITING_REVIEW"
     draft2 = _draft(client, member_headers, base_version=1, description="只读建议与更严格的人工核对")
     reviewer_headers = _role(client, "reviewer")
     stored2 = app.state.control_plane.store.get_agent_config_draft(draft2, "local-demo")
@@ -116,6 +152,10 @@ def test_browser_demo_runs_governance_without_feishu(tmp_path):
     assert {"RUN_FAILURE", "RUN_NOT_WAITING_REVIEW"} <= set(readiness["blockers"])
     assert client.post(route + "/promote", json={**route_request, "volunteer_ids": []},
                        headers=admin_headers).status_code == 409
+    disposition_url = route + f"/sample-runs/{unknown_id}/disposition"
+    assert client.post(disposition_url, json={"expected_version": 2,
+        "evidence_ref": "local:checked-canary"}, headers=admin_headers).status_code == 200
+    assert "RUN_FAILURE" in client.get(route + "/promotion-readiness").json()["blockers"]
     assert client.post(route + "/rollback", json={
         "expected_version": 1, "target_version": 1, "reason": "核对未知样例后关闭灰度窗口",
     }, headers=admin_headers).status_code == 200
@@ -148,7 +188,7 @@ def test_browser_demo_runs_governance_without_feishu(tmp_path):
                        headers=admin_headers).status_code == 200
     assert client.get(route + "/compare?old_version=1&new_version=2").json()[
         "sample_comparison"
-    ]["read_only"]["old"]["task_run_id"] == run.json()["task_run_id"]
+    ]["read_only"]["old"]["task_run_id"] == retried.json()["task_run_id"]
     assert client.post(route + "/rollback", json={
         "expected_version": 2, "target_version": 1, "reason": "local sample rollback",
     }, headers=admin_headers).status_code == 200
@@ -158,6 +198,13 @@ def test_browser_demo_runs_governance_without_feishu(tmp_path):
     assert app.state.control_plane.store.select_agent_version(
         "local-demo", "sample-lifecycle-agent", "member"
     ) is None
+    app.state.control_plane.store.close()
+    restarted = create_app(tmp_path / "demo.sqlite3")
+    stored_dispositions = restarted.state.control_plane.store.agent_sample_dispositions(
+        "local-demo", "sample-lifecycle-agent",
+    )
+    assert set(stored_dispositions) == {failures[1], unknown_id}
+    assert restarted.state.control_plane.store.get_task_run(unknown_id)["status"] == "RECONCILING"
 
 
 def test_browser_demo_restricts_login_origin_and_remote_clients(tmp_path):

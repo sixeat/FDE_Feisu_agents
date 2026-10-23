@@ -47,6 +47,11 @@ class AgentSampleExecutionService:
                   "description": config["description"], "case_id": case_id,
                   "question": SAMPLE_CASES[case_id]}
         digest = hashlib.sha256(self.store._json(sample).encode()).hexdigest()
+        pending = self.store.open_agent_sample_unknown(
+            identity.tenant_id, agent_id, identity.actor_id, version, digest,
+        )
+        if pending is not None:
+            raise ValueError(f"样例运行 {pending} 的结果尚未人工核验")
         task = self.cp.create_task_run(
             identity.actor_id, binding["assistant_actor_id"], agent_id, version,
             input_ref_hash=digest, identity=identity,

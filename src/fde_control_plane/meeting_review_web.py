@@ -139,6 +139,13 @@ class AgentSampleRunRequest(BaseModel):
     case_id: Literal["read_only", "write_boundary"]
 
 
+class AgentSampleDispositionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int = Field(ge=1)
+    evidence_ref: StrictStr = Field(min_length=3, max_length=200,
+                                    pattern=r"^[A-Za-z0-9_.:-]+$")
+
+
 class AgentPauseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_version: int | None = Field(default=None, ge=1)
@@ -302,6 +309,28 @@ class MeetingReviewWebService:
             raise HTTPException(404, "Agent 不存在")
         return {"agent_id": agent_id, **self.cp.store.agent_run_diagnostics(identity.tenant_id, agent_id)}
 
+    def dispose_agent_sample_unknown(self, agent_id: str, task_run_id: str,
+                                     identity: IdentityContext,
+                                     body: AgentSampleDispositionRequest) -> dict[str, Any]:
+        if not self.can_confirm_agent_config(identity):
+            raise HTTPException(403, "只有管理员可以处置未知样例运行")
+        event = AuditEvent(
+            audit_id="audit-" + secrets.token_hex(12),
+            event_type="AGENT_SAMPLE_DISCARDED_UNVERIFIED",
+            tenant_id=identity.tenant_id, actor_id=identity.actor_id,
+            task_run_id=task_run_id, correlation_id=task_run_id,
+            payload_hash=hashlib.sha256(json.dumps({
+                "agent_id": agent_id, "version": body.expected_version,
+                "evidence_ref": body.evidence_ref, "decision": "DISCARD_UNVERIFIED",
+            }, sort_keys=True).encode()).hexdigest(), outcome="DISCARD_UNVERIFIED",
+        )
+        if not self.cp.store.save_agent_sample_disposition(
+                identity.tenant_id, agent_id, task_run_id, body.expected_version,
+                identity.actor_id, body.evidence_ref, event):
+            raise HTTPException(409, "样例运行不存在、不是结果未知，或已处置")
+        return {"agent_id": agent_id, "task_run_id": task_run_id,
+                "decision": "DISCARD_UNVERIFIED", "audit_id": event.audit_id}
+
     def agent_canary_runs(self, agent_id: str, identity: IdentityContext) -> dict[str, Any]:
         if not self.can_precheck_agent_config(identity):
             raise HTTPException(403, "只有审核官或管理员可以查看灰度运行记录")
@@ -314,6 +343,7 @@ class MeetingReviewWebService:
         )
         samples = {run["task_run_id"]: self.cp.store.get_agent_sample_result(run["task_run_id"])
                    for run in runs}
+        dispositions = self.cp.store.agent_sample_dispositions(identity.tenant_id, agent_id)
         if any(sample is not None and hashlib.sha256(sample["response_text"].encode()).hexdigest()
                != sample["response_hash"] for sample in samples.values()):
             raise HTTPException(409, "样例运行结果摘要不匹配")
@@ -322,6 +352,7 @@ class MeetingReviewWebService:
                           "created_at": run["created_at"],
                           "error_code": self.cp.store.agent_error_code(run.get("failure_reason"))
                           or ("UNCLASSIFIED_FAILURE" if run["status"] in {"FAILED", "RECONCILING"} else None),
+                          "disposition": dispositions.get(run["task_run_id"]),
                           "sample_case_id": samples[run["task_run_id"]]["case_id"]
                           if samples[run["task_run_id"]] is not None else None,
                           "sample_response": samples[run["task_run_id"]]["response_text"]
@@ -1280,6 +1311,14 @@ def build_meeting_review_router(
     def agent_diagnostics(agent_id: str, identity: IdentityContext = Depends(require_identity)):
         with service.lock:
             return service.agent_diagnostics(agent_id, identity)
+
+    @router.post("/agents/{agent_id}/sample-runs/{task_run_id}/disposition")
+    def dispose_agent_sample_unknown(agent_id: str, task_run_id: str,
+                                     body: AgentSampleDispositionRequest, request: Request,
+                                     identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        with service.lock:
+            return service.dispose_agent_sample_unknown(agent_id, task_run_id, identity, body)
 
     @router.get("/agents/{agent_id}/canary-runs")
     def agent_canary_runs(agent_id: str, identity: IdentityContext = Depends(require_identity)):

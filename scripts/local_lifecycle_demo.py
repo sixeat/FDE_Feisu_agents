@@ -120,7 +120,8 @@ def create_app(db_path: Path | None = None, *, port: int = 8212) -> FastAPI:
             raise HTTPException(403, "invalid local request")
         token = DEMO_OUTCOME.set(body.outcome)
         try:
-            return service.run_agent_sample(agent_id, identity, body)
+            with service.lock:
+                return service.run_agent_sample(agent_id, identity, body)
         finally:
             DEMO_OUTCOME.reset(token)
 

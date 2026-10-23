@@ -30,6 +30,8 @@ Runtime：Hermes CLI 已用于会议 Agent 语义执行；线上控制平面现�
 2026-10-22 临时转本地开发：按用户安排将服务器让给个人博客。停机前在线备份 `/opt/fde-agent-stage/deploy/data/backups/20261022-offline-for-blog/`，含 SQLite、Compose、FDE 环境配置和 Nginx 站点配置，数据库 `quick_check=ok`；随后通过 Compose 停止三个 FDE 容器，解除 FDE Nginx 站点链接，`nginx -t` 通过并重载。原数据库、容器、镜像和配置均保留，未执行 `down` 或清理。服务器 SSH 与博客交接说明位于本机 `F:\Code_X\ssh\workbuddy-server-handoff.md`，不含私钥内容。本机独立开发库 `deploy/data/local-dev.sqlite3` 与占位飞书配置启动 8211 端口，`/health` 返回 `ok`；真实 OAuth/H5 登录和 Hermes 样例运行尚未在本机配置，线上现已下架。下一步继续本地生命周期开发与测试，博客使用结束后再安排带备份核验的线上恢复。
 
 2026-10-22 本地生命周期继续：版本对比现可按固定题目并排读取 v1/v2 最近一次不可变样例回答，附任务编号、时间与摘要核验；没有运行过的题目明确显示空缺。管理员在 H5 的诊断区域直接查看，不再只能在弹窗中看配置差异。测试用真实样例 API 生成 v1 与 v2 回答，验证同题对比、缺失样例、非管理员拒绝、未知版本拒绝和归档后可读；全量 `py -m pytest -q` 为 **311 passed**、4 项第三方弃用警告，`node --check` 与 `git diff --check` 通过。本地开发服务已重启并通过 `/health`；真实 OAuth 未配置，生产服务器保持停用。
+
+2026-10-23 本地 H5 生命周期演练：新增独立 `scripts/local_lifecycle_demo.py`，仅接受本机回环请求，使用虚构成员、独立审核官和管理员、持久化本地 SQLite 及确定性无工具样例回答；复用现有治理 API、会话和 H5。会议发起与其他非治理写入被拒，不配置飞书客户端。浏览器从 `http://127.0.0.1:8212/local-demo` 切换三种身份；集成测试走通 v1 草稿/评测/预审/发布、v2 志愿灰度/两题运行/评审/转正/回退/归档，并验证外部来源请求被拒。全量 `py -m pytest -q` 为 **313 passed**、4 项第三方弃用警告；`node --check`、`git diff --check` 和本地 `/health` 检查通过。该演练只证明本地流程可操作，不代表真实 OAuth、Hermes 模型质量或新服务器已部署。下一步在本地做人工页面验收与异常恢复；服务器 FDE 继续停用。
 ```
 
 ## 进度状态定义

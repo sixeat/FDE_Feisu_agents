@@ -127,3 +127,27 @@ def test_browser_demo_restricts_login_origin_and_remote_clients(tmp_path):
     assert client.post("/local-demo/login/unknown").status_code == 404
     remote = TestClient(app, client=("203.0.113.9", 40000))
     assert remote.get("/local-demo").status_code == 403
+
+
+def test_browser_demo_recovers_session_and_draft_after_restart(tmp_path):
+    path = tmp_path / "demo.sqlite3"
+    first = create_app(path)
+    client = TestClient(first)
+    headers = _role(client, "member")
+    draft_id = _draft(client, headers)
+    cookie = client.cookies.get("fde_auth_session")
+    first.state.control_plane.store.close()
+
+    restarted = create_app(path)
+    recovered = TestClient(restarted)
+    recovered.cookies.set("fde_auth_session", cookie)
+    assert recovered.get("/local-demo/h5").status_code == 200
+    drafts = recovered.get("/api/meetings/agent-drafts").json()
+    assert any(item["draft_id"] == draft_id and item["created_by_current_member"]
+               for item in drafts["drafts"])
+    assert recovered.post("/api/meetings/start", json={}, headers=headers).status_code == 404
+    reviewer_headers = _role(recovered, "reviewer")
+    review = recovered.post(f"/api/meetings/agent-drafts/{draft_id}/precheck",
+                            headers=reviewer_headers)
+    assert review.status_code == 200
+    assert "AGENT_EVALUATION_REQUIRED" in review.json()["blockers"]

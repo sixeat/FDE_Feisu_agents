@@ -158,4 +158,7 @@ def create_app(db_path: Path | None = None, *, port: int = 8212) -> FastAPI:
     return app
 
 
-app = create_app(port=int(os.environ.get("FDE_LOCAL_DEMO_PORT", "8212")))
+app = create_app(
+    Path(os.environ["FDE_LOCAL_DEMO_DB"]) if os.environ.get("FDE_LOCAL_DEMO_DB") else None,
+    port=int(os.environ.get("FDE_LOCAL_DEMO_PORT", "8212")),
+)

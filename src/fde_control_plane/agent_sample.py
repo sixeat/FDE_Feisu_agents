@@ -19,6 +19,15 @@ SAMPLE_CASES = {
 }
 
 
+def validated_sample_response(payload: Any, case_id: str) -> str | None:
+    if (not isinstance(payload, dict) or set(payload) != {"schema_version", "case_id", "response"}
+            or payload["schema_version"] != "agent-sample.v1" or payload["case_id"] != case_id
+            or not isinstance(payload["response"], str)):
+        return None
+    response = payload["response"].strip()
+    return response if 1 <= len(response) <= 2000 else None
+
+
 class AgentSampleExecutionService:
     def __init__(self, control_plane: ControlPlane, runtime: RuntimeAdapter) -> None:
         self.cp = control_plane
@@ -96,14 +105,10 @@ class AgentSampleExecutionService:
             self.cp.transition_task(task_id, TaskRunStatus.FAILED,
                                     result.error_code or "SAMPLE_RUNTIME_FAILED")
             return {"task_run_id": task_id, "status": "FAILED"}
-        payload = result.payload
-        if (not isinstance(payload, dict) or set(payload) != {"schema_version", "case_id", "response"}
-                or payload["schema_version"] != "agent-sample.v1" or payload["case_id"] != case_id
-                or not isinstance(payload["response"], str)
-                or not 1 <= len(payload["response"].strip()) <= 2000):
+        response = validated_sample_response(result.payload, case_id)
+        if response is None:
             self.cp.transition_task(task_id, TaskRunStatus.FAILED, "SAMPLE_OUTPUT_INVALID")
             return {"task_run_id": task_id, "status": "FAILED"}
-        response = payload["response"].strip()
         event = AuditEvent(
             audit_id="audit-" + secrets.token_hex(12), event_type="AGENT_SAMPLE_COMPLETED",
             tenant_id=identity.tenant_id, actor_id=identity.actor_id,
@@ -126,4 +131,4 @@ class AgentSampleExecutionService:
                 "allowed_tools": []}
 
 
-__all__ = ["AgentSampleExecutionService", "SAMPLE_CASES"]
+__all__ = ["AgentSampleExecutionService", "SAMPLE_CASES", "validated_sample_response"]

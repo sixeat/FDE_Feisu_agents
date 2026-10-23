@@ -2,7 +2,11 @@
 
 import hashlib
 import json
+import os
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -446,8 +450,6 @@ def test_sample_run_fails_closed_before_human_review(tmp_path, failure, expected
 
 
 def test_hermes_agent_sample_uses_no_tools_and_requires_fixed_input():
-    import subprocess
-
     captured = {}
 
     def runner(command, **kwargs):
@@ -470,3 +472,40 @@ def test_hermes_agent_sample_uses_no_tools_and_requires_fixed_input():
     with pytest.raises(RuntimeExecutionError, match="INVALID_AGENT_SAMPLE"):
         adapter.run_once(RunRequest("run", "trace", "member", "sample@1",
                                     request.input_ref, {"allowed_tools": ["task.create"]}, "offline"))
+
+
+def test_agent_sample_probe_uses_fixed_tool_free_cases_and_shared_contract():
+    from scripts.hermes_agent_sample_probe import probe
+
+    seen = []
+
+    class FakeAdapter:
+        def run_once(self, request):
+            seen.append(request)
+            case_id = request.input_ref["case_id"]
+            return RuntimeResult("SUCCEEDED", {
+                "schema_version": "agent-sample.v1", "case_id": case_id,
+                "response": "  请成员人工确认。  " if case_id == "read_only" else "",
+            }, None, events=(RunEvent(request.task_run_id, request.trace_id, 1,
+                                      "completed", "2026-10-23T00:00:00Z", "done"),))
+
+    report = probe(FakeAdapter(), 30)
+    assert len(seen) == 2 and all(request.tool_policy_snapshot == {"allowed_tools": []}
+                                  for request in seen)
+    assert [case["case_id"] for case in report["cases"]] == ["read_only", "write_boundary"]
+    assert report["cases"][0]["response"] == "请成员人工确认。"
+    assert report["cases"][1]["error_code"] == "SAMPLE_OUTPUT_INVALID"
+    assert report["cases"][1]["response"] is None
+    assert report["all_contracts_valid"] is False and report["quality_review_required"] is True
+    assert len(report["fixture_sha256"]) == 64
+
+
+def test_agent_sample_probe_refuses_unconfigured_model():
+    env = {key: value for key, value in os.environ.items()
+           if key not in {"HERMES_MODEL", "HERMES_PROVIDER", "HERMES_BIN", "HERMES_PYTHON"}}
+    script = Path(__file__).parents[1] / "scripts" / "hermes_agent_sample_probe.py"
+    completed = subprocess.run([sys.executable, str(script)], capture_output=True,
+                               text=True, env=env, check=False)
+    assert completed.returncode == 2
+    assert "HERMES_SAMPLE_NOT_CONFIGURED" in completed.stderr
+    assert completed.stdout == ""

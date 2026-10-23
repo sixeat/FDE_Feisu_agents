@@ -92,6 +92,16 @@ async function main() {
     await role('普通成员');
     await card().getByRole('button', { name: '运行只读样例' }).click();
     await notice.getByText(/样例运行完成/).waitFor();
+    for (const [label, status] of [['模拟执行失败', '执行失败'], ['模拟结果未知', '待核验']]) {
+      await card().getByRole('button', { name: label }).click();
+      await notice.getByText(new RegExp(`样例运行状态：${status}`)).waitFor();
+    }
+    await role('管理员');
+    await card().getByRole('button', { name: '运行诊断与版本对比' }).click();
+    await card().getByText('异常运行 2 条').waitFor();
+    await card().getByText(/SAMPLE_DEMO_FAILURE/).waitFor();
+    await card().getByText(/SAMPLE_DEMO_UNKNOWN/).waitFor();
+    await role('普通成员');
     await submitDraft(1, '只读建议与更严格的人工核对');
     await role('独立审核官');
     await evaluateDraft(false);

@@ -191,6 +191,13 @@ function renderAgents() {
         const button=node("button",label);button.type="button";
         button.addEventListener("click",()=>runAgentSample(agent,caseId,button));actions.append(button);
       }
+      if(window.fdeLocalDemo){
+        for(const [outcome,label] of [["FAILED","模拟执行失败"],["UNKNOWN","模拟结果未知"]]){
+          const button=node("button",label);button.type="button";
+          button.title="本地演练：运行只读样例并保留异常记录";
+          button.addEventListener("click",()=>runAgentSample(agent,"read_only",button,outcome));actions.append(button);
+        }
+      }
       card.append(actions);
     }
     if(agent.status==="CANARY" && agentState.canPrecheck){
@@ -237,7 +244,8 @@ async function loadCanaryRuns(agent,panel,button){
     if(!result.runs.length){panel.append(node("p","当前灰度期还没有运行记录。","muted"));return;}
     result.runs.forEach(run=>{
       const row=node("div",undefined,"agent-draft-row");
-      row.append(node("p",`运行 ${run.task_run_id} · ${taskNames[run.status]||run.status} · ${run.review_outcome||"待独立评审"}`,"muted"));
+      row.append(node("p",`运行 ${run.task_run_id} · ${taskNames[run.status]||run.status} · ${run.review_outcome|| (run.status==="WAITING_REVIEW"?"待独立评审":"不可评审")}`,"muted"));
+      if(run.error_code)row.append(node("p",`诊断码：${run.error_code} · ${run.status==="RECONCILING"?"先人工核验结果；本窗口不可转正。":"保留本次记录；核对后可新建样例运行。"}`,"agent-review-findings"));
       if(run.sample_response)row.append(node("p",`${run.sample_case_id}：${run.sample_response}`,"agent-draft-description"));
       if(run.review_outcome)row.append(node("p",`审核人：${run.reviewer_id} · 证据编号：${run.evidence_ref}`,"muted"));
       if(run.status==="WAITING_REVIEW" && !run.review_outcome){
@@ -252,13 +260,15 @@ async function loadCanaryRuns(agent,panel,button){
   }catch(error){panel.replaceChildren(node("p",error.message,"error"));}
   finally{button.disabled=false;}
 }
-async function runAgentSample(agent,caseId,button){
+async function runAgentSample(agent,caseId,button,demoOutcome=null){
   if(agentState.busy)return;
   agentState.busy=true;button.disabled=true;
   try{
-    const result=await api(`/api/meetings/agents/${encodeURIComponent(agent.agent_id)}/sample-runs`,{
+    const url=demoOutcome?`/local-demo/agents/${encodeURIComponent(agent.agent_id)}/sample-runs`:
+      `/api/meetings/agents/${encodeURIComponent(agent.agent_id)}/sample-runs`;
+    const result=await api(url,{
       method:"POST",headers:{"Content-Type":"application/json","X-CSRF-Token":agentState.csrf},
-      body:JSON.stringify({case_id:caseId})
+      body:JSON.stringify(demoOutcome?{case_id:caseId,outcome:demoOutcome}:{case_id:caseId})
     });
     agentNotice(result.status==="WAITING_REVIEW"?`样例运行完成，等待审核官核对。运行编号：${result.task_run_id}`:
       `样例运行状态：${taskNames[result.status]||result.status}。运行编号：${result.task_run_id}`,
@@ -302,6 +312,16 @@ async function inspectAgent(agent,panel,button){
     panel.replaceChildren(node("h4","运行诊断"),node("p",`累计 ${diagnostic.total} 次运行。`,"muted"));
     for(const [version,item] of Object.entries(diagnostic.versions)){
       panel.append(node("p",`v${version}：${item.total} 次，异常 ${item.failures} 次；状态 ${JSON.stringify(item.statuses)}`,"muted"));
+    }
+    if(diagnostic.issue_total){
+      panel.append(node("h4",`异常运行 ${diagnostic.issue_total} 条${diagnostic.issue_total>diagnostic.issues.length?"（显示最近 50 条）":""}`));
+      diagnostic.issues.forEach(issue=>{
+        const row=node("div",undefined,"agent-draft-row");
+        row.append(node("p",`v${issue.version} · ${issue.task_run_id} · ${taskNames[issue.status]||issue.status} · ${issue.created_at||"时间未知"}`,"muted"));
+        row.append(node("p",`诊断码：${issue.error_code} · ${issue.release_mode}${issue.canary_epoch==null?"":` · 灰度窗口 ${issue.canary_epoch}`}`,"agent-review-findings"));
+        panel.append(row);
+      });
+      panel.append(node("p","失败运行可核对后发起新样例；结果未知须先人工核验。当前灰度有异常时可暂停或回退，重新灰度将使用新窗口。","muted"));
     }
     if(versions.length>1){
       const newer=agent.canary_version||versions[0],older=versions.find(version=>version<newer);

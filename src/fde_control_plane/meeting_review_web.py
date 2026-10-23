@@ -320,6 +320,8 @@ class MeetingReviewWebService:
         return {"agent_id": agent_id, "candidate_version": int(route["canary_version"]),
                 "runs": [{"task_run_id": run["task_run_id"], "status": run["status"],
                           "created_at": run["created_at"],
+                          "error_code": self.cp.store.agent_error_code(run.get("failure_reason"))
+                          or ("UNCLASSIFIED_FAILURE" if run["status"] in {"FAILED", "RECONCILING"} else None),
                           "sample_case_id": samples[run["task_run_id"]]["case_id"]
                           if samples[run["task_run_id"]] is not None else None,
                           "sample_response": samples[run["task_run_id"]]["response_text"]

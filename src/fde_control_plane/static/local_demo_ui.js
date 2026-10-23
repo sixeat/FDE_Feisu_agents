@@ -1,4 +1,5 @@
 (() => {
+  window.fdeLocalDemo = true;
   const allowed = new Set(["agents", "audit"]);
   const normalizeHash = () => {
     const view = location.hash.slice(1);

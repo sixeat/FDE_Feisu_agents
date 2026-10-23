@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -20,6 +21,10 @@ from typing import Any, Iterable
 
 
 class SQLiteStore:
+    @staticmethod
+    def agent_error_code(reason: Any) -> str | None:
+        return reason if isinstance(reason, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{1,79}", reason) else None
+
     def __init__(self, path: str | Path = ":memory:") -> None:
         self.path = str(path)
         self._owner_decision_lock = RLock()
@@ -1623,6 +1628,7 @@ class SQLiteStore:
         ).fetchall()
         by_version: dict[int, dict[str, Any]] = {}
         run_versions: dict[str, int] = {}
+        issues: list[dict[str, Any]] = []
         for row in rows:
             run = json.loads(row["data_json"])
             if run.get("agent_id") != agent_id:
@@ -1636,6 +1642,12 @@ class SQLiteStore:
             item["statuses"][status] = item["statuses"].get(status, 0) + 1
             if status in {"FAILED", "RECONCILING"} or run.get("failure_reason"):
                 item["failures"] += 1
+                issues.append({"task_run_id": run["task_run_id"], "version": version,
+                               "status": status, "created_at": run.get("created_at"),
+                               "release_mode": run.get("release_mode", "STABLE"),
+                               "canary_epoch": run.get("canary_epoch"),
+                               "error_code": self.agent_error_code(run.get("failure_reason"))
+                               or "UNCLASSIFIED_FAILURE"})
         if run_versions:
             events = self.connection.execute(
                 "SELECT runtime_events.task_run_id, runtime_events.data_json FROM runtime_events "
@@ -1649,7 +1661,9 @@ class SQLiteStore:
                 event_type = str(json.loads(event["data_json"]).get("event_type", "UNKNOWN"))
                 counts = by_version[version]["runtime_events"]
                 counts[event_type] = counts.get(event_type, 0) + 1
-        return {"versions": by_version, "total": sum(item["total"] for item in by_version.values())}
+        issues.sort(key=lambda issue: (issue["created_at"] or "", issue["task_run_id"]), reverse=True)
+        return {"versions": by_version, "total": sum(item["total"] for item in by_version.values()),
+                "issue_total": len(issues), "issues": issues[:50]}
 
     def save_binding(self, binding: Any) -> None:
         self.connection.execute(

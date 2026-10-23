@@ -62,6 +62,21 @@ def test_browser_demo_runs_governance_without_feishu(tmp_path):
     assert run.json()["response"].startswith("v1")
     assert run.json()["allowed_tools"] == []
     assert app.state.control_plane.store.get_agent_sample_result(run.json()["task_run_id"]) is not None
+    failure_url = "/local-demo/agents/sample-lifecycle-agent/sample-runs"
+    assert client.post(failure_url, json={"case_id": "read_only", "outcome": "FAILED"}).status_code == 403
+    failures = []
+    for outcome, status in (("FAILED", "FAILED"), ("UNKNOWN", "RECONCILING")):
+        result = client.post(failure_url, json={"case_id": "read_only", "outcome": outcome},
+                             headers=member_headers)
+        assert result.status_code == 200 and result.json()["status"] == status
+        task_run_id = result.json()["task_run_id"]
+        assert app.state.control_plane.store.get_agent_sample_result(task_run_id) is None
+        failures.append(task_run_id)
+    admin_headers = _role(client, "admin")
+    issues = client.get("/api/meetings/agents/sample-lifecycle-agent/diagnostics").json()["issues"]
+    assert {issue["task_run_id"] for issue in issues} == set(failures)
+    assert {issue["error_code"] for issue in issues} == {"SAMPLE_DEMO_FAILURE", "SAMPLE_DEMO_UNKNOWN"}
+    member_headers = _role(client, "member")
     draft2 = _draft(client, member_headers, base_version=1, description="只读建议与更严格的人工核对")
     reviewer_headers = _role(client, "reviewer")
     stored2 = app.state.control_plane.store.get_agent_config_draft(draft2, "local-demo")
@@ -84,6 +99,33 @@ def test_browser_demo_runs_governance_without_feishu(tmp_path):
                      "volunteer_ids": ["member"], "reason": "local sample canary"}
     assert client.post(route + "/canary", json=route_request,
                        headers=admin_headers).status_code == 200
+    member_headers = _role(client, "member")
+    unknown = client.post("/local-demo/agents/sample-lifecycle-agent/sample-runs",
+                          json={"case_id": "read_only", "outcome": "UNKNOWN"},
+                          headers=member_headers)
+    assert unknown.status_code == 200 and unknown.json()["status"] == "RECONCILING"
+    unknown_id = unknown.json()["task_run_id"]
+    reviewer_headers = _role(client, "reviewer")
+    canary_runs = client.get(route + "/canary-runs").json()["runs"]
+    assert next(run for run in canary_runs if run["task_run_id"] == unknown_id)["error_code"] == "SAMPLE_DEMO_UNKNOWN"
+    assert client.post(route + f"/canary-runs/{unknown_id}/review", json={
+        "expected_version": 2, "outcome": "PASS", "evidence_ref": "local:unknown",
+    }, headers=reviewer_headers).status_code == 409
+    admin_headers = _role(client, "admin")
+    readiness = client.get(route + "/promotion-readiness").json()
+    assert {"RUN_FAILURE", "RUN_NOT_WAITING_REVIEW"} <= set(readiness["blockers"])
+    assert client.post(route + "/promote", json={**route_request, "volunteer_ids": []},
+                       headers=admin_headers).status_code == 409
+    assert client.post(route + "/rollback", json={
+        "expected_version": 1, "target_version": 1, "reason": "核对未知样例后关闭灰度窗口",
+    }, headers=admin_headers).status_code == 200
+    member_headers = _role(client, "member")
+    assert client.post(route + "/volunteer", json={"candidate_version": 2, "enroll": True},
+                       headers=member_headers).status_code == 200
+    admin_headers = _role(client, "admin")
+    assert client.post(route + "/canary", json=route_request,
+                       headers=admin_headers).status_code == 200
+    assert unknown_id not in {run["task_run_id"] for run in client.get(route + "/canary-runs").json()["runs"]}
     member_headers = _role(client, "member")
     sample_runs = []
     for case_id in ("read_only", "write_boundary"):

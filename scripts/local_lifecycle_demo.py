@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import os
+import secrets
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from fde_control_plane import (Actor, ActorType, AgentOrchestrator, AssistantBinding,
                                ControlPlane, FeishuMeetingReviewGateway, IdentityContext,
                                SQLiteOAuthSessionIssuer, SQLiteStore)
-from fde_control_plane.meeting_review_web import MeetingReviewWebService, build_meeting_review_router
+from fde_control_plane.meeting_review_web import (MeetingReviewWebService,
+                                                   build_meeting_review_router, csrf_token)
 from fde_control_plane.runtime import RunEvent, RunRequest, RuntimeResult
 
 
@@ -22,6 +27,12 @@ STATIC = ROOT / "src" / "fde_control_plane" / "static"
 TENANT = "local-demo"
 ROLES = {"member": frozenset(), "reviewer": frozenset({"agent_reviewer"}),
          "admin": frozenset({"admin"})}
+DEMO_OUTCOME: ContextVar[str] = ContextVar("demo_sample_outcome", default="SUCCEEDED")
+
+
+class DemoSampleRequest(BaseModel):
+    case_id: Literal["read_only", "write_boundary"]
+    outcome: Literal["FAILED", "UNKNOWN"]
 
 
 class SyntheticRuntime:
@@ -29,6 +40,11 @@ class SyntheticRuntime:
         sample = request.input_ref
         if request.tool_policy_snapshot != {"allowed_tools": []} or not isinstance(sample, dict):
             raise ValueError("local demo accepts only tool-free samples")
+        outcome = DEMO_OUTCOME.get()
+        if outcome != "SUCCEEDED":
+            return RuntimeResult(outcome, None, None,
+                                 error_code="SAMPLE_DEMO_UNKNOWN" if outcome == "UNKNOWN"
+                                 else "SAMPLE_DEMO_FAILURE")
         answer = (f"v{sample['version']}：建议先核对职责和资料，再由成员确认。"
                   if sample["case_id"] == "read_only" else
                   f"v{sample['version']}：不会直接改写飞书任务；须由人审核批准。")
@@ -91,6 +107,22 @@ def create_app(db_path: Path | None = None, *, port: int = 8212) -> FastAPI:
     @app.get("/health")
     def health():
         return {"status": "ok", "mode": "synthetic-local-demo"}
+
+    @app.post("/local-demo/agents/{agent_id}/sample-runs")
+    def run_demo_failure(agent_id: str, body: DemoSampleRequest, request: Request):
+        session = request.cookies.get("fde_auth_session", "")
+        identity = sessions.resolve(session)
+        if identity is None:
+            raise HTTPException(401, "login required")
+        if (request.headers.get("origin") != f"http://127.0.0.1:{port}"
+                or not secrets.compare_digest(request.headers.get("x-csrf-token", ""),
+                                               csrf_token(session))):
+            raise HTTPException(403, "invalid local request")
+        token = DEMO_OUTCOME.set(body.outcome)
+        try:
+            return service.run_agent_sample(agent_id, identity, body)
+        finally:
+            DEMO_OUTCOME.reset(token)
 
     @app.get("/local-demo", response_class=HTMLResponse)
     def choose_role(request: Request):

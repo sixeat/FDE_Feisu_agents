@@ -431,6 +431,18 @@ def test_sample_run_fails_closed_before_human_review(tmp_path, failure, expected
     assert cp.store.get_agent_sample_result(result.json()["task_run_id"]) is None
     assert not any(event["event_type"] == "AGENT_SAMPLE_COMPLETED"
                    for event in cp.store.list_audits())
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    diagnostic = client.get("/api/meetings/agents/sample-lifecycle-agent/diagnostics").json()
+    issue = diagnostic["issues"][0]
+    assert diagnostic["issue_total"] == 1
+    assert issue["task_run_id"] == result.json()["task_run_id"]
+    assert issue["status"] == expected and issue["created_at"]
+    assert issue["error_code"] == {
+        "invalid": "SAMPLE_OUTPUT_INVALID", "unknown": "RUNTIME_TIMEOUT",
+        "revoked": "SAMPLE_AUTHORIZATION_CHANGED",
+        "rebound": "SAMPLE_AUTHORIZATION_CHANGED",
+    }[failure]
+    assert "response" not in issue and "input_ref_hash" not in issue
 
 
 def test_hermes_agent_sample_uses_no_tools_and_requires_fixed_input():

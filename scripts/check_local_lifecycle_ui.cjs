@@ -85,6 +85,8 @@ async function main() {
     await role('独立审核官');
     await evaluateDraft(true);
     await role('管理员');
+    assert.equal(await page.locator('#agent-list > .agent-row').filter({ hasText: 'local-assistant' })
+      .getByRole('button', { name: '暂停 Agent' }).count(), 0);
     await publish(1);
     console.log('browser: v1 published');
     await role('普通成员');

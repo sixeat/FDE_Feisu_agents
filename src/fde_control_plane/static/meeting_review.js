@@ -200,7 +200,7 @@ function renderAgents() {
       button.addEventListener("click",()=>loadCanaryRuns(agent,details,button));
       actions.append(button);card.append(actions,details);
     }
-    if(agentState.canPause && agent.status!=="PAUSED" && agent.status!=="ARCHIVED"){
+    if(agentState.canPause && agent.current_version!=null && agent.status!=="PAUSED" && agent.status!=="ARCHIVED"){
       const actions=node("div",undefined,"commands agent-review-actions"),button=node("button","暂停 Agent");
       button.type="button";button.addEventListener("click",()=>pauseAgent(agent,button));actions.append(button);card.append(actions);
     }else if(agentState.canResume && agent.status==="PAUSED" && agent.current_version!=null){

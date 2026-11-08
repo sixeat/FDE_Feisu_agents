@@ -372,6 +372,70 @@ def test_audit_triage_requires_admin_and_preserves_conclusion_without_remote_wri
     assert client.get("/api/meetings/audit").json() == {"can_view": False, "events": [], "counts": {}}
 
 
+def test_reviewer_audit_queue_is_limited_to_managed_agent_governance(tmp_path):
+    cp, _, client, _, _, _, _ = web_setup(tmp_path)
+    cp.register_actor(Actor("reviewer", "tenant", ActorType.USER, frozenset(),
+                            external_ref_hash="reviewer-subject"))
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    grant = client.post("/api/meetings/member-directory/reviewer/reviewer-role", json={
+        "expected_reviewer": False, "reviewer": True, "reason": "负责治理事项核实",
+    }, headers=admin_headers)
+    assert grant.status_code == 200
+
+    snapshot = {"name": "Managed agent", "actor_type": "BUSINESS_AGENT"}
+    cp.store.connection.execute(
+        "INSERT INTO agent_version_snapshots(agent_id, version, tenant_id, draft_id, config_json, config_hash) "
+        "VALUES ('managed-agent', 1, 'tenant', 'draft', ?, ?)",
+        (json.dumps(snapshot), "a" * 64),
+    )
+    managed_task = {"agent_id": "managed-agent", "agent_version": 1, "status": "FAILED"}
+    cp.store.connection.execute(
+        "INSERT INTO task_runs(task_run_id, tenant_id, data_json) VALUES ('managed-run', 'tenant', ?)",
+        (json.dumps(managed_task),),
+    )
+    unmanaged_task = {"agent_id": "unmanaged-agent", "agent_version": 1, "status": "FAILED"}
+    cp.store.connection.execute(
+        "INSERT INTO task_runs(task_run_id, tenant_id, data_json) VALUES ('unmanaged-run', 'tenant', ?)",
+        (json.dumps(unmanaged_task),),
+    )
+    cp._audit("TASK_RUN_FAILED", "tenant", "system", "managed-run", {}, "FAILED")
+    cp._audit("TASK_RUN_RECONCILING", "tenant", "system", "managed-run", {}, "UNKNOWN")
+    cp._audit("APPROVAL_EXPIRED", "tenant", "system", "managed-run", {}, "EXPIRED")
+    cp._audit("AGENT_CANARY_REVIEWED", "tenant", "reviewer", "managed-run", {}, "FAIL")
+    cp._audit("TASK_RUN_FAILED", "tenant", "system", "unmanaged-run", {}, "FAILED")
+    cp._audit("TOOL_CALL_RECONCILED", "tenant", "member", "managed-run", {}, "UNKNOWN")
+
+    reviewer_headers = switch_user(cp, client, "reviewer", "reviewer-subject")
+    listed = client.get("/api/meetings/audit")
+    body = listed.json()
+    assert body["can_view"] is True and body["can_triage"] is True
+    assert body["can_manage_members"] is False
+    assert {item["event_type"] for item in body["events"]} == {
+        "TASK_RUN_FAILED", "TASK_RUN_RECONCILING", "APPROVAL_EXPIRED", "AGENT_CANARY_REVIEWED",
+    }
+    assert next(item for item in body["events"] if item["outcome"] == "FAIL")["recommended_action"] == "MANUAL_QUALITY_REVIEW"
+    assert next(item for item in body["events"] if item["outcome"] == "EXPIRED")["recommended_action"] == "REVIEW_EXPIRED_APPROVAL"
+    assert "managed-run" not in listed.text and "unmanaged-run" not in listed.text
+    assert client.get("/api/meetings/member-directory", headers=reviewer_headers).status_code == 403
+
+    fail_event = next(item for item in body["events"] if item["outcome"] == "FAIL")
+    triage_url = f'/api/meetings/audit/{fail_event["audit_ref"]}/triage'
+    claim = client.post(triage_url, json={"expected_status": "OPEN", "status": "ACKNOWLEDGED"},
+                        headers=reviewer_headers)
+    assert claim.status_code == 200
+    assert client.post(triage_url, json={"expected_status": "ACKNOWLEDGED", "status": "RESOLVED",
+                                         "resolution": "已检查评审证据"},
+                       headers=reviewer_headers).status_code == 200
+    switch_user(cp, client, "member", SUBJECT)
+    assert client.get("/api/meetings/audit").json() == {"can_view": False, "events": [], "counts": {}}
+    assert client.post(triage_url, json={"expected_status": "OPEN", "status": "ACKNOWLEDGED"}).status_code == 403
+
+    admin_headers = switch_user(cp, client, "admin", "admin-subject")
+    admin_view = client.get("/api/meetings/audit", headers=admin_headers).json()
+    assert admin_view["can_manage_members"] is True
+    assert any(item["event_type"] == "TOOL_CALL_RECONCILED" for item in admin_view["events"])
+
+
 def test_audit_summary_counts_tenant_tool_status_without_exposing_call_details(tmp_path):
     cp, _, client, _, _, _, task_id = web_setup(tmp_path)
     cp.store.connection.execute(

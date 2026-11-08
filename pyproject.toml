@@ -12,4 +12,4 @@ dependencies = [
 [project.scripts]
 fde-agent = "fde_agent.cli:app"
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]

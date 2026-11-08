@@ -199,8 +199,8 @@ AUDIT_EVENT_PREFIX_CATEGORIES = (
     ("TASK_", "TASK"),
     ("TOOL_", "TOOL"),
 )
-AUDIT_ERROR_OUTCOMES = frozenset({"ERROR", "FAILED", "UNKNOWN"})
-AUDIT_WARNING_OUTCOMES = frozenset({"BLOCKED", "DENIED", "INVALIDATED", "REJECTED", "STALE"})
+AUDIT_ERROR_OUTCOMES = frozenset({"ERROR", "FAILED", "UNKNOWN", "FAIL"})
+AUDIT_WARNING_OUTCOMES = frozenset({"BLOCKED", "DENIED", "EXPIRED", "INVALIDATED", "REJECTED", "STALE"})
 
 
 class DueCorrectionApproval(BaseModel):
@@ -575,11 +575,17 @@ class MeetingReviewWebService:
                 and bool(actor.roles & AGENT_ADMIN_ROLES))
 
     def audit_events(self, identity: IdentityContext, limit: int = 100) -> dict[str, Any]:
-        """Return a redacted audit view for administrators only."""
-        if not self.can_confirm_agent_config(identity):
+        """Return full audit to admins and a managed-Agent queue to reviewers."""
+        actor = self.cp.verify_identity(identity)
+        can_manage_members = self.can_confirm_agent_config(identity)
+        can_review = self.can_precheck_agent_config(identity)
+        if not can_manage_members and not can_review:
             return {"can_view": False, "events": [], "counts": {}}
+        source_items = (self.cp.store.list_tenant_audits(identity.tenant_id, limit)
+                        if can_manage_members else
+                        self.cp.store.list_governance_audits(identity.tenant_id, limit))
         events = []
-        for item in self.cp.store.list_tenant_audits(identity.tenant_id, limit):
+        for item in source_items:
             event_type = str(item.get("event_type", "UNKNOWN"))
             outcome = str(item.get("outcome", "UNKNOWN"))
             category = "SYSTEM"
@@ -587,7 +593,11 @@ class MeetingReviewWebService:
                 if event_type.startswith(prefix):
                     category = candidate
                     break
-            if outcome in AUDIT_ERROR_OUTCOMES:
+            if outcome == "FAIL":
+                severity, action = "HIGH", "MANUAL_QUALITY_REVIEW"
+            elif outcome == "EXPIRED":
+                severity, action = "WARN", "REVIEW_EXPIRED_APPROVAL"
+            elif outcome in AUDIT_ERROR_OUTCOMES:
                 severity, action = "HIGH", "RECONCILE_BEFORE_RETRY"
             elif outcome in AUDIT_WARNING_OUTCOMES:
                 severity, action = "WARN", "CHECK_POLICY_OR_SOURCE"
@@ -611,14 +621,27 @@ class MeetingReviewWebService:
         for event in events:
             key = event["outcome"]
             counts[key] = counts.get(key, 0) + 1
-        return {"can_view": True, "events": events, "counts": counts,
-                "summary": self.cp.store.audit_operations_summary(identity.tenant_id)}
+        if can_manage_members:
+            summary = self.cp.store.audit_operations_summary(identity.tenant_id)
+        else:
+            incidents: dict[str, int] = {}
+            for event in events:
+                status = event["triage_status"]
+                incidents[status] = incidents.get(status, 0) + 1
+            summary = {"incidents": incidents, "tool_calls": {}}
+        return {"can_view": True, "can_triage": can_review,
+                "can_manage_members": can_manage_members, "events": events,
+                "counts": counts, "summary": summary}
 
     def triage_audit(self, identity: IdentityContext, audit_ref: str,
                      body: AuditTriageRequest) -> dict[str, Any]:
-        if not self.can_confirm_agent_config(identity):
-            raise HTTPException(403, "只有管理员可以处置审计事件")
-        matches = [item for item in self.cp.store.list_tenant_audits(identity.tenant_id, 100)
+        can_manage_members = self.can_confirm_agent_config(identity)
+        if not can_manage_members and not self.can_precheck_agent_config(identity):
+            raise HTTPException(403, "只有审核官或管理员可以处置治理事项")
+        source_items = (self.cp.store.list_tenant_audits(identity.tenant_id, 100)
+                        if can_manage_members else
+                        self.cp.store.list_governance_audits(identity.tenant_id, 100))
+        matches = [item for item in source_items
                    if hashlib.sha256(str(item["audit_id"]).encode()).hexdigest()[:12] == audit_ref]
         if len(matches) != 1:
             raise HTTPException(404, "审计事件不存在或不在最近列表中")

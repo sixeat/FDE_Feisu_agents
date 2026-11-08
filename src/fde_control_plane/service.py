@@ -228,6 +228,7 @@ class ControlPlane:
 
     def transition_task(self, task_run_id: str, status: TaskRunStatus, reason: str | None = None) -> TaskRun:
         task = self._task(task_run_id)
+        previous_status = task.status
         allowed = {
             TaskRunStatus.RECEIVED: {TaskRunStatus.QUEUED, TaskRunStatus.CANCELLED},
             TaskRunStatus.QUEUED: {TaskRunStatus.PLANNING, TaskRunStatus.CANCELLED, TaskRunStatus.RECONCILING},
@@ -245,7 +246,18 @@ class ControlPlane:
         task.status = status
         if reason:
             task.failure_reason = reason
-        self.store.save_task_run(task)
+        if status in {TaskRunStatus.FAILED, TaskRunStatus.RECONCILING} and status != previous_status:
+            outcome = "FAILED" if status == TaskRunStatus.FAILED else "UNKNOWN"
+            event = AuditEvent(
+                audit_id=_id("audit"),
+                event_type="TASK_RUN_FAILED" if status == TaskRunStatus.FAILED else "TASK_RUN_RECONCILING",
+                tenant_id=task.tenant_id, actor_id="system:task-lifecycle",
+                task_run_id=task_run_id, correlation_id=task_run_id,
+                payload_hash=_hash({"status": status.value, "reason": reason}), outcome=outcome,
+            )
+            self.store.save_task_run_and_audit(task, event)
+        else:
+            self.store.save_task_run(task)
         return task
 
     def _task(self, task_run_id: str) -> TaskRun:

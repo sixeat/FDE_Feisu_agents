@@ -1821,6 +1821,27 @@ class SQLiteStore:
         )
         self.connection.commit()
 
+    def save_task_run_and_audit(self, task_run: Any, event: Any) -> None:
+        data = asdict(task_run)
+        if hasattr(data.get("status"), "value"):
+            data["status"] = data["status"].value
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO task_runs(task_run_id, tenant_id, data_json) VALUES (?, ?, ?)",
+                (task_run.task_run_id, task_run.tenant_id, self._json(data)),
+            )
+            self.connection.execute(
+                "INSERT INTO audit_events(audit_id, event_type, tenant_id, task_run_id, data_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (event.audit_id, event.event_type, event.tenant_id, event.task_run_id,
+                 self._json(asdict(event))),
+            )
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.rollback()
+            raise
+
     def get_task_run(self, task_run_id: str) -> dict[str, Any] | None:
         return self._decode(self.connection.execute("SELECT data_json FROM task_runs WHERE task_run_id = ?", (task_run_id,)).fetchone())
 
@@ -3015,6 +3036,37 @@ class SQLiteStore:
             items.append(item)
         return items
 
+    def list_governance_audits(self, tenant_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Return only managed-Agent failures and decisions suitable for reviewer triage."""
+        bounded_limit = max(1, min(int(limit), 200))
+        rows = self.connection.execute(
+            "SELECT event.data_json, event.created_at FROM audit_events AS event "
+            "WHERE event.tenant_id = ? AND ("
+            "(event.event_type = 'AGENT_CANARY_REVIEWED' AND event.data_json ->> '$.outcome' = 'FAIL' "
+            "AND EXISTS (SELECT 1 FROM task_runs AS task JOIN agent_version_snapshots AS snapshot "
+            "ON snapshot.agent_id = json_extract(task.data_json, '$.agent_id') "
+            "AND snapshot.version = json_extract(task.data_json, '$.agent_version') "
+            "WHERE task.task_run_id = event.task_run_id AND task.tenant_id = event.tenant_id)) "
+            "OR (event.event_type = 'APPROVAL_EXPIRED' AND event.data_json ->> '$.outcome' = 'EXPIRED' "
+            "AND EXISTS (SELECT 1 FROM task_runs AS task JOIN agent_version_snapshots AS snapshot "
+            "ON snapshot.agent_id = json_extract(task.data_json, '$.agent_id') "
+            "AND snapshot.version = json_extract(task.data_json, '$.agent_version') "
+            "WHERE task.task_run_id = event.task_run_id AND task.tenant_id = event.tenant_id)) "
+            "OR (event.event_type IN ('TASK_RUN_FAILED', 'TASK_RUN_RECONCILING') "
+            "AND EXISTS (SELECT 1 FROM task_runs AS task JOIN agent_version_snapshots AS snapshot "
+            "ON snapshot.agent_id = json_extract(task.data_json, '$.agent_id') "
+            "AND snapshot.version = json_extract(task.data_json, '$.agent_version') "
+            "WHERE task.task_run_id = event.task_run_id AND task.tenant_id = event.tenant_id))) "
+            "ORDER BY event.rowid DESC LIMIT ?",
+            (tenant_id, bounded_limit),
+        ).fetchall()
+        items = []
+        for row in rows:
+            item = json.loads(row["data_json"])
+            item["created_at"] = row["created_at"]
+            items.append(item)
+        return items
+
     def audit_operations_summary(self, tenant_id: str) -> dict[str, dict[str, int]]:
         """Count tenant incidents and tool results without exposing event contents."""
         incident_rows = self.connection.execute(
@@ -3023,7 +3075,7 @@ class SQLiteStore:
             "ON triage.audit_id = event.audit_id AND triage.tenant_id = event.tenant_id "
             "WHERE event.tenant_id = ? AND event.event_type != 'AUDIT_TRIAGE_UPDATED' "
             "AND json_extract(event.data_json, '$.outcome') IN "
-            "('ERROR', 'FAILED', 'UNKNOWN', 'BLOCKED', 'DENIED', 'INVALIDATED', 'REJECTED', 'STALE') "
+            "('ERROR', 'FAILED', 'UNKNOWN', 'BLOCKED', 'DENIED', 'INVALIDATED', 'REJECTED', 'STALE', 'FAIL', 'EXPIRED') "
             "GROUP BY COALESCE(triage.status, 'OPEN')", (tenant_id,),
         ).fetchall()
         tool_rows = self.connection.execute(

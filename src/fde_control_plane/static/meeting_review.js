@@ -5,7 +5,7 @@ const ownerState = {csrf:"", tasks:[], busy:false, drafts:new Map(), retries:new
 const organizerState = {csrf:"", tasks:[], busy:false};
 const agentState = {agents:[], drafts:[], csrf:"", canPrecheck:false, canConfirm:false, canPause:false, canResume:false, busy:false};
 const memberState = {requests:[], members:[], csrf:"", busy:false};
-const auditState = {events:[], counts:{}, summary:{}, csrf:"", busy:false, canView:false};
+const auditState = {events:[], counts:{}, summary:{}, csrf:"", busy:false, canView:false, canTriage:false, canManageMembers:false};
 const viewNames={meetings:"会议审核","owner-tasks":"我的待办","organizer-tasks":"发起的任务","follow-up":"跟进概览",agents:"Agent 管理",members:"成员与组织",audit:"审计运维"};
 let activeView="";
 const ownerStatusNames = {WAITING_OWNER:"等待你确认",IN_PROGRESS:"已接受，进行中",WAITING_HUMAN:"已退回，等待会议发起人处理",COMPLETED:"已完成",CANCELLED:"已取消",UNKNOWN:"等待核验",DUE_SOON:"即将到期",OVERDUE:"已逾期"};
@@ -617,7 +617,7 @@ function renderAudit() {
   const panel=$("audit-list");panel.replaceChildren();
   if(!auditState.events.length){panel.append(node("p","暂无审计事件。","muted"));return;}
   const categoryNames={AGENT_GOVERNANCE:"Agent治理",APPROVAL:"审批",SOURCE:"来源校验",MEMBER:"成员",TASK_FOLLOW_UP:"任务跟进",TASK:"任务",TOOL:"工具",OPERATIONS:"运维处置",SYSTEM:"系统"};
-  const actionNames={NONE:"无需处理",CHECK_POLICY_OR_SOURCE:"检查权限、审批或来源版本",RECONCILE_BEFORE_RETRY:"先对账确认，再考虑人工重试"};
+  const actionNames={NONE:"无需处理",CHECK_POLICY_OR_SOURCE:"检查权限、审批或来源版本",MANUAL_QUALITY_REVIEW:"审核官核实质量证据",RECONCILE_BEFORE_RETRY:"先对账确认，再考虑人工重试",REVIEW_EXPIRED_APPROVAL:"核对审批到期影响"};
   const triageNames={OPEN:"待处理",ACKNOWLEDGED:"已认领",RESOLVED:"已核实关闭"};
   auditState.events.forEach(item=>{
     const row=node("article",undefined,"audit-row"),head=node("div",undefined,"audit-row-head");
@@ -629,10 +629,10 @@ function renderAudit() {
     if(item.task_ref)row.append(node("p",`任务引用：${item.task_ref}`,"audit-ref"));
     if(["WARN","HIGH"].includes(item.severity)){
       row.append(node("p",`处置状态：${triageNames[item.triage_status]||"待处理"}`,"muted"));
-      if(item.triage_status==="OPEN"){
+      if(auditState.canTriage && item.triage_status==="OPEN"){
         const button=node("button","认领核查");button.type="button";
         button.addEventListener("click",()=>triageAudit(item,"ACKNOWLEDGED",null));row.append(button);
-      }else if(item.triage_status==="ACKNOWLEDGED"){
+      }else if(auditState.canTriage && item.triage_status==="ACKNOWLEDGED"){
         const button=node("button","记录结论并关闭");button.type="button";
         button.addEventListener("click",()=>{
           const resolution=window.prompt("请填写核实结论。若远端写入结果未知，请先对账；关闭记录不会执行重试。","");
@@ -656,7 +656,7 @@ async function triageAudit(item,status,resolution){
 }
 async function loadAudit() {
   if(auditState.busy)return;auditState.busy=true;$("audit-reload").disabled=true;$("audit-list").setAttribute("aria-busy","true");
-  try{const data=await api("/api/meetings/audit");auditState.canView=Boolean(data.can_view);auditState.events=data.events||[];auditState.counts=data.counts||{};auditState.summary=data.summary||{};auditState.csrf=data.csrf_token||"";$("module-audit").hidden=!auditState.canView;$("module-members").hidden=!auditState.canView;$("audit-counts").textContent=Object.entries(auditState.counts).map(([key,value])=>`${key} ${value}`).join(" · ");renderAuditSummary();renderAudit();}
+  try{const data=await api("/api/meetings/audit");auditState.canView=Boolean(data.can_view);auditState.canTriage=Boolean(data.can_triage);auditState.canManageMembers=Boolean(data.can_manage_members);auditState.events=data.events||[];auditState.counts=data.counts||{};auditState.summary=data.summary||{};auditState.csrf=data.csrf_token||"";$("module-audit").hidden=!auditState.canView;$("module-members").hidden=!auditState.canManageMembers;$("audit-counts").textContent=Object.entries(auditState.counts).map(([key,value])=>`${key} ${value}`).join(" · ");renderAuditSummary();renderAudit();}
   catch(error){auditNotice(error.message,"error");}
   finally{auditState.busy=false;$("audit-reload").disabled=false;$("audit-list").setAttribute("aria-busy","false");}
 }

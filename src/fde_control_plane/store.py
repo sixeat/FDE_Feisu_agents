@@ -462,6 +462,28 @@ class SQLiteStore:
             BEFORE UPDATE ON teaching_source_blocks BEGIN SELECT RAISE(ABORT, 'immutable teaching source block'); END;
             CREATE TRIGGER IF NOT EXISTS teaching_source_blocks_no_delete
             BEFORE DELETE ON teaching_source_blocks BEGIN SELECT RAISE(ABORT, 'immutable teaching source block'); END;
+            CREATE TABLE IF NOT EXISTS teaching_source_diagnostics (
+                diagnosis_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, course_id TEXT NOT NULL,
+                source_id TEXT NOT NULL, input_hash TEXT NOT NULL, data_json TEXT NOT NULL,
+                created_by TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (source_id) REFERENCES teaching_sources(source_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS teaching_source_diagnostics_no_update
+            BEFORE UPDATE ON teaching_source_diagnostics BEGIN SELECT RAISE(ABORT, 'immutable teaching source diagnosis'); END;
+            CREATE TRIGGER IF NOT EXISTS teaching_source_diagnostics_no_delete
+            BEFORE DELETE ON teaching_source_diagnostics BEGIN SELECT RAISE(ABORT, 'immutable teaching source diagnosis'); END;
+            CREATE TABLE IF NOT EXISTS teaching_source_change_reviews (
+                diagnosis_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, course_id TEXT NOT NULL,
+                source_id TEXT NOT NULL, outcome TEXT NOT NULL
+                    CHECK(outcome IN ('IMPACT_FOUND', 'NO_IMPACT_FOUND', 'NEEDS_FOLLOW_UP')),
+                reason_code TEXT NOT NULL, reviewed_by TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (diagnosis_id) REFERENCES teaching_source_diagnostics(diagnosis_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS teaching_source_change_reviews_no_update
+            BEFORE UPDATE ON teaching_source_change_reviews BEGIN SELECT RAISE(ABORT, 'immutable teaching source change review'); END;
+            CREATE TRIGGER IF NOT EXISTS teaching_source_change_reviews_no_delete
+            BEFORE DELETE ON teaching_source_change_reviews BEGIN SELECT RAISE(ABORT, 'immutable teaching source change review'); END;
             CREATE TABLE IF NOT EXISTS teaching_source_readers (
                 tenant_id TEXT NOT NULL, course_id TEXT NOT NULL,
                 source_id TEXT NOT NULL, actor_id TEXT NOT NULL,
@@ -2946,6 +2968,91 @@ class SQLiteStore:
             "SELECT block_index, block_hash FROM teaching_source_blocks "
             "WHERE source_id = ? ORDER BY block_index", (source_id,)
         ).fetchall()
+
+    def get_teaching_source_diagnosis(self, tenant_id: str, course_id: str,
+                                      source_id: str, diagnosis_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM teaching_source_diagnostics WHERE tenant_id = ? AND course_id = ? "
+            "AND source_id = ? AND diagnosis_id = ?",
+            (tenant_id, course_id, source_id, diagnosis_id),
+        ).fetchone()
+
+    def get_teaching_source_change_review(self, diagnosis_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT outcome, reason_code, reviewed_by, created_at "
+            "FROM teaching_source_change_reviews WHERE diagnosis_id = ?", (diagnosis_id,),
+        ).fetchone()
+
+    def save_teaching_source_diagnosis(self, diagnosis_id: str, tenant_id: str, course_id: str,
+                                       source_id: str, input_hash: str, data_json: str,
+                                       created_by: str, subject_ref_hash: str, event: Any) -> None:
+        with self.teaching_transaction() as connection:
+            actor = connection.execute(
+                "SELECT active, actor_type, external_ref_hash FROM actors "
+                "WHERE tenant_id = ? AND actor_id = ?", (tenant_id, created_by),
+            ).fetchone()
+            member = connection.execute(
+                "SELECT role, active FROM teaching_course_members WHERE tenant_id = ? "
+                "AND course_id = ? AND actor_id = ?", (tenant_id, course_id, created_by),
+            ).fetchone()
+            source = connection.execute(
+                "SELECT submitted_by FROM teaching_sources WHERE tenant_id = ? AND course_id = ? "
+                "AND source_id = ?", (tenant_id, course_id, source_id),
+            ).fetchone()
+            if (actor is None or not actor["active"] or actor["actor_type"] != "USER"
+                    or actor["external_ref_hash"] != subject_ref_hash
+                    or member is None or not member["active"] or source is None):
+                raise PermissionError("source authorization was revoked during diagnosis")
+            if member["role"] != "LEAD" and source["submitted_by"] != created_by:
+                reader = connection.execute(
+                    "SELECT active FROM teaching_source_readers WHERE tenant_id = ? AND course_id = ? "
+                    "AND source_id = ? AND actor_id = ?",
+                    (tenant_id, course_id, source_id, created_by),
+                ).fetchone()
+                if reader is None or not reader["active"]:
+                    raise PermissionError("source sharing was revoked during diagnosis")
+            connection.execute(
+                "INSERT INTO teaching_source_diagnostics(diagnosis_id, tenant_id, course_id, source_id, "
+                "input_hash, data_json, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (diagnosis_id, tenant_id, course_id, source_id, input_hash, data_json, created_by),
+            )
+            self.teaching_audit_in_transaction(connection, event)
+
+    def save_teaching_source_change_review(self, diagnosis_id: str, tenant_id: str, course_id: str,
+                                          source_id: str, input_hash: str, outcome: str,
+                                          reason_code: str, reviewer_id: str, subject_ref_hash: str,
+                                          event: Any) -> bool:
+        with self.teaching_transaction() as connection:
+            actor = connection.execute(
+                "SELECT active, actor_type, external_ref_hash FROM actors WHERE tenant_id = ? AND actor_id = ?",
+                (tenant_id, reviewer_id),
+            ).fetchone()
+            member = connection.execute(
+                "SELECT role, active FROM teaching_course_members WHERE tenant_id = ? "
+                "AND course_id = ? AND actor_id = ?", (tenant_id, course_id, reviewer_id),
+            ).fetchone()
+            diagnosis = connection.execute(
+                "SELECT input_hash FROM teaching_source_diagnostics WHERE tenant_id = ? AND course_id = ? "
+                "AND source_id = ? AND diagnosis_id = ?",
+                (tenant_id, course_id, source_id, diagnosis_id),
+            ).fetchone()
+            if (actor is None or not actor["active"] or actor["actor_type"] != "USER"
+                    or actor["external_ref_hash"] != subject_ref_hash
+                    or member is None or not member["active"] or member["role"] != "LEAD"):
+                raise PermissionError("course lead authorization was revoked during source review")
+            if diagnosis is None or diagnosis["input_hash"] != input_hash:
+                raise ValueError("source diagnosis changed before review")
+            if connection.execute(
+                "SELECT 1 FROM teaching_source_change_reviews WHERE diagnosis_id = ?", (diagnosis_id,),
+            ).fetchone():
+                return False
+            connection.execute(
+                "INSERT INTO teaching_source_change_reviews(diagnosis_id, tenant_id, course_id, source_id, "
+                "outcome, reason_code, reviewed_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (diagnosis_id, tenant_id, course_id, source_id, outcome, reason_code, reviewer_id),
+            )
+            self.teaching_audit_in_transaction(connection, event)
+            return True
 
     def list_teaching_sources(self, tenant_id: str, course_id: str, actor_id: str,
                               *, lead: bool) -> list[sqlite3.Row]:

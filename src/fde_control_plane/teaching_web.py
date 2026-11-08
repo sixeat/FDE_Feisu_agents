@@ -109,6 +109,12 @@ class TeachingPreparationRequest(BaseModel):
     lesson_plan: StrictStr = Field(min_length=1, max_length=100)
 
 
+class TeachingSourceChangeReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    outcome: Literal["IMPACT_FOUND", "NO_IMPACT_FOUND", "NEEDS_FOLLOW_UP"]
+    reason_code: Literal["PLAN_UPDATE_REQUIRED", "NO_ACTION_REQUIRED", "EVIDENCE_INSUFFICIENT"]
+
+
 def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSessionIssuer,
                           *, public_origin: str,
                           extraction: TeachingSourceExecutionService | None = None) -> APIRouter:
@@ -139,6 +145,8 @@ def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSession
                 "source reader is already active", "source reader is not active",
                 "alignment was already reviewed",
                 "teaching extraction was already reviewed",
+                "source diagnosis was already reviewed",
+                "current source does not require change review",
             } else 422
             raise HTTPException(status, str(exc)) from exc
         except RuntimeError as exc:
@@ -193,6 +201,19 @@ def build_teaching_router(service: TeachingService, sessions: SQLiteOAuthSession
     def diagnose_source(course_id: str, source_id: str,
                         identity: IdentityContext = Depends(require_identity)):
         return call(service.diagnose_source, identity, course_id, source_id)
+
+    @router.get("/courses/{course_id}/sources/{source_id}/diagnoses/{diagnosis_id}")
+    def read_source_diagnosis(course_id: str, source_id: str, diagnosis_id: str,
+                              identity: IdentityContext = Depends(require_identity)):
+        return call(service.read_source_diagnosis, identity, course_id, source_id, diagnosis_id)
+
+    @router.post("/courses/{course_id}/sources/{source_id}/diagnoses/{diagnosis_id}/review")
+    def review_source_diagnosis(course_id: str, source_id: str, diagnosis_id: str,
+                                body: TeachingSourceChangeReviewRequest, request: Request,
+                                identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        return call(service.review_source_diagnosis, identity, course_id, source_id, diagnosis_id,
+                    body.outcome, body.reason_code)
 
     @router.get("/courses/{course_id}/sources/{source_id}/readers")
     def list_source_readers(course_id: str, source_id: str,

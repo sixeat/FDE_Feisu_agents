@@ -1117,6 +1117,77 @@ def test_source_diagnostics_fail_closed_on_revocation_and_old_baseline(tmp_path)
     assert legacy["missing_block_candidates"] == []
 
 
+def test_changed_source_diagnosis_is_immutable_and_course_lead_reviews_current_revision(tmp_path):
+    cp, reader, client, _, login = setup(tmp_path)
+    create_course(client, login("admin"))
+    old_blocks = [
+        {"index": 1, "block_type": 2, "text": "课程目标：理解递归。"},
+        {"index": 2, "block_type": 2, "text": "第 1 周：递归定义。"},
+    ]
+    reader.blocks = old_blocks
+    source_id = client.post("/api/teaching/courses/demo/sources", json={
+        "kind": "WEEKLY_PLAN", "document_url": DOC_URL, "attested_no_student_data": True,
+    }, headers=login("lead")).json()["source_id"]
+    path = f"/api/teaching/courses/demo/sources/{source_id}"
+    reader.revision = "2"
+    reader.blocks = [old_blocks[0], {"index": 2, "block_type": 2, "text": "第 1 周：递归案例。"}]
+    diagnosis = client.get(path + "/diagnostics").json()
+    diagnosis_id = diagnosis["diagnosis_id"]
+    diagnosis_path = path + f"/diagnoses/{diagnosis_id}"
+    assert diagnosis["status"] == "CONTENT_CHANGED"
+    assert diagnosis["review_status"] == "PENDING_REVIEW"
+    stored = cp.store.get_teaching_source_diagnosis("tenant", "demo", source_id, diagnosis_id)
+    assert "递归案例" not in stored["data_json"]
+    with pytest.raises(sqlite3.IntegrityError, match="immutable teaching source diagnosis"):
+        cp.store.connection.execute(
+            "UPDATE teaching_source_diagnostics SET data_json = '{}' WHERE diagnosis_id = ?", (diagnosis_id,),
+        )
+
+    lead_headers = login("lead")
+    assert client.post("/api/teaching/courses/demo/teachers", json={
+        "actor_id": "teacher", "reason": "加入课程参与备课",
+    }, headers=lead_headers).status_code == 200
+    assert client.post(f"{path}/readers", json={
+        "actor_id": "teacher", "reason": "共享只读来源用于参与审定",
+    }, headers=login("lead")).status_code == 200
+    assert client.post(diagnosis_path + "/review", json={
+        "outcome": "IMPACT_FOUND", "reason_code": "PLAN_UPDATE_REQUIRED",
+    }, headers=login("teacher")).status_code == 403
+    assert client.post(diagnosis_path + "/review", json={
+        "outcome": "IMPACT_FOUND", "reason_code": "NO_ACTION_REQUIRED",
+    }, headers=login("lead")).status_code == 422
+    reviewed = client.post(diagnosis_path + "/review", json={
+        "outcome": "IMPACT_FOUND", "reason_code": "PLAN_UPDATE_REQUIRED",
+    }, headers=login("lead"))
+    assert reviewed.status_code == 200
+    assert client.get(diagnosis_path).json()["review_status"] == "IMPACT_FOUND"
+    assert client.get(path).status_code == 409
+    assert "递归案例" not in str(cp.store.list_tenant_audits("tenant"))
+    with pytest.raises(sqlite3.IntegrityError, match="immutable teaching source change review"):
+        cp.store.connection.execute(
+            "UPDATE teaching_source_change_reviews SET outcome = 'NO_IMPACT_FOUND' WHERE diagnosis_id = ?",
+            (diagnosis_id,),
+        )
+    with SQLiteStore(tmp_path / "course.sqlite3") as reopened:
+        persisted = reopened.get_teaching_source_diagnosis("tenant", "demo", source_id, diagnosis_id)
+        persisted_review = reopened.get_teaching_source_change_review(diagnosis_id)
+        assert persisted["input_hash"] == stored["input_hash"]
+        assert persisted_review["outcome"] == "IMPACT_FOUND"
+        assert persisted_review["reason_code"] == "PLAN_UPDATE_REQUIRED"
+    assert client.post(diagnosis_path + "/review", json={
+        "outcome": "IMPACT_FOUND", "reason_code": "PLAN_UPDATE_REQUIRED",
+    }, headers=login("lead")).status_code == 409
+
+    stale_diagnosis = client.get(path + "/diagnostics").json()
+    reader.revision = "3"
+    reader.blocks = [{"index": 1, "block_type": 2, "text": "课程目标：理解循环。"}]
+    stale_review = client.post(path + f"/diagnoses/{stale_diagnosis['diagnosis_id']}/review", json={
+        "outcome": "NEEDS_FOLLOW_UP", "reason_code": "EVIDENCE_INSUFFICIENT",
+    }, headers=login("lead"))
+    assert stale_review.status_code == 409
+    assert cp.store.get_teaching_source_change_review(stale_diagnosis["diagnosis_id"]) is None
+
+
 def test_reopening_database_preserves_course_and_source_contract(tmp_path):
     cp, reader, client, contexts, login = setup(tmp_path)
     create_course(client, login("admin"))

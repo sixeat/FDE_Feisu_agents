@@ -422,16 +422,88 @@ class TeachingService:
                 matched_new.update(range(new_start, new_start + length))
             missing = [item["block_index"] for i, item in enumerate(baseline) if i not in matched_old]
             added = [blocks[i]["index"] for i in range(len(blocks)) if i not in matched_new]
-        self.store.save_audit(self._audit(identity, "TEACHING_SOURCE_DIAGNOSED",
-                                         {"course_id": course_id, "source_id": source_id,
-                                          "baseline_revision": row["revision_id"],
-                                          "current_revision": revision, "status": status,
-                                          "missing": missing, "added": added}))
-        return {"source_id": source_id, "baseline_revision": row["revision_id"],
+        diagnosis_id = None
+        result = {"source_id": source_id, "baseline_revision": row["revision_id"],
                 "current_revision": revision, "baseline_block_count": row["block_count"],
                 "current_block_count": len(blocks), "status": status,
                 "baseline_available": baseline_available,
                 "missing_block_candidates": missing, "new_block_candidates": added}
+        if status != "CURRENT":
+            diagnosis_id = "diagnosis-" + secrets.token_hex(12)
+            payload = {**result, "diagnosis_id": diagnosis_id,
+                       "baseline_content_hash": row["content_hash"], "current_content_hash": digest}
+            payload_hash = hashlib.sha256(self.store._json(payload).encode()).hexdigest()
+            event = self._audit(identity, "TEACHING_SOURCE_DIAGNOSED", {
+                "course_id": course_id, "source_id": source_id, "diagnosis_id": diagnosis_id,
+                "input_hash": payload_hash, "status": status,
+            })
+            self.store.save_teaching_source_diagnosis(
+                diagnosis_id, identity.tenant_id, course_id, source_id, payload_hash,
+                self.store._json(payload), identity.actor_id, identity.subject_ref_hash, event,
+            )
+            result["diagnosis_id"] = diagnosis_id
+            result["review_status"] = "PENDING_REVIEW"
+        else:
+            self.store.save_audit(self._audit(identity, "TEACHING_SOURCE_DIAGNOSED",
+                                             {"course_id": course_id, "source_id": source_id,
+                                              "baseline_revision": row["revision_id"],
+                                              "current_revision": revision, "status": status}))
+        return result
+
+    def read_source_diagnosis(self, identity: IdentityContext, course_id: str,
+                              source_id: str, diagnosis_id: str) -> dict[str, Any]:
+        self._authorized_source(identity, course_id, source_id)
+        row = self.store.get_teaching_source_diagnosis(
+            identity.tenant_id, course_id, source_id, diagnosis_id,
+        )
+        if row is None:
+            raise KeyError("teaching source diagnosis is not available")
+        payload = json.loads(row["data_json"])
+        digest = hashlib.sha256(self.store._json(payload).encode()).hexdigest()
+        if digest != row["input_hash"] or payload.get("diagnosis_id") != diagnosis_id:
+            raise SourceChanged("teaching source diagnosis integrity check failed")
+        review = self.store.get_teaching_source_change_review(diagnosis_id)
+        return {**payload, "review_status": review["outcome"] if review else "PENDING_REVIEW",
+                "review_reason_code": review["reason_code"] if review else None,
+                "reviewed_by": review["reviewed_by"] if review else None}
+
+    def review_source_diagnosis(self, identity: IdentityContext, course_id: str,
+                                source_id: str, diagnosis_id: str,
+                                outcome: str, reason_code: str) -> dict[str, Any]:
+        valid_reasons = {
+            "IMPACT_FOUND": {"PLAN_UPDATE_REQUIRED"},
+            "NO_IMPACT_FOUND": {"NO_ACTION_REQUIRED"},
+            "NEEDS_FOLLOW_UP": {"EVIDENCE_INSUFFICIENT"},
+        }
+        if outcome not in valid_reasons or reason_code not in valid_reasons[outcome]:
+            raise ValueError("source review outcome and reason do not match")
+        self._course_member(identity, course_id, lead=True)
+        diagnosis = self.read_source_diagnosis(identity, course_id, source_id, diagnosis_id)
+        if diagnosis["status"] == "CURRENT":
+            raise ValueError("current source does not require change review")
+        if diagnosis["review_status"] != "PENDING_REVIEW":
+            raise ValueError("source diagnosis was already reviewed")
+        source = self.store.get_teaching_source(identity.tenant_id, course_id, source_id)
+        if source is None:
+            raise KeyError("teaching source is not in this course")
+        revision, digest, _, _ = self._fresh_read(identity, source["document_id"])
+        if (revision != diagnosis["current_revision"]
+                or digest != diagnosis["current_content_hash"]):
+            raise SourceChanged("source changed after this diagnosis; run diagnostics again")
+        event = self._audit(identity, "TEACHING_SOURCE_CHANGE_REVIEWED", {
+            "course_id": course_id, "source_id": source_id,
+            "diagnosis_id": diagnosis_id, "outcome": outcome, "reason_code": reason_code,
+        }, outcome=outcome)
+        input_hash = hashlib.sha256(self.store._json({key: value for key, value in diagnosis.items()
+            if key not in {"review_status", "review_reason_code", "reviewed_by"}}).encode()).hexdigest()
+        saved = self.store.save_teaching_source_change_review(
+            diagnosis_id, identity.tenant_id, course_id, source_id, input_hash,
+            outcome, reason_code, identity.actor_id, identity.subject_ref_hash, event,
+        )
+        if not saved:
+            raise ValueError("source diagnosis was already reviewed")
+        return {"diagnosis_id": diagnosis_id, "outcome": outcome,
+                "reason_code": reason_code, "reviewed_by": identity.actor_id}
 
     @staticmethod
     def _week_coverage(items: list[dict[str, Any]], expected_weeks: list[int]) -> dict[str, list[int]]:

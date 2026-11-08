@@ -272,6 +272,29 @@ class SQLiteStore:
             BEFORE UPDATE ON agent_sample_results BEGIN SELECT RAISE(ABORT, 'immutable agent sample result'); END;
             CREATE TRIGGER IF NOT EXISTS agent_sample_results_no_delete
             BEFORE DELETE ON agent_sample_results BEGIN SELECT RAISE(ABORT, 'immutable agent sample result'); END;
+            CREATE TABLE IF NOT EXISTS agent_sample_attempts (
+                task_run_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+                agent_version INTEGER NOT NULL, case_id TEXT NOT NULL, config_hash TEXT NOT NULL,
+                subject_ref_hash TEXT NOT NULL, trace_id TEXT NOT NULL UNIQUE,
+                claim_token TEXT NOT NULL, lease_until REAL NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('CLAIMED', 'RESULT_RECORDED', 'UNKNOWN', 'FAILED', 'FINALIZED')),
+                error_code TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (task_run_id) REFERENCES task_runs(task_run_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_sample_attempts_lease
+                ON agent_sample_attempts(status, lease_until);
+            CREATE TABLE IF NOT EXISTS agent_sample_runtime_results (
+                task_run_id TEXT PRIMARY KEY, status TEXT NOT NULL, result_json TEXT NOT NULL,
+                result_hash TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (task_run_id) REFERENCES agent_sample_attempts(task_run_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS agent_sample_runtime_results_no_update
+            BEFORE UPDATE ON agent_sample_runtime_results
+            BEGIN SELECT RAISE(ABORT, 'immutable agent sample runtime result'); END;
+            CREATE TRIGGER IF NOT EXISTS agent_sample_runtime_results_no_delete
+            BEFORE DELETE ON agent_sample_runtime_results
+            BEGIN SELECT RAISE(ABORT, 'immutable agent sample runtime result'); END;
             CREATE TABLE IF NOT EXISTS agent_sample_dispositions (
                 task_run_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, agent_id TEXT NOT NULL,
                 agent_version INTEGER NOT NULL, decided_by TEXT NOT NULL,
@@ -1888,6 +1911,95 @@ class SQLiteStore:
         return self.connection.execute(
             "SELECT * FROM agent_sample_results WHERE task_run_id = ?", (task_run_id,),
         ).fetchone()
+
+    def claim_agent_sample_attempt(self, *, task_run_id: str, tenant_id: str, agent_id: str,
+                                   agent_version: int, case_id: str, config_hash: str,
+                                   subject_ref_hash: str, trace_id: str, claim_token: str,
+                                   lease_seconds: float = 150.0) -> bool:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            inserted = self.connection.execute(
+                "INSERT OR IGNORE INTO agent_sample_attempts(task_run_id, tenant_id, agent_id, "
+                "agent_version, case_id, config_hash, subject_ref_hash, trace_id, claim_token, "
+                "lease_until, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CLAIMED')",
+                (task_run_id, tenant_id, agent_id, agent_version, case_id, config_hash,
+                 subject_ref_hash, trace_id, claim_token, time.time() + max(1.0, lease_seconds)),
+            ).rowcount == 1
+            self.connection.execute("COMMIT")
+            return inserted
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def get_agent_sample_attempt(self, task_run_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM agent_sample_attempts WHERE task_run_id = ?", (task_run_id,),
+        ).fetchone()
+
+    def get_agent_sample_runtime_result(self, task_run_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT status, result_json, result_hash FROM agent_sample_runtime_results "
+            "WHERE task_run_id = ?", (task_run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if hashlib.sha256(row["result_json"].encode()).hexdigest() != row["result_hash"]:
+            raise ValueError("AGENT_SAMPLE_RUNTIME_RESULT_INTEGRITY")
+        return {"status": row["status"], **json.loads(row["result_json"])}
+
+    def save_agent_sample_runtime_result(self, task_run_id: str, claim_token: str,
+                                         result: dict[str, Any]) -> bool:
+        encoded = self._json(result)
+        digest = hashlib.sha256(encoded.encode()).hexdigest()
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            attempt = self.get_agent_sample_attempt(task_run_id)
+            if attempt is None or attempt["claim_token"] != claim_token:
+                raise ValueError("AGENT_SAMPLE_CLAIM_LOST")
+            prior = self.connection.execute(
+                "SELECT status, result_json, result_hash FROM agent_sample_runtime_results "
+                "WHERE task_run_id = ?", (task_run_id,),
+            ).fetchone()
+            if prior is not None:
+                if prior["status"] != result["status"] or prior["result_json"] != encoded:
+                    raise ValueError("AGENT_SAMPLE_RUNTIME_RESULT_CONFLICT")
+                self.connection.execute("COMMIT")
+                return False
+            if attempt["status"] != "CLAIMED":
+                raise ValueError("AGENT_SAMPLE_ATTEMPT_CLOSED")
+            self.connection.execute(
+                "INSERT INTO agent_sample_runtime_results(task_run_id, status, result_json, result_hash) "
+                "VALUES (?, ?, ?, ?)", (task_run_id, result["status"], encoded, digest),
+            )
+            self.connection.execute(
+                "UPDATE agent_sample_attempts SET status = 'RESULT_RECORDED', "
+                "updated_at = CURRENT_TIMESTAMP WHERE task_run_id = ? AND claim_token = ?",
+                (task_run_id, claim_token),
+            )
+            self.connection.execute("COMMIT")
+            return True
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def finish_agent_sample_attempt(self, task_run_id: str, status: str,
+                                    error_code: str | None = None) -> None:
+        if status not in {"UNKNOWN", "FAILED", "FINALIZED"}:
+            raise ValueError("invalid Agent sample attempt status")
+        self.connection.execute(
+            "UPDATE agent_sample_attempts SET status = ?, error_code = ?, "
+            "updated_at = CURRENT_TIMESTAMP WHERE task_run_id = ?",
+            (status, error_code, task_run_id),
+        )
+
+    def expire_agent_sample_attempt(self, task_run_id: str, now: float | None = None) -> bool:
+        changed = self.connection.execute(
+            "UPDATE agent_sample_attempts SET status = 'UNKNOWN', error_code = 'RUNTIME_RESULT_UNVERIFIED', "
+            "updated_at = CURRENT_TIMESTAMP WHERE task_run_id = ? AND status = 'CLAIMED' "
+            "AND lease_until <= ?",
+            (task_run_id, time.time() if now is None else now),
+        ).rowcount == 1
+        return changed
 
     def latest_agent_samples(self, tenant_id: str, agent_id: str,
                              versions: tuple[int, int]) -> dict[int, dict[str, sqlite3.Row]]:

@@ -230,8 +230,9 @@ class ControlPlane:
         task = self._task(task_run_id)
         allowed = {
             TaskRunStatus.RECEIVED: {TaskRunStatus.QUEUED, TaskRunStatus.CANCELLED},
-            TaskRunStatus.QUEUED: {TaskRunStatus.PLANNING, TaskRunStatus.CANCELLED},
-            TaskRunStatus.PLANNING: {TaskRunStatus.RUNNING, TaskRunStatus.WAITING_APPROVAL, TaskRunStatus.FAILED},
+            TaskRunStatus.QUEUED: {TaskRunStatus.PLANNING, TaskRunStatus.CANCELLED, TaskRunStatus.RECONCILING},
+            TaskRunStatus.PLANNING: {TaskRunStatus.RUNNING, TaskRunStatus.WAITING_APPROVAL,
+                                     TaskRunStatus.RECONCILING, TaskRunStatus.FAILED},
             TaskRunStatus.WAITING_APPROVAL: {TaskRunStatus.RUNNING, TaskRunStatus.CANCELLED, TaskRunStatus.PAUSED},
             TaskRunStatus.RUNNING: {TaskRunStatus.WAITING_REVIEW, TaskRunStatus.WAITING_APPROVAL, TaskRunStatus.RECONCILING, TaskRunStatus.SUCCEEDED,
                                     TaskRunStatus.PARTIAL_SUCCESS, TaskRunStatus.FAILED, TaskRunStatus.PAUSED},

@@ -6,11 +6,15 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
-from fde_control_plane import Actor, ActorType, AgentVersion, RiskLevel, SQLiteStore, TaskRunStatus, ToolDefinition
+from fde_control_plane import (Actor, ActorType, AgentVersion, ControlPlane, IdentityContext, RiskLevel,
+                               SQLiteStore, TaskRunStatus, ToolDefinition)
+from fde_control_plane.agent_sample import AgentSampleExecutionService
 from fde_control_plane.runtime import (HermesAgentSampleAdapter, RunEvent, RunRequest,
                                        RuntimeExecutionError, RuntimeResult)
 from test_meeting_review_web import switch_user, web_setup
@@ -59,7 +63,11 @@ def test_existing_agent_route_database_adds_canary_epoch_without_losing_route(tm
 
 def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
     class SampleRuntime:
+        def __init__(self):
+            self.calls = 0
+
         def run_once(self, request):
+            self.calls += 1
             assert request.tool_policy_snapshot == {"allowed_tools": []}
             return RuntimeResult("SUCCEEDED", {
                 "schema_version": "agent-sample.v1",
@@ -68,7 +76,8 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
             }, None, events=(RunEvent(request.task_run_id, request.trace_id, 1,
                                       "completed", "2026-10-22T00:00:00Z", "sample completed"),))
 
-    cp, _, client, member_headers, _, _, _ = web_setup(tmp_path, sample_runtime=SampleRuntime())
+    runtime = SampleRuntime()
+    cp, _, client, member_headers, _, _, _ = web_setup(tmp_path, sample_runtime=runtime)
     cp.register_actor(Actor("reviewer", "tenant", ActorType.USER, frozenset(),
                             external_ref_hash="reviewer-subject"))
     reviewer_headers = switch_user(cp, client, "reviewer", "reviewer-subject")
@@ -117,12 +126,91 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
         )
     assert cp.store.select_agent_version("tenant", "sample-lifecycle-agent", "member") == 1
     member_headers = switch_user(cp, client, "member", hashlib.sha256(b"ou_submitter").hexdigest())
-    stable_sample = client.post(
-        "/api/meetings/agents/sample-lifecycle-agent/sample-runs",
-        json={"case_id": "read_only"}, headers=member_headers,
+    sample_identity = IdentityContext(
+        "tenant", "member", "user_oauth", hashlib.sha256(b"ou_submitter").hexdigest(),
     )
-    assert stable_sample.status_code == 200
-    assert stable_sample.json()["agent_version"] == 1
+    entered = threading.Event()
+    release = threading.Event()
+
+    class RecoverableRuntime:
+        def __init__(self):
+            self.calls = 0
+
+        def run_once(self, request):
+            self.calls += 1
+            entered.set()
+            assert release.wait(5)
+            return RuntimeResult("SUCCEEDED", {
+                "schema_version": "agent-sample.v1", "case_id": "read_only",
+                "response": "人工核对后再继续。",
+            }, None, events=(RunEvent(request.task_run_id, request.trace_id, 1,
+                                      "completed", "2026-10-22T00:00:00Z", "sample completed"),))
+
+    recoverable_runtime = RecoverableRuntime()
+    first_process = AgentSampleExecutionService(cp, recoverable_runtime)
+
+    def interrupt_after_runtime_save(*args, **kwargs):
+        raise KeyboardInterrupt("simulated process interruption after durable Runtime result")
+
+    first_process._finalize = interrupt_after_runtime_save
+    other_cp = ControlPlane(SQLiteStore(cp.store.path))
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(first_process.execute, sample_identity,
+                                 "sample-lifecycle-agent", "read_only")
+            assert entered.wait(5)
+            duplicate = AgentSampleExecutionService(other_cp, recoverable_runtime).execute(
+                sample_identity, "sample-lifecycle-agent", "read_only",
+            )
+            assert duplicate["status"] == "RUNNING" and duplicate["deduplicated"] is True
+            assert recoverable_runtime.calls == 1
+            release.set()
+            with pytest.raises(KeyboardInterrupt):
+                future.result(timeout=5)
+    finally:
+        release.set()
+        other_cp.close()
+    interrupted_task = cp.store.connection.execute(
+        "SELECT task_run_id FROM agent_sample_runtime_results",
+    ).fetchone()["task_run_id"]
+    assert cp.store.get_task_run(interrupted_task)["status"] == "RUNNING"
+    assert cp.store.get_agent_sample_result(interrupted_task) is None
+    assert cp.store.get_agent_sample_runtime_result(interrupted_task)["status"] == "SUCCEEDED"
+    resumed = AgentSampleExecutionService(cp, runtime).execute(
+        sample_identity, "sample-lifecycle-agent", "read_only",
+    )
+    assert resumed["status"] == "WAITING_REVIEW" and resumed["agent_version"] == 1
+    assert resumed["task_run_id"] == interrupted_task and recoverable_runtime.calls == 1
+    stable_sample = resumed
+
+    class InterruptedRuntime:
+        def __init__(self):
+            self.calls = 0
+
+        def run_once(self, request):
+            self.calls += 1
+            raise KeyboardInterrupt("simulated process interruption during Runtime call")
+
+    interrupted_runtime = InterruptedRuntime()
+    with pytest.raises(KeyboardInterrupt):
+        AgentSampleExecutionService(cp, interrupted_runtime).execute(
+            sample_identity, "sample-lifecycle-agent", "write_boundary",
+        )
+    unknown_task = cp.store.connection.execute(
+        "SELECT task_run_id FROM agent_sample_attempts WHERE case_id = 'write_boundary' "
+        "ORDER BY created_at DESC LIMIT 1",
+    ).fetchone()["task_run_id"]
+    cp.store.connection.execute(
+        "UPDATE agent_sample_attempts SET lease_until = 0 WHERE task_run_id = ?", (unknown_task,),
+    )
+    cp.store.connection.commit()
+    unknown_replay = AgentSampleExecutionService(cp, interrupted_runtime).execute(
+        sample_identity, "sample-lifecycle-agent", "write_boundary",
+    )
+    assert unknown_replay["status"] == "RECONCILING"
+    assert cp.store.get_task_run(unknown_task)["status"] == "RECONCILING"
+    assert interrupted_runtime.calls == 1
+
     run1 = cp.create_task_run("member", "assistant", "sample-lifecycle-agent", 1)
     run1.status = TaskRunStatus.FAILED
     run1.failure_reason = "sample failure"
@@ -295,12 +383,12 @@ def test_sample_agent_human_lifecycle_and_read_only_canary(tmp_path):
     admin_headers = switch_user(cp, client, "admin", "admin-subject")
     assert client.get(route + "/compare?old_version=1&new_version=99").status_code == 404
     diagnostics = client.get(route + "/diagnostics").json()
-    assert diagnostics["total"] == 7 and diagnostics["versions"]["1"]["failures"] == 1
+    assert diagnostics["total"] == 8 and diagnostics["versions"]["1"]["failures"] == 2
     comparison = client.get(route + "/compare?old_version=1&new_version=2").json()
     assert comparison["changes"]["description"]["old"] != comparison["changes"]["description"]["new"]
     read_answers = comparison["sample_comparison"]["read_only"]
-    assert read_answers["old"]["task_run_id"] == stable_sample.json()["task_run_id"]
-    assert read_answers["old"]["response"] == stable_sample.json()["response"]
+    assert read_answers["old"]["task_run_id"] == stable_sample["task_run_id"]
+    assert read_answers["old"]["response"] == stable_sample["response"]
     assert read_answers["new"]["task_run_id"] == fresh_runs[0].task_run_id
     assert read_answers["new"]["response"] != read_answers["old"]["response"]
     assert comparison["sample_comparison"]["write_boundary"]["old"] is None

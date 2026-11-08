@@ -121,7 +121,9 @@ def create_app(db_path: Path | None = None, *, port: int = 8212) -> FastAPI:
         token = DEMO_OUTCOME.set(body.outcome)
         try:
             with service.lock:
-                return service.run_agent_sample(agent_id, identity, body)
+                return service.run_agent_sample(
+                    agent_id, identity, body, dispatch_scope=f"local-demo:{body.outcome}",
+                )
         finally:
             DEMO_OUTCOME.reset(token)
 

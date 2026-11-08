@@ -291,11 +291,13 @@ class MeetingReviewWebService:
                 "can_manage_lifecycle": can_manage}
 
     def run_agent_sample(self, agent_id: str, identity: IdentityContext,
-                         body: AgentSampleRunRequest) -> dict[str, Any]:
+                         body: AgentSampleRunRequest, *,
+                         dispatch_scope: str = "production") -> dict[str, Any]:
         if self.sample is None:
             raise HTTPException(404, "样例运行入口未启用")
         try:
-            return self.sample.execute(identity, agent_id, body.case_id)
+            return self.sample.execute(identity, agent_id, body.case_id,
+                                       dispatch_scope=dispatch_scope)
         except PermissionError as exc:
             raise HTTPException(403, str(exc)) from exc
         except (KeyError, ValueError) as exc:

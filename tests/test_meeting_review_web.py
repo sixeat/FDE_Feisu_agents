@@ -19,6 +19,7 @@ from fde_control_plane import (
     RiskLevel, ToolDefinition,
 )
 from fde_control_plane.meeting_review_web import MeetingReviewWebService, build_meeting_review_router
+from fde_control_plane.models import AuditEvent
 from test_feishu_review import setup_review, DOCUMENT_ID, SUBJECT, CAPS, FailedRuntime
 
 
@@ -434,6 +435,59 @@ def test_reviewer_audit_queue_is_limited_to_managed_agent_governance(tmp_path):
     admin_view = client.get("/api/meetings/audit", headers=admin_headers).json()
     assert admin_view["can_manage_members"] is True
     assert any(item["event_type"] == "TOOL_CALL_RECONCILED" for item in admin_view["events"])
+
+
+def test_governance_triage_survives_reopen_and_serializes_concurrent_claims(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from fde_control_plane import SQLiteStore
+
+    cp, _, _, _, _, _, _ = web_setup(tmp_path)
+    config = {"name": "Persistent managed agent", "actor_type": "BUSINESS_AGENT"}
+    cp.store.connection.execute(
+        "INSERT INTO agent_version_snapshots(agent_id, version, tenant_id, draft_id, config_json, config_hash) "
+        "VALUES ('persistent-agent', 1, 'tenant', 'persistent-draft', ?, ?)",
+        (json.dumps(config), "b" * 64),
+    )
+    task_data = {"agent_id": "persistent-agent", "agent_version": 1, "status": "FAILED"}
+    cp.store.connection.execute(
+        "INSERT INTO task_runs(task_run_id, tenant_id, data_json) VALUES ('persistent-run', 'tenant', ?)",
+        (json.dumps(task_data),),
+    )
+    cp._audit("TASK_RUN_FAILED", "tenant", "system", "persistent-run", {}, "FAILED")
+    source = next(item for item in cp.store.list_governance_audits("tenant")
+                  if item["event_type"] == "TASK_RUN_FAILED")
+    stores = [SQLiteStore(cp.store.path), SQLiteStore(cp.store.path)]
+    barrier = Barrier(2)
+
+    def claim(index):
+        event = AuditEvent(
+            audit_id=f"race-triage-{index}", event_type="AUDIT_TRIAGE_UPDATED",
+            tenant_id="tenant", actor_id=f"reviewer-{index}", task_run_id=None,
+            correlation_id=None, payload_hash=str(index) * 64, outcome="ACKNOWLEDGED",
+        )
+        barrier.wait(timeout=5)
+        return stores[index].set_audit_triage(
+            "tenant", source["audit_id"], f"reviewer-{index}", "OPEN", "ACKNOWLEDGED", None, event,
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(claim, (0, 1)))
+        assert sorted(results) == ["ACKNOWLEDGED", "STALE"]
+        assert len([item for item in cp.store.list_audits()
+                    if item["event_type"] == "AUDIT_TRIAGE_UPDATED"]) == 1
+        with SQLiteStore(cp.store.path) as reopened:
+            persisted = reopened.get_audit_triage("tenant", source["audit_id"])
+            assert persisted is not None and persisted["status"] == "ACKNOWLEDGED"
+            queue_item = next(item for item in reopened.list_governance_audits("tenant")
+                              if item["audit_id"] == source["audit_id"])
+            assert queue_item["event_type"] == "TASK_RUN_FAILED"
+            assert len([item for item in reopened.list_tenant_audits("tenant")
+                        if item["event_type"] == "AUDIT_TRIAGE_UPDATED"]) == 1
+    finally:
+        for store in stores:
+            store.close()
 
 
 def test_audit_summary_counts_tenant_tool_status_without_exposing_call_details(tmp_path):

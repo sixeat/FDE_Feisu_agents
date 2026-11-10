@@ -18,7 +18,7 @@ from dataclasses import asdict, replace
 from functools import wraps
 from pathlib import Path
 from threading import RLock
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 def _workflow_serialized(method):
@@ -1591,7 +1591,8 @@ class SQLiteStore:
     @_workflow_serialized
     def upsert_workflow_opportunities(self, *, tenant_id: str, subscription_id: str,
                                       consent_version: str,
-                                      candidates: list[dict[str, Any]]) -> list[sqlite3.Row]:
+                                      candidates: list[dict[str, Any]],
+                                      authorization_check: Callable[[], None]) -> list[sqlite3.Row]:
         """Commit one scan as a unit after rechecking its source authorization."""
         self.connection.execute("BEGIN IMMEDIATE")
         try:
@@ -1603,6 +1604,7 @@ class SQLiteStore:
             if (subscription is None or subscription["status"] != "ACTIVE"
                     or subscription["consent_version"] != consent_version):
                 raise ValueError("workflow source subscription is no longer active")
+            authorization_check()
             rows = []
             for candidate in candidates:
                 opportunity_id = candidate["opportunity_id"]
@@ -2154,6 +2156,7 @@ class SQLiteStore:
             (member_actor_id, tenant_id),
         ).fetchone()
 
+    @_workflow_serialized
     def save_user_oauth_token(self, *, actor_id: str, tenant_id: str,
                               subject_ref_hash: str, scopes: frozenset[str],
                               token_ciphertext: str, expires_at: int) -> None:
@@ -2167,11 +2170,13 @@ class SQLiteStore:
             (actor_id, tenant_id, subject_ref_hash, self._json(sorted(scopes)), token_ciphertext, expires_at),
         )
 
+    @_workflow_serialized
     def get_user_oauth_token(self, actor_id: str) -> sqlite3.Row | None:
         return self.connection.execute(
             "SELECT * FROM user_oauth_tokens WHERE actor_id = ?", (actor_id,),
         ).fetchone()
 
+    @_workflow_serialized
     def delete_user_oauth_token(self, actor_id: str) -> None:
         self.connection.execute("DELETE FROM user_oauth_tokens WHERE actor_id = ?", (actor_id,))
 

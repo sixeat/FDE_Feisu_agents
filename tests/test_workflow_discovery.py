@@ -210,6 +210,43 @@ def test_revocation_during_chat_read_prevents_persisting_scan_results(tmp_path):
     assert "WORKFLOW_DISCOVERY_SCAN" not in audit_kinds
 
 
+@pytest.mark.parametrize("change", ["token_revoked", "token_expired", "member_inactive"])
+def test_member_authorization_change_during_read_blocks_scan_persistence(tmp_path, change):
+    cp, service, reader, identities = setup(tmp_path)
+    identity = identities["member"]
+    subscription = service.subscribe(identity, "oc_123456789", "GROUP", "测试群", True,
+                                     WORKFLOW_SOURCE_CONSENT_VERSION)
+    now = [NOW.timestamp()]
+    vault = UserTokenVault(cp.store, "awtrY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2M=",
+                           clock=lambda: now[0])
+    vault.replace(identity, OAuthGrant("member-chat-token", CHAT_GROUP_READ_SCOPE, 3600))
+    service.token_vault = vault
+    original_reader = reader.list_messages
+
+    def read_then_change_authorization(*args):
+        vault.get(identity, required_scope=CHAT_GROUP_READ_SCOPE)
+        messages = original_reader(*args)
+        if change == "token_revoked":
+            vault.revoke(identity.actor_id)
+        elif change == "token_expired":
+            now[0] += 3571  # less than the vault's 30-second safety margin remains
+        else:
+            cp.store.connection.execute("UPDATE actors SET active = 0 WHERE actor_id = ?",
+                                        (identity.actor_id,))
+        return messages
+
+    reader.list_messages = read_then_change_authorization
+    with pytest.raises(PermissionError):
+        service.scan_recent(identity, subscription["subscription_id"])
+
+    assert cp.store.connection.execute("SELECT COUNT(*) FROM workflow_opportunities").fetchone()[0] == 0
+    assert cp.store.connection.execute("SELECT COUNT(*) FROM workflow_opportunity_evidence").fetchone()[0] == 0
+    audit = cp.store.list_tenant_audits("tenant", limit=1)[0]
+    assert audit["event_type"] == "WORKFLOW_DISCOVERY_SCAN_BLOCKED"
+    assert audit["outcome"] == "BLOCKED"
+    assert "member-chat-token" not in "\n".join(cp.store.connection.iterdump())
+
+
 def test_scan_rolls_back_all_candidates_when_later_write_fails(tmp_path):
     cp, service, reader, identities = setup(tmp_path)
     subscription = service.subscribe(identities["member"], "oc_123456789", "GROUP", "测试群", True,

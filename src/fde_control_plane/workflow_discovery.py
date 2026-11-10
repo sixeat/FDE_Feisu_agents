@@ -290,10 +290,29 @@ class WorkflowDiscoveryService:
                 "last_seen": max(unique.values()).isoformat(),
                 "evidence_refs": list(unique),
             })
-        rows = self.store.upsert_workflow_opportunities(
-            tenant_id=identity.tenant_id, subscription_id=subscription_id,
-            consent_version=WORKFLOW_SOURCE_CONSENT_VERSION, candidates=candidates,
-        )
+        def check_authorization() -> None:
+            self._member(identity, required_scope=required_scope)
+            if self.token_vault is not None:
+                self.token_vault.get(identity, required_scope=required_scope)
+
+        try:
+            rows = self.store.upsert_workflow_opportunities(
+                tenant_id=identity.tenant_id, subscription_id=subscription_id,
+                consent_version=WORKFLOW_SOURCE_CONSENT_VERSION, candidates=candidates,
+                authorization_check=check_authorization,
+            )
+        except UserDocumentAuthorizationRequired:
+            self.cp._audit("WORKFLOW_DISCOVERY_SCAN_BLOCKED", identity.tenant_id,
+                           identity.actor_id, None,
+                           {"subscription_id": subscription_id,
+                            "reason": "USER_AUTHORIZATION_LOST_DURING_SCAN"}, "BLOCKED")
+            raise
+        except PermissionError:
+            self.cp._audit("WORKFLOW_DISCOVERY_SCAN_BLOCKED", identity.tenant_id,
+                           identity.actor_id, None,
+                           {"subscription_id": subscription_id,
+                            "reason": "MEMBER_AUTHORIZATION_CHANGED"}, "BLOCKED")
+            raise
         created = [row["opportunity_id"] for row in rows if row["occurrence_count"] >= 2]
         self.cp._audit("WORKFLOW_DISCOVERY_SCAN", identity.tenant_id, identity.actor_id, None,
                        {"subscription_id": subscription_id, "window_hours": 24,

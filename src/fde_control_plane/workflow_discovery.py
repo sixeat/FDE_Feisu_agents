@@ -21,7 +21,7 @@ from .user_document_access import (
     UserTokenVault,
 )
 
-WORKFLOW_SOURCE_CONSENT_VERSION = "workflow-source-v1"
+WORKFLOW_SOURCE_CONSENT_VERSION = "workflow-source-v2"
 
 
 @dataclass(frozen=True)
@@ -272,6 +272,8 @@ class WorkflowDiscoveryService:
         grouped: dict[str, list[tuple[datetime, str]]] = {}
         salt = bytes.fromhex(subscription["fingerprint_salt"])
         for message in messages:
+            if not start_at <= message.created_at.astimezone(timezone.utc) <= end_at:
+                continue
             normalized = " ".join(unicodedata.normalize("NFKC", message.text).casefold().split())
             if len(normalized) < 12 or len(normalized) > 4000:
                 continue
@@ -321,6 +323,75 @@ class WorkflowDiscoveryService:
                 "messages_scanned": len(messages), "opportunity_ids": sorted(set(created)),
                 "raw_message_content_retained": False}
 
+    def preview_evidence(self, identity: IdentityContext,
+                         opportunity_id: str) -> dict[str, Any]:
+        """Re-read matching evidence for its owner without retaining message text."""
+        self._member(identity)
+        opportunity = self.store.get_workflow_opportunity(
+            opportunity_id, identity.tenant_id, identity.actor_id,
+        )
+        if opportunity is None:
+            raise ValueError("workflow opportunity was not found")
+        subscription = self.store.get_workflow_subscription(
+            opportunity["subscription_id"], identity.tenant_id, identity.actor_id,
+        )
+        if subscription is None or subscription["status"] != "ACTIVE":
+            raise PermissionError("active member chat subscription is required")
+        if subscription["consent_version"] != WORKFLOW_SOURCE_CONSENT_VERSION:
+            raise ValueError("读取说明已更新，请在原订阅中重新确认后再预览。")
+        required_scope = (CHAT_GROUP_READ_SCOPE if subscription["chat_type"] == "GROUP"
+                          else CHAT_P2P_READ_SCOPE)
+        self._member(identity, required_scope=required_scope)
+        if self.reader is None:
+            raise RuntimeError("member-authorized Feishu chat reader is not configured")
+        end_at = self.clock().astimezone(timezone.utc)
+        start_at = end_at - timedelta(hours=24)
+        try:
+            messages = self.reader.list_messages(identity, subscription["chat_id"],
+                                                 subscription["chat_type"], start_at, end_at)
+        except UserDocumentAuthorizationRequired:
+            raise
+        except RuntimeError as exc:
+            raise RuntimeError("FEISHU_CHAT_READ_FAILED") from exc
+        salt = bytes.fromhex(subscription["fingerprint_salt"])
+        known_refs = set(json.loads(opportunity["evidence_refs_json"]))
+        matches = []
+        for message in messages:
+            when = message.created_at.astimezone(timezone.utc)
+            if not start_at <= when <= end_at:
+                continue
+            normalized = " ".join(unicodedata.normalize("NFKC", message.text).casefold().split())
+            signature = hmac.new(salt, normalized.encode("utf-8"), hashlib.sha256).hexdigest()
+            if signature != opportunity["signature_hash"]:
+                continue
+            evidence_ref = hmac.new(
+                salt, f"{subscription['subscription_id']}:{message.message_id}".encode(),
+                hashlib.sha256,
+            ).hexdigest()[:24]
+            if evidence_ref in known_refs:
+                matches.append({"evidence_ref": evidence_ref, "created_at": when.isoformat(),
+                                "excerpt": " ".join(message.text.split())[:200]})
+        def check_authorization() -> None:
+            self._member(identity, required_scope=required_scope)
+            if self.token_vault is not None:
+                self.token_vault.get(identity, required_scope=required_scope)
+
+        self.store.verify_workflow_subscription_access(
+            tenant_id=identity.tenant_id, subscription_id=subscription["subscription_id"],
+            consent_version=WORKFLOW_SOURCE_CONSENT_VERSION,
+            authorization_check=check_authorization,
+        )
+        selected = sorted(
+            {sample["evidence_ref"]: sample for sample in matches}.values(),
+            key=lambda sample: sample["created_at"], reverse=True,
+        )[:3]
+        self.cp._audit("WORKFLOW_EVIDENCE_PREVIEWED", identity.tenant_id,
+                       identity.actor_id, None,
+                       {"opportunity_id": opportunity_id, "sample_count": len(selected)},
+                       "SUCCEEDED")
+        return {"opportunity_id": opportunity_id, "samples": selected,
+                "window_hours": 24, "persisted_message_text": False}
+
     def list_opportunities(self, identity: IdentityContext) -> list[dict[str, Any]]:
         self._member(identity)
         result = []
@@ -328,6 +399,8 @@ class WorkflowDiscoveryService:
             result.append({
                 "opportunity_id": row["opportunity_id"], "status": row["status"],
                 "source_label": row["display_label"],
+                "source_active": row["source_status"] == "ACTIVE",
+                "source_consent_current": row["source_consent_version"] == WORKFLOW_SOURCE_CONSENT_VERSION,
                 "pattern_type": "EXACT_NORMALIZED_TEXT_REPEAT",
                 "occurrence_count": row["occurrence_count"], "first_seen": row["first_seen"],
                 "last_seen": row["last_seen"],

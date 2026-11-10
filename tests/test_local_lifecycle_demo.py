@@ -230,7 +230,7 @@ def test_local_member_can_subscribe_scan_review_create_draft_and_revoke(tmp_path
     subscribed = client.post("/api/workflow-opportunities/subscriptions", headers=headers,
                              json={"chat_id": "oc_workflow123", "chat_type": "GROUP",
                                    "display_label": "本地课程群", "consent_confirmed": True,
-                                   "consent_version": "workflow-source-v1"})
+                                   "consent_version": "workflow-source-v2"})
     assert subscribed.status_code == 200
     subscription_id = subscribed.json()["subscription_id"]
 
@@ -268,7 +268,7 @@ def test_revoked_workflow_source_blocks_precheck_and_publication(tmp_path):
     subscribed = client.post("/api/workflow-opportunities/subscriptions", headers=member_headers,
                              json={"chat_id": "oc_revoked123", "chat_type": "GROUP",
                                    "display_label": "撤权测试群", "consent_confirmed": True,
-                                   "consent_version": "workflow-source-v1"})
+                                   "consent_version": "workflow-source-v2"})
     assert subscribed.status_code == 200
     subscription_id = subscribed.json()["subscription_id"]
     scanned = client.post(f"/api/workflow-opportunities/subscriptions/{subscription_id}/scan",
@@ -317,7 +317,7 @@ def test_revoked_workflow_source_blocks_precheck_and_publication(tmp_path):
     member_headers = _role(client, "member")
     renewed = client.post(f"/api/workflow-opportunities/subscriptions/{subscription_id}/consent",
                           headers=member_headers,
-                          json={"consent_confirmed": True, "consent_version": "workflow-source-v1"})
+                          json={"consent_confirmed": True, "consent_version": "workflow-source-v2"})
     assert renewed.status_code == 200
     assert next(item for item in client.get("/api/meetings/agent-drafts").json()["drafts"]
                 if item["draft_id"] == draft_id)["workflow_source_available"] is True
@@ -361,7 +361,7 @@ def test_revoking_published_workflow_source_creates_reviewer_issue_without_pausi
     subscribed = client.post("/api/workflow-opportunities/subscriptions", headers=member_headers,
                              json={"chat_id": "oc_published123", "chat_type": "GROUP",
                                    "display_label": "已发布来源群", "consent_confirmed": True,
-                                   "consent_version": "workflow-source-v1"})
+                                   "consent_version": "workflow-source-v2"})
     assert subscribed.status_code == 200
     subscription_id = subscribed.json()["subscription_id"]
     scanned = client.post(f"/api/workflow-opportunities/subscriptions/{subscription_id}/scan",

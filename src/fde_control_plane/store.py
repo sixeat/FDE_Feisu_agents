@@ -1589,6 +1589,27 @@ class SQLiteStore:
             raise
 
     @_workflow_serialized
+    def verify_workflow_subscription_access(self, *, tenant_id: str,
+                                            subscription_id: str,
+                                            consent_version: str,
+                                            authorization_check: Callable[[], None]) -> None:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            subscription = self.connection.execute(
+                "SELECT status, consent_version FROM workflow_source_subscriptions "
+                "WHERE subscription_id = ? AND tenant_id = ?",
+                (subscription_id, tenant_id),
+            ).fetchone()
+            if (subscription is None or subscription["status"] != "ACTIVE"
+                    or subscription["consent_version"] != consent_version):
+                raise ValueError("workflow source subscription is no longer active")
+            authorization_check()
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    @_workflow_serialized
     def upsert_workflow_opportunities(self, *, tenant_id: str, subscription_id: str,
                                       consent_version: str,
                                       candidates: list[dict[str, Any]],
@@ -1662,7 +1683,8 @@ class SQLiteStore:
     @_workflow_serialized
     def list_workflow_opportunities(self, tenant_id: str, member_id: str) -> list[sqlite3.Row]:
         return self.connection.execute(
-            "SELECT o.*, s.display_label FROM workflow_opportunities AS o "
+            "SELECT o.*, s.display_label, s.status AS source_status, "
+            "s.consent_version AS source_consent_version FROM workflow_opportunities AS o "
             "JOIN workflow_source_subscriptions AS s "
             "ON s.subscription_id = o.subscription_id WHERE o.tenant_id = ? AND s.member_id = ? "
             "AND o.occurrence_count >= 2 "

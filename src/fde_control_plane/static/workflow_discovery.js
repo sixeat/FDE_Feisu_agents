@@ -18,13 +18,13 @@
     try { payload = await response.json(); } catch { payload = {}; }
     if (!response.ok) {
       const detail = typeof payload.detail === "string" ? payload.detail.toLowerCase() : "";
-      if (response.status === 403 && path.includes("/scan")
+      if (response.status === 403 && (path.includes("/scan") || path.includes("/evidence-preview"))
           && (detail.includes("authorization") || detail.includes("chat-read permission"))) {
-        throw new Error("成员聊天授权缺失或已过期。请点击“重新授权聊天读取”，完成授权后刷新状态再扫描。");
+        throw new Error("成员聊天授权缺失或已过期。请点击“重新授权聊天读取”，完成授权后刷新状态再试。");
       }
-      if (response.status === 503 && path.includes("/scan")
+      if (response.status === 503 && (path.includes("/scan") || path.includes("/evidence-preview"))
           && detail.startsWith("feishu_chat_read_")) {
-        throw new Error("扫描未完成。请刷新授权状态；若显示需授权，请重新授权。若授权有效，请确认你仍可访问该会话后重试。本次没有生成候选。");
+        throw new Error("读取未完成。请刷新授权状态；若显示需授权，请重新授权。若授权有效，请确认你仍可访问该会话后重试。本次没有生成新候选。");
       }
       throw new Error(payload.detail || `请求失败（${response.status}）`);
     }
@@ -113,6 +113,13 @@
     meta.className = "muted";
     meta.textContent = `相同文本出现 ${item.occurrence_count} 次 · ${item.pattern_type} · ${item.evidence_refs.length} 条脱敏证据引用`;
     card.append(head, meta);
+    if (item.source_active && item.source_consent_current) {
+      const preview = document.createElement("div");
+      preview.className = "workflow-preview";
+      preview.hidden = true;
+      const previewButton = button("查看匹配证据摘录", () => previewEvidence(item, preview, previewButton));
+      card.append(previewButton, preview);
+    }
     if (item.decision_reason) {
       const reason = document.createElement("p");
       reason.className = "workflow-reason";
@@ -226,6 +233,40 @@
   async function scan(id) {
     await run(() => mutate(`/api/workflow-opportunities/subscriptions/${encodeURIComponent(id)}/scan`, { method: "POST" }),
       result => `扫描完成：读取 ${result.messages_scanned} 条消息，发现 ${result.opportunity_ids.length} 个候选。`);
+  }
+  async function previewEvidence(item, panel, control) {
+    if (state.busy) return;
+    state.busy = true;
+    control.disabled = true;
+    panel.hidden = false;
+    panel.replaceChildren();
+    const pending = document.createElement("p");
+    pending.textContent = "正在重新读取最近 24 小时的匹配证据…";
+    panel.append(pending);
+    try {
+      const result = await mutate(`/api/workflow-opportunities/${encodeURIComponent(item.opportunity_id)}/evidence-preview`, {
+        method: "POST", cache: "no-store",
+      });
+      panel.replaceChildren();
+      if (!result.samples.length) {
+        const empty = document.createElement("p");
+        empty.textContent = "最近 24 小时没有可重新核对的匹配消息；历史正文未保存。";
+        panel.append(empty);
+      }
+      for (const sample of result.samples) {
+        const excerpt = document.createElement("p");
+        excerpt.textContent = `${sample.created_at} · 证据 ${sample.evidence_ref} · ${sample.excerpt}`;
+        panel.append(excerpt);
+      }
+    } catch (error) {
+      panel.replaceChildren();
+      const failure = document.createElement("p");
+      failure.textContent = error.message;
+      panel.append(failure);
+    } finally {
+      state.busy = false;
+      control.disabled = false;
+    }
   }
   async function renewConsent(id) {
     const checkbox = $("workflow-consent");

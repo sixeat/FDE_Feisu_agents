@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import sqlite3
@@ -145,7 +146,7 @@ def test_member_authorized_discovery_is_idempotent_private_and_creates_linked_dr
     assert opportunity["occurrence_count"] == 2
     assert opportunity["source_label"] == "测试群"
     assert opportunity["pattern_type"] == "EXACT_NORMALIZED_TEXT_REPEAT"
-    assert service.list_subscriptions(identities["member"])[0]["consent_version"] == "workflow-source-v1"
+    assert service.list_subscriptions(identities["member"])[0]["consent_version"] == "workflow-source-v2"
     assert len(opportunity["evidence_refs"]) == 2
     assert service.list_opportunities(identities["other"]) == []
     assert reader.calls[0][2] == "GROUP"
@@ -168,6 +169,86 @@ def test_member_authorized_discovery_is_idempotent_private_and_creates_linked_dr
     assert config["workflow_occurrence_count"] == 2
     assert config["requested_tool_policy"] == {"allowed_tools": []}
     assert "message-one" not in json.dumps(config)
+
+
+def test_evidence_preview_re_reads_only_owner_matches_without_persisting_text(tmp_path):
+    cp, service, reader, identities = setup(tmp_path)
+    source = service.subscribe(identities["member"], "oc_123456789", "GROUP", "测试群", True,
+                               WORKFLOW_SOURCE_CONSENT_VERSION)
+    opportunity_id = service.scan_recent(identities["member"], source["subscription_id"])["opportunity_ids"][0]
+    with pytest.raises(ValueError, match="not found"):
+        service.preview_evidence(identities["other"], opportunity_id)
+    preview = service.preview_evidence(identities["member"], opportunity_id)
+    assert preview["persisted_message_text"] is False
+    assert preview["window_hours"] == 24
+    assert len(preview["samples"]) == 2
+    assert {item["excerpt"] for item in preview["samples"]} == {CHAT_TEXT}
+    assert all("message-" not in json.dumps(item) for item in preview["samples"])
+    assert len(reader.calls) == 2
+    assert CHAT_TEXT not in "\n".join(cp.store.connection.iterdump())
+    assert cp.store.list_tenant_audits("tenant", limit=1)[0]["event_type"] == "WORKFLOW_EVIDENCE_PREVIEWED"
+
+    def read_then_revoke(*args):
+        service.revoke(identities["member"], source["subscription_id"])
+        return reader.messages
+
+    reader.list_messages = read_then_revoke
+    with pytest.raises(ValueError, match="no longer active"):
+        service.preview_evidence(identities["member"], opportunity_id)
+    assert CHAT_TEXT not in "\n".join(cp.store.connection.iterdump())
+
+
+def test_evidence_preview_rechecks_token_after_read(tmp_path):
+    cp, service, reader, identities = setup(tmp_path)
+    identity = identities["member"]
+    source = service.subscribe(identity, "oc_123456789", "GROUP", "测试群", True,
+                               WORKFLOW_SOURCE_CONSENT_VERSION)
+    opportunity_id = service.scan_recent(identity, source["subscription_id"])["opportunity_ids"][0]
+    vault = UserTokenVault(cp.store, base64.urlsafe_b64encode(b"k" * 32).decode(),
+                           clock=lambda: NOW.timestamp())
+    vault.replace(identity, OAuthGrant("member-chat-token", CHAT_GROUP_READ_SCOPE, 3600))
+    service.token_vault = vault
+
+    def read_then_revoke_token(*args):
+        vault.revoke(identity.actor_id)
+        return reader.messages
+
+    reader.list_messages = read_then_revoke_token
+    with pytest.raises(UserDocumentAuthorizationRequired):
+        service.preview_evidence(identity, opportunity_id)
+    assert not any(row["event_type"] == "WORKFLOW_EVIDENCE_PREVIEWED"
+                   for row in cp.store.list_tenant_audits("tenant", limit=10))
+
+
+def test_evidence_preview_sanitizes_reader_errors(tmp_path):
+    cp, service, reader, identities = setup(tmp_path)
+    identity = identities["member"]
+    source = service.subscribe(identity, "oc_123456789", "GROUP", "测试群", True,
+                               WORKFLOW_SOURCE_CONSENT_VERSION)
+    opportunity_id = service.scan_recent(identity, source["subscription_id"])["opportunity_ids"][0]
+
+    def fail_with_sensitive_detail(*args):
+        raise RuntimeError("Bearer secret-token; private text")
+
+    reader.list_messages = fail_with_sensitive_detail
+    with pytest.raises(RuntimeError, match="^FEISHU_CHAT_READ_FAILED$"):
+        service.preview_evidence(identity, opportunity_id)
+    assert "private text" not in "\n".join(cp.store.connection.iterdump())
+
+
+def test_evidence_preview_limits_sample_count_and_excerpt_length(tmp_path):
+    _, service, reader, identities = setup(tmp_path)
+    identity = identities["member"]
+    reader.messages = [
+        ChatMessage(f"message-{number}", NOW - timedelta(minutes=number), "课程资料" * 50)
+        for number in range(1, 6)
+    ]
+    source = service.subscribe(identity, "oc_123456789", "GROUP", "测试群", True,
+                               WORKFLOW_SOURCE_CONSENT_VERSION)
+    opportunity_id = service.scan_recent(identity, source["subscription_id"])["opportunity_ids"][0]
+    preview = service.preview_evidence(identity, opportunity_id)
+    assert len(preview["samples"]) == 3
+    assert all(len(sample["excerpt"]) == 200 for sample in preview["samples"])
 
 
 def test_subscription_owner_revocation_blocks_scan_but_keeps_review_access(tmp_path):
@@ -521,6 +602,16 @@ def test_authenticated_api_runs_discovery_and_returns_agent_draft_link(tmp_path)
     opportunity_id = scan.json()["opportunity_ids"][0]
     opportunity = client.get("/api/workflow-opportunities").json()["opportunities"][0]
     assert opportunity["source_label"] == "样例课程群"
+    preview_url = f"/api/workflow-opportunities/{opportunity_id}/evidence-preview"
+    client.cookies.clear()
+    assert client.post(preview_url, headers=headers).status_code == 401
+    client.cookies.set("fde_auth_session", session)
+    assert client.post(preview_url, headers={"Origin": "https://example.test"}).status_code == 403
+    preview = client.post(preview_url, headers=headers)
+    assert preview.status_code == 200
+    assert preview.headers["cache-control"] == "no-store"
+    assert len(preview.json()["samples"]) == 2
+    assert {sample["excerpt"] for sample in preview.json()["samples"]} == {CHAT_TEXT}
 
     decided = client.post(f"/api/workflow-opportunities/{opportunity_id}/decision",
                           headers=headers,
@@ -544,6 +635,7 @@ def test_authenticated_api_runs_discovery_and_returns_agent_draft_link(tmp_path)
     )
     assert outdated_scan.status_code == 409
     assert outdated_scan.json()["detail"] == "读取说明已更新，请在原订阅中重新确认后再扫描。"
+    assert client.post(preview_url, headers=headers).status_code == 409
     consent_url = f"/api/workflow-opportunities/subscriptions/{subscription_id}/consent"
     assert client.post(consent_url, headers=headers,
                        json={"consent_confirmed": False,
@@ -562,3 +654,7 @@ def test_authenticated_api_runs_discovery_and_returns_agent_draft_link(tmp_path)
     assert renewed.json()["consent_version"] == WORKFLOW_SOURCE_CONSENT_VERSION
     assert client.post(f"/api/workflow-opportunities/subscriptions/{subscription_id}/scan",
                        headers=headers).status_code == 200
+    assert client.post(preview_url, headers=headers).status_code == 200
+    assert client.delete(f"/api/workflow-opportunities/subscriptions/{subscription_id}",
+                         headers=headers).status_code == 200
+    assert client.post(preview_url, headers=headers).status_code == 403

@@ -23,11 +23,16 @@ async function main() {
     await page.getByRole('button', { name: '登记订阅' }).click();
     const subscription = page.locator('#workflow-subscriptions .workflow-row').filter({ hasText: label });
     await subscription.waitFor();
-    await subscription.getByText(/读取说明 v1 · 同意时间/).waitFor();
+    await subscription.getByText(/读取说明 v2 · 同意时间/).waitFor();
     await subscription.getByRole('button', { name: '扫描最近 24 小时' }).click();
     await page.locator('#workflow-notice').getByText(/扫描完成：读取 2 条消息，发现 1 个候选/).waitFor();
     const opportunity = page.locator('#workflow-opportunities .workflow-opportunity').filter({ hasText: label });
     await opportunity.waitFor();
+    await opportunity.getByRole('button', { name: '查看匹配证据摘录' }).click();
+    const preview = opportunity.locator('.workflow-preview');
+    await preview.getByText(/请每周帮我把课程资料整理成待确认事项/).first().waitFor();
+    assert.equal(await preview.locator('p').count(), 2);
+    assert.doesNotMatch(await preview.innerText(), /synthetic-message-/);
     await opportunity.locator('textarea').fill('每周都会重复整理课程资料');
     await opportunity.getByRole('button', { name: '采纳' }).click();
     await opportunity.getByRole('button', { name: '生成待审核草稿' }).waitFor();
@@ -42,6 +47,7 @@ async function main() {
     await subscription.getByRole('button', { name: '撤销订阅' }).click();
     await subscription.getByText('已撤销').waitFor();
     await subscription.getByRole('button', { name: '扫描最近 24 小时' }).waitFor({ state: 'detached' });
+    await opportunity.getByRole('button', { name: '查看匹配证据摘录' }).waitFor({ state: 'detached' });
     await page.getByRole('tab', { name: 'Agent', exact: true }).click();
     const revokedDraft = page.locator('#agent-draft-list .agent-draft-row').filter({ hasText: `${label} Agent` });
     await revokedDraft.getByText(/流程来源已撤销或读取说明需重新确认/).waitFor();
@@ -73,7 +79,7 @@ async function main() {
     assert.deepEqual(errors, []);
     await page.setViewportSize({ width: 390, height: 844 });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
-    console.log(JSON.stringify({ flow: 'group-subscribe-scan-accept-draft-revoke; p2p-subscribe-scan-revoke', status: 'passed', page_errors: 0 }));
+    console.log(JSON.stringify({ flow: 'group-subscribe-scan-preview-accept-draft-revoke; p2p-subscribe-scan-revoke', status: 'passed', page_errors: 0 }));
   } finally {
     await browser.close();
   }

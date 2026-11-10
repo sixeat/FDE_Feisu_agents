@@ -83,7 +83,7 @@
               <label class="field"><span>会话 ID</span><input id="workflow-chat-id" required minlength="9" maxlength="128" placeholder="oc_..." autocomplete="off"></label>
               <label class="field"><span>显示名称</span><input id="workflow-chat-label" required minlength="2" maxlength="80" placeholder="例如：课程教研群" autocomplete="off"></label>
             </div>
-            <div class="workflow-consent"><label><input id="workflow-consent" type="checkbox" data-consent-version="workflow-source-v1" required>我确认这是我有权访问的会话，并同意只读扫描最近 24 小时的文本消息。</label><span>扫描仅聚合重复文本信号；不保存消息正文或原始消息 ID。撤销后停止扫描。</span></div>
+            <div class="workflow-consent"><label><input id="workflow-consent" type="checkbox" data-consent-version="workflow-source-v2" required>我确认这是我有权访问的会话，并同意只读扫描最近 24 小时的文本消息；我可按需查看匹配候选的少量原文摘录。</label><span>摘录只在本人点击时重新读取并临时显示，不保存消息正文或原始消息 ID。撤销后停止读取。</span></div>
             <div class="commands"><button class="primary" type="submit">登记订阅</button></div>
           </form>
         </section>

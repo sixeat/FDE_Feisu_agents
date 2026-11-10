@@ -6,6 +6,7 @@ import secrets
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr
 
 from .feishu_oauth_web import SQLiteOAuthSessionIssuer, build_session_dependency
@@ -105,6 +106,14 @@ def build_workflow_discovery_router(service: WorkflowDiscoveryService,
     @router.get("")
     def opportunities(identity: IdentityContext = Depends(require_identity)):
         return {"opportunities": call(service.list_opportunities, identity)}
+
+    @router.post("/{opportunity_id}/evidence-preview")
+    def evidence_preview(opportunity_id: str, request: Request,
+                         identity: IdentityContext = Depends(require_identity)):
+        check_csrf(request)
+        result = call(service.preview_evidence, identity, opportunity_id)
+        return JSONResponse(result, headers={"Cache-Control": "no-store",
+                                             "Referrer-Policy": "no-referrer"})
 
     @router.post("/{opportunity_id}/decision")
     def decide(opportunity_id: str, body: WorkflowDecisionRequest, request: Request,

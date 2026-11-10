@@ -604,7 +604,9 @@ class MeetingReviewWebService:
                 if event_type.startswith(prefix):
                     category = candidate
                     break
-            if outcome == "FAIL":
+            if event_type == "WORKFLOW_AGENT_SOURCE_REVOKED":
+                severity, action = "WARN", "REVIEW_AGENT_SOURCE"
+            elif outcome == "FAIL":
                 severity, action = "HIGH", "MANUAL_QUALITY_REVIEW"
             elif outcome == "EXPIRED":
                 severity, action = "WARN", "REVIEW_EXPIRED_APPROVAL"
@@ -627,6 +629,8 @@ class MeetingReviewWebService:
             }
             if item.get("task_run_id"):
                 event["task_ref"] = hashlib.sha256(str(item["task_run_id"]).encode()).hexdigest()[:12]
+            if event_type == "WORKFLOW_AGENT_SOURCE_REVOKED":
+                event["affected_agents"] = item.get("affected_agents", [])
             events.append(event)
         counts: dict[str, int] = {}
         for event in events:

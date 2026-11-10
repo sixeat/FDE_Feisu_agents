@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 
+import pytest
 from fastapi.testclient import TestClient
 
 from scripts.local_lifecycle_demo import create_app
@@ -328,6 +329,8 @@ def test_revoked_workflow_source_blocks_precheck_and_publication(tmp_path):
     member_headers = _role(client, "member")
     assert client.delete(f"/api/workflow-opportunities/subscriptions/{subscription_id}",
                          headers=member_headers).status_code == 200
+    assert not any(event["event_type"] == "WORKFLOW_AGENT_SOURCE_REVOKED"
+                   for event in app.state.control_plane.store.list_tenant_audits("local-demo"))
     admin_headers = _role(client, "admin")
     listed = next(item for item in client.get("/api/meetings/agent-drafts").json()["drafts"]
                   if item["draft_id"] == draft_id)
@@ -349,6 +352,93 @@ def test_revoked_workflow_source_blocks_precheck_and_publication(tmp_path):
     assert repeated["review_id"] == blocked["review_id"] and repeated["duplicate"] is True
     assert app.state.control_plane.store.get_agent_config_approval(draft_id, "local-demo", input_hash) is None
     assert app.state.control_plane.store.get_agent_version("撤权来源 Agent", 1) is None
+
+
+def test_revoking_published_workflow_source_creates_reviewer_issue_without_pausing(tmp_path):
+    app = create_app(tmp_path / "published-source-revoke.sqlite3")
+    client = TestClient(app)
+    member_headers = _role(client, "member")
+    subscribed = client.post("/api/workflow-opportunities/subscriptions", headers=member_headers,
+                             json={"chat_id": "oc_published123", "chat_type": "GROUP",
+                                   "display_label": "已发布来源群", "consent_confirmed": True,
+                                   "consent_version": "workflow-source-v1"})
+    assert subscribed.status_code == 200
+    subscription_id = subscribed.json()["subscription_id"]
+    scanned = client.post(f"/api/workflow-opportunities/subscriptions/{subscription_id}/scan",
+                          headers=member_headers)
+    opportunity_id = scanned.json()["opportunity_ids"][0]
+    assert client.post(f"/api/workflow-opportunities/{opportunity_id}/decision",
+                       headers=member_headers,
+                       json={"decision": "ACCEPTED", "reason": "每周重复整理课程资料"}).status_code == 200
+    created = client.post(f"/api/workflow-opportunities/{opportunity_id}/agent-draft",
+                          headers=member_headers,
+                          json={"name": "来源运维 Agent", "description": "输出待人工核对的建议"})
+    draft_id = created.json()["draft_id"]
+    stored = app.state.control_plane.store.get_agent_config_draft(draft_id, "local-demo")
+    input_hash = hashlib.sha256(json.dumps(json.loads(stored["data_json"]),
+                                         sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+    reviewer_headers = _role(client, "reviewer")
+    digest = hashlib.sha256(b"READ_ONLY").hexdigest()
+    cases = [{"case_id": name, "expected_hash": digest, "evidence_ref": name}
+             for name in ("source-impact-1", "source-impact-2")]
+    assert client.post("/api/meetings/agent-evaluation-datasets", json={
+        "dataset_id": "source-impact-eval", "cases": cases,
+    }, headers=reviewer_headers).status_code == 200
+    assert client.post(f"/api/meetings/agent-drafts/{draft_id}/evaluate", json={
+        "input_hash": input_hash, "dataset_id": "source-impact-eval",
+        "cases": [case | {"observed_hash": digest} for case in cases],
+    }, headers=reviewer_headers).status_code == 200
+    review = client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck",
+                         headers=reviewer_headers).json()
+    assert review["status"] == "READY_FOR_ADMIN"
+    admin_headers = _role(client, "admin")
+    published = client.post(f"/api/meetings/agent-drafts/{draft_id}/confirm", json={
+        "review_id": review["review_id"], "input_hash": review["input_hash"],
+    }, headers=admin_headers)
+    assert published.status_code == 200 and published.json()["version"] == 1
+
+    member_headers = _role(client, "member")
+    app.state.control_plane.store.connection.execute(
+        "CREATE TRIGGER fail_source_impact BEFORE INSERT ON workflow_source_agent_impacts "
+        "BEGIN SELECT RAISE(ABORT, 'synthetic impact failure'); END"
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="synthetic impact failure"):
+        client.delete(f"/api/workflow-opportunities/subscriptions/{subscription_id}",
+                      headers=member_headers)
+    assert app.state.control_plane.store.get_workflow_subscription(
+        subscription_id, "local-demo", "member",
+    )["status"] == "ACTIVE"
+    assert not any(event["event_type"] == "WORKFLOW_SOURCE_REVOKED"
+                   for event in app.state.control_plane.store.list_tenant_audits("local-demo"))
+    app.state.control_plane.store.connection.execute("DROP TRIGGER fail_source_impact")
+    assert client.delete(f"/api/workflow-opportunities/subscriptions/{subscription_id}",
+                         headers=member_headers).status_code == 200
+    assert client.get("/api/meetings/audit").json()["can_view"] is False
+    reviewer_headers = _role(client, "reviewer")
+    queue = client.get("/api/meetings/audit").json()
+    impacts = [item for item in queue["events"]
+               if item["event_type"] == "WORKFLOW_AGENT_SOURCE_REVOKED"]
+    assert len(impacts) == 1
+    impact = impacts[0]
+    assert impact["affected_agents"] == [{"agent_id": "来源运维 Agent", "version": 1}]
+    assert impact["severity"] == "WARN" and impact["recommended_action"] == "REVIEW_AGENT_SOURCE"
+    assert queue["summary"]["incidents"]["OPEN"] >= 1
+    assert "oc_published123" not in json.dumps(queue, ensure_ascii=False)
+    assert "请每周帮我" not in json.dumps(queue, ensure_ascii=False)
+    assert client.post(f'/api/meetings/audit/{impact["audit_ref"]}/triage', json={
+        "expected_status": "OPEN", "status": "ACKNOWLEDGED",
+    }, headers=reviewer_headers).status_code == 200
+    assert next(agent for agent in client.get("/api/meetings/agents").json()["agents"]
+                if agent["agent_id"] == "来源运维 Agent")["status"] == "ACTIVE"
+    admin_headers = _role(client, "admin")
+    admin_events = client.get("/api/meetings/audit").json()["events"]
+    assert next(item for item in admin_events if item["event_type"] ==
+                "WORKFLOW_AGENT_SOURCE_REVOKED")["affected_agents"] == impact["affected_agents"]
+    member_headers = _role(client, "member")
+    assert client.delete(f"/api/workflow-opportunities/subscriptions/{subscription_id}",
+                         headers=member_headers).status_code == 409
+    assert sum(event["event_type"] == "WORKFLOW_AGENT_SOURCE_REVOKED"
+               for event in app.state.control_plane.store.list_tenant_audits("local-demo")) == 1
 
 
 def test_browser_demo_recovers_session_and_draft_after_restart(tmp_path):

@@ -118,7 +118,8 @@ def create_app(db_path: Path | None = None, *, port: int = 8212) -> FastAPI:
             return JSONResponse({"detail": "local demo accepts loopback clients only"}, status_code=403)
         if request.method not in {"GET", "HEAD"} and request.url.path.startswith("/api/meetings/"):
             allowed = ("/api/meetings/agents/", "/api/meetings/agent-drafts",
-                       "/api/meetings/agent-evaluation-datasets", "/api/meetings/logout")
+                       "/api/meetings/agent-evaluation-datasets", "/api/meetings/audit/",
+                       "/api/meetings/logout")
             if not request.url.path.startswith(allowed):
                 return JSONResponse({"detail": "this demo runs Agent governance only"}, status_code=404)
         if request.url.path.startswith("/assets/") or request.url.path == "/health":

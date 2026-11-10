@@ -214,11 +214,22 @@ class WorkflowDiscoveryService:
 
     def revoke(self, identity: IdentityContext, subscription_id: str) -> dict[str, Any]:
         self._member(identity)
+        source_hash = hashlib.sha256(subscription_id.encode()).hexdigest()
+        revoke_event = AuditEvent(
+            audit_id="audit-" + secrets.token_hex(12), event_type="WORKFLOW_SOURCE_REVOKED",
+            tenant_id=identity.tenant_id, actor_id=identity.actor_id, task_run_id=None,
+            correlation_id=None, payload_hash=source_hash, outcome="REVOKED",
+        )
+        impact_event = AuditEvent(
+            audit_id="audit-" + secrets.token_hex(12),
+            event_type="WORKFLOW_AGENT_SOURCE_REVOKED",
+            tenant_id=identity.tenant_id, actor_id=identity.actor_id, task_run_id=None,
+            correlation_id=None, payload_hash=source_hash, outcome="STALE",
+        )
         if not self.store.revoke_workflow_subscription(subscription_id, identity.tenant_id,
-                                                       identity.actor_id):
+                                                       identity.actor_id, revoke_event,
+                                                       impact_event):
             raise ValueError("active chat subscription was not found")
-        self.cp._audit("WORKFLOW_SOURCE_REVOKED", identity.tenant_id, identity.actor_id, None,
-                       {"subscription_id": subscription_id}, "REVOKED")
         return {"subscription_id": subscription_id, "status": "REVOKED"}
 
     def scan_recent(self, identity: IdentityContext, subscription_id: str) -> dict[str, Any]:

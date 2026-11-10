@@ -14,7 +14,7 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from functools import wraps
 from pathlib import Path
 from threading import RLock
@@ -462,6 +462,12 @@ class SQLiteStore:
                 audit_id TEXT PRIMARY KEY, event_type TEXT NOT NULL,
                 tenant_id TEXT NOT NULL, task_run_id TEXT,
                 data_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS workflow_source_agent_impacts (
+                audit_id TEXT NOT NULL, tenant_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL, version INTEGER NOT NULL,
+                PRIMARY KEY(audit_id, agent_id, version),
+                FOREIGN KEY(audit_id) REFERENCES audit_events(audit_id)
             );
             CREATE TABLE IF NOT EXISTS audit_triage (
                 audit_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
@@ -1531,7 +1537,8 @@ class SQLiteStore:
 
     @_workflow_serialized
     def revoke_workflow_subscription(self, subscription_id: str, tenant_id: str,
-                                     member_id: str) -> bool:
+                                     member_id: str, revoke_event: Any,
+                                     impact_event: Any) -> bool:
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             changed = self.connection.execute(
@@ -1540,12 +1547,41 @@ class SQLiteStore:
                 (subscription_id, tenant_id, member_id),
             ).rowcount
             if changed:
+                impacted = self.connection.execute(
+                    "SELECT DISTINCT snapshot.agent_id, snapshot.version "
+                    "FROM workflow_opportunities AS opportunity "
+                    "JOIN agent_version_snapshots AS snapshot "
+                    "ON snapshot.draft_id = opportunity.agent_draft_id "
+                    "AND snapshot.tenant_id = opportunity.tenant_id "
+                    "JOIN agent_routes AS route ON route.agent_id = snapshot.agent_id "
+                    "AND route.tenant_id = snapshot.tenant_id "
+                    "WHERE opportunity.subscription_id = ? AND opportunity.tenant_id = ? "
+                    "AND route.status != 'ARCHIVED' "
+                    "AND (snapshot.version = route.stable_version "
+                    "OR snapshot.version = route.canary_version) "
+                    "ORDER BY snapshot.agent_id, snapshot.version",
+                    (subscription_id, tenant_id),
+                ).fetchall()
                 self.connection.execute(
                     "UPDATE workflow_opportunities SET status = 'SOURCE_REVOKED', "
                     "decision_reason = 'SOURCE_REVOKED' WHERE subscription_id = ? "
                     "AND status IN ('DISCOVERED', 'ACCEPTED')",
                     (subscription_id,),
                 )
+                self._insert_agent_audit(revoke_event)
+                if impacted:
+                    affected = [{"agent_id": row["agent_id"], "version": row["version"]}
+                                for row in impacted]
+                    payload_hash = hashlib.sha256(self._json({
+                        "subscription_id": subscription_id, "affected": affected,
+                    }).encode()).hexdigest()
+                    self._insert_agent_audit(replace(impact_event, payload_hash=payload_hash))
+                    for row in impacted:
+                        self.connection.execute(
+                            "INSERT INTO workflow_source_agent_impacts "
+                            "(audit_id, tenant_id, agent_id, version) VALUES (?, ?, ?, ?)",
+                            (impact_event.audit_id, tenant_id, row["agent_id"], row["version"]),
+                        )
             self.connection.commit()
             return changed == 1
         except Exception:
@@ -3447,8 +3483,20 @@ class SQLiteStore:
         for row in rows:
             item = json.loads(row["data_json"])
             item["created_at"] = row["created_at"]
+            if item["event_type"] == "WORKFLOW_AGENT_SOURCE_REVOKED":
+                item["affected_agents"] = self.workflow_source_agent_impacts(
+                    tenant_id, item["audit_id"],
+                )
             items.append(item)
         return items
+
+    def workflow_source_agent_impacts(self, tenant_id: str,
+                                      audit_id: str) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.connection.execute(
+            "SELECT agent_id, version FROM workflow_source_agent_impacts "
+            "WHERE audit_id = ? AND tenant_id = ? ORDER BY agent_id, version",
+            (audit_id, tenant_id),
+        )]
 
     def list_governance_audits(self, tenant_id: str, limit: int = 100) -> list[dict[str, Any]]:
         """Return only managed-Agent failures and decisions suitable for reviewer triage."""
@@ -3470,7 +3518,10 @@ class SQLiteStore:
             "AND EXISTS (SELECT 1 FROM task_runs AS task JOIN agent_version_snapshots AS snapshot "
             "ON snapshot.agent_id = json_extract(task.data_json, '$.agent_id') "
             "AND snapshot.version = json_extract(task.data_json, '$.agent_version') "
-            "WHERE task.task_run_id = event.task_run_id AND task.tenant_id = event.tenant_id))) "
+            "WHERE task.task_run_id = event.task_run_id AND task.tenant_id = event.tenant_id)) "
+            "OR (event.event_type = 'WORKFLOW_AGENT_SOURCE_REVOKED' "
+            "AND EXISTS (SELECT 1 FROM workflow_source_agent_impacts AS impact "
+            "WHERE impact.audit_id = event.audit_id AND impact.tenant_id = event.tenant_id))) "
             "ORDER BY event.rowid DESC LIMIT ?",
             (tenant_id, bounded_limit),
         ).fetchall()
@@ -3478,6 +3529,10 @@ class SQLiteStore:
         for row in rows:
             item = json.loads(row["data_json"])
             item["created_at"] = row["created_at"]
+            if item["event_type"] == "WORKFLOW_AGENT_SOURCE_REVOKED":
+                item["affected_agents"] = self.workflow_source_agent_impacts(
+                    tenant_id, item["audit_id"],
+                )
             items.append(item)
         return items
 

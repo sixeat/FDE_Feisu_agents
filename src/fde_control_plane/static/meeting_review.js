@@ -619,7 +619,7 @@ function renderAudit() {
   const panel=$("audit-list");panel.replaceChildren();
   if(!auditState.events.length){panel.append(node("p","暂无审计事件。","muted"));return;}
   const categoryNames={AGENT_GOVERNANCE:"Agent治理",APPROVAL:"审批",SOURCE:"来源校验",WORKFLOW_DISCOVERY:"流程发现",MEMBER:"成员",TASK_FOLLOW_UP:"任务跟进",TASK:"任务",TOOL:"工具",OPERATIONS:"运维处置",SYSTEM:"系统"};
-  const actionNames={NONE:"无需处理",CHECK_POLICY_OR_SOURCE:"检查权限、审批或来源版本",MANUAL_QUALITY_REVIEW:"审核官核实质量证据",RECONCILE_BEFORE_RETRY:"先对账确认，再考虑人工重试",REVIEW_EXPIRED_APPROVAL:"核对审批到期影响"};
+  const actionNames={NONE:"无需处理",CHECK_POLICY_OR_SOURCE:"检查权限、审批或来源版本",REVIEW_AGENT_SOURCE:"核对受影响 Agent，再决定暂停、回退或继续运行",MANUAL_QUALITY_REVIEW:"审核官核实质量证据",RECONCILE_BEFORE_RETRY:"先对账确认，再考虑人工重试",REVIEW_EXPIRED_APPROVAL:"核对审批到期影响"};
   const triageNames={OPEN:"待处理",ACKNOWLEDGED:"已认领",RESOLVED:"已核实关闭"};
   auditState.events.forEach(item=>{
     const row=node("article",undefined,"audit-row"),head=node("div",undefined,"audit-row-head");
@@ -629,6 +629,7 @@ function renderAudit() {
     row.append(head,node("p",`${item.created_at} · 审计 ${item.audit_ref} · 载荷 ${item.payload_ref}`,"muted"));
     row.append(node("p",`分类：${categoryNames[item.category]||item.category||"系统"} · 级别：${item.severity||"INFO"} · 建议：${actionNames[item.recommended_action]||"人工核对"}`,`audit-action ${(item.severity||"INFO").toLowerCase()}`));
     if(item.task_ref)row.append(node("p",`任务引用：${item.task_ref}`,"audit-ref"));
+    if(item.affected_agents?.length)row.append(node("p",`待复核 Agent：${item.affected_agents.map(agent=>`${agent.agent_id} v${agent.version}`).join("、")}`,"audit-ref"));
     if(["WARN","HIGH"].includes(item.severity)){
       row.append(node("p",`处置状态：${triageNames[item.triage_status]||"待处理"}`,"muted"));
       if(auditState.canTriage && item.triage_status==="OPEN"){

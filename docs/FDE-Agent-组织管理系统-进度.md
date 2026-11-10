@@ -8,7 +8,7 @@
 - 发布源：GitHub `main` 提交 `8150c6c`；本地全量 `351 passed`，两组 Edge 浏览器合成演练通过。源码归档本机与服务器 SHA-256 均为 `8398292a0ba5b953c9d29ed957e3574d49e0f9e37e935e97517912f52f12a880`。
 - 发布前：旧控制平面镜像 `fde-control-plane:scan-auth-b05ce93` 健康、数据库 `quick_check=ok`。在线 SQLite 快照及环境/Compose 受限备份在 `/opt/fde-agent-stage/deploy/data/backups/20261110-evidence-preview-8150c6c/`；镜像导入和入口编译通过，旧镜像保留作回退。
 - 部署：仅替换控制平面为 `fde-control-plane:evidence-preview-8150c6c`，镜像 ID `sha256:8cdfa075095ff1de996bd5093556353c148d605c538b0280cd22bf19c532b95b`。审批监听器、只读无网络 Worker 未重启；`FDE_ASSISTANT_INTAKE_ENABLED`、`FDE_ASSISTANT_CARD_REVIEW_ENABLED`、`FDE_CARD_FORM_PROBE_ENABLED` 仍为 `0`。
-- 发布后：控制平面和 Worker healthy，服务器本机 HTTPS `/health=200`、流程发现 JS `200`、匿名候选 API `401`，数据库 `quick_check=ok`；博客 HTTPS `200`。有效成员 OAuth token 数为 `0`，尚不能声称真实群聊或单聊读取通过。本机访问 FDE 域名 HTTPS 仍连接重置，公网入口需单独排查。
+- 发布后：控制平面和 Worker healthy，服务器本机 HTTPS `/health=200`、流程发现 JS `200`、匿名候选 API `401`，数据库 `quick_check=ok`；博客 HTTPS `200`。有效成员 OAuth token 数为 `0`，尚不能声称真实群聊或单聊读取通过。本机访问 FDE 域名 HTTPS 多数请求连接重置，曾有一次 GET `/health=200`，说明公网故障具有间歇性，原因尚未确认；不再断言持续受备案拦截。
 - 学习要点：镜像和数据库健康证明服务部署成功；成员授权数为零则说明飞书用户身份数据路径还没有被真实跑通。应用权限、线上发布和用户 OAuth 是不同的验收层。
 
 ### 2026-11-10 成员候选证据按需预览与群/单聊权限复核
@@ -17,7 +17,7 @@
 - 修改：成员候选增加主动“查看匹配证据摘录”入口。服务端重新读取最近 24 小时，仅返回与该候选指纹和已有脱敏证据引用同时匹配的最多 3 条摘录，每条最多 200 字；响应 `no-store`，不保存正文或原始消息 ID。读取完成后在 SQLite 事务中复核订阅、同意版本、成员身份和当前令牌，撤权或令牌失效时不返回摘录；成功预览写入脱敏审计。扫描也排除 Reader 意外返回的窗口外消息。
 - 因读取说明新增临时原文展示，来源同意版本从 `workflow-source-v1` 升至 `workflow-source-v2`。旧订阅须由本人在原订阅行勾选当前说明并续认，续认前扫描和预览均被阻断；撤销来源后页面不再展示预览按钮。
 - 验收：服务和 API 测试覆盖本人/他人、CSRF、读取期间撤销来源或令牌、过期同意、预览条数和字数上限、原始 ID 不返回及错误脱敏。全量 `py -3.12 -m pytest -q` 为 `351 passed`、4 项第三方弃用警告；Python 编译、JS 语法与 `git diff --check` 通过。Edge 浏览器合成演练的群聊/单聊流程、证据预览、撤权和完整 Agent 生命周期均通过，页面脚本错误 `0`。
-- 公网边界：本机访问 `fde.sixeat.icu` 的 HTTPS 连接仍被重置，先前 HTTP 返回阿里云 `Non-compliance ICP Filing` 403；服务器本机健康检查为 200。需核实备案接入并恢复公网工作台后，由成员本人完成 OAuth，再分别测试真实群聊和单聊。当前不声称真实飞书读取已通过。线上消息入口、正式卡片审核和飞书任务持续写入继续关闭。
+- 公网边界：本机访问 `fde.sixeat.icu` 的 HTTPS 多数请求连接重置，曾有一次 GET `/health=200`；先前 HTTP 出现阿里云 `Non-compliance ICP Filing` 403，此轮 HTTP 返回 404。服务器本机健康检查持续为 200。需核实间歇性公网连接及备案接入状态后，由成员本人完成 OAuth，再分别测试真实群聊和单聊。当前不声称真实飞书读取已通过。线上消息入口、正式卡片审核和飞书任务持续写入继续关闭。
 - 学习要点：应用权限、成员 OAuth、具体会话访问权和工作台公网可达性是四个独立条件；候选摘录的价值是让人核对“为什么推荐”，同时必须随同意版本和撤权实时约束。
 
 ### 2026-11-10 扫描授权再校验版本部署

@@ -3,6 +3,14 @@
 > 这是项目状态的唯一来源。计划书描述目标、依赖和验收要求；本文件记录实际讨论、验证和实施状态。
 > 更新时间：2026-11-10
 
+### 2026-11-10 成员证据预览控制平面部署
+
+- 发布源：GitHub `main` 提交 `8150c6c`；本地全量 `351 passed`，两组 Edge 浏览器合成演练通过。源码归档本机与服务器 SHA-256 均为 `8398292a0ba5b953c9d29ed957e3574d49e0f9e37e935e97517912f52f12a880`。
+- 发布前：旧控制平面镜像 `fde-control-plane:scan-auth-b05ce93` 健康、数据库 `quick_check=ok`。在线 SQLite 快照及环境/Compose 受限备份在 `/opt/fde-agent-stage/deploy/data/backups/20261110-evidence-preview-8150c6c/`；镜像导入和入口编译通过，旧镜像保留作回退。
+- 部署：仅替换控制平面为 `fde-control-plane:evidence-preview-8150c6c`，镜像 ID `sha256:8cdfa075095ff1de996bd5093556353c148d605c538b0280cd22bf19c532b95b`。审批监听器、只读无网络 Worker 未重启；`FDE_ASSISTANT_INTAKE_ENABLED`、`FDE_ASSISTANT_CARD_REVIEW_ENABLED`、`FDE_CARD_FORM_PROBE_ENABLED` 仍为 `0`。
+- 发布后：控制平面和 Worker healthy，服务器本机 HTTPS `/health=200`、流程发现 JS `200`、匿名候选 API `401`，数据库 `quick_check=ok`；博客 HTTPS `200`。有效成员 OAuth token 数为 `0`，尚不能声称真实群聊或单聊读取通过。本机访问 FDE 域名 HTTPS 仍连接重置，公网入口需单独排查。
+- 学习要点：镜像和数据库健康证明服务部署成功；成员授权数为零则说明飞书用户身份数据路径还没有被真实跑通。应用权限、线上发布和用户 OAuth 是不同的验收层。
+
 ### 2026-11-10 成员候选证据按需预览与群/单聊权限复核
 
 - 用户截图确认飞书开放平台的用户身份权限 `im:message.p2p_msg:get_as_user` 已开通；此前群聊 `im:message.group_msg:get_as_user` 已在应用/OAuth 配置中核对。两项分别对应成员可访问的单聊和群聊历史读取，并非只能读群聊；应用开通不等于成员已经授权。服务器上一次只读核对的有效成员 OAuth token 数仍为 `0`，真实读取尚未验收。

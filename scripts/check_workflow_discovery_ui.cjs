@@ -28,6 +28,7 @@ async function main() {
     await page.locator('#workflow-notice').getByText(/扫描完成：读取 2 条消息，发现 1 个候选/).waitFor();
     const opportunity = page.locator('#workflow-opportunities .workflow-opportunity').filter({ hasText: label });
     await opportunity.waitFor();
+    await opportunity.getByText(/首次出现 .* · 最近出现 /).waitFor();
     await opportunity.getByRole('button', { name: '查看匹配证据摘录' }).click();
     const preview = opportunity.locator('.workflow-preview');
     await preview.getByText(/请每周帮我把课程资料整理成待确认事项/).first().waitFor();

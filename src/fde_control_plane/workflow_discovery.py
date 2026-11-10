@@ -285,12 +285,16 @@ class WorkflowDiscoveryService:
         candidates = []
         for fingerprint, matches in grouped.items():
             unique = {ref: seen for seen, ref in matches}
+            evidence = [
+                {"evidence_ref": ref, "seen_at": seen.isoformat()}
+                for ref, seen in sorted(unique.items(), key=lambda item: (item[1], item[0]))
+            ]
             candidates.append({
                 "opportunity_id": "workflow-opportunity-" + secrets.token_hex(10),
                 "signature_hash": fingerprint,
                 "first_seen": min(unique.values()).isoformat(),
                 "last_seen": max(unique.values()).isoformat(),
-                "evidence_refs": list(unique),
+                "evidence": evidence,
             })
         def check_authorization() -> None:
             self._member(identity, required_scope=required_scope)

@@ -1632,7 +1632,8 @@ class SQLiteStore:
                 signature_hash = candidate["signature_hash"]
                 first_seen = candidate["first_seen"]
                 last_seen = candidate["last_seen"]
-                evidence_refs = candidate["evidence_refs"]
+                evidence = candidate["evidence"]
+                evidence_refs = [sample["evidence_ref"] for sample in evidence]
                 existing = self.connection.execute(
                     "SELECT * FROM workflow_opportunities WHERE tenant_id = ? AND subscription_id = ? "
                     "AND signature_hash = ?", (tenant_id, subscription_id, signature_hash),
@@ -1645,20 +1646,21 @@ class SQLiteStore:
                         (opportunity_id, tenant_id, subscription_id, signature_hash, len(evidence_refs),
                          first_seen, last_seen, self._json(evidence_refs[-50:])),
                     )
-                    for evidence_ref in evidence_refs:
+                    for sample in evidence:
                         self.connection.execute(
                             "INSERT OR IGNORE INTO workflow_opportunity_evidence "
                             "(tenant_id, opportunity_id, evidence_ref, seen_at) VALUES (?, ?, ?, ?)",
-                            (tenant_id, opportunity_id, evidence_ref, last_seen),
+                            (tenant_id, opportunity_id, sample["evidence_ref"], sample["seen_at"]),
                         )
                 else:
                     refs = json.loads(existing["evidence_refs_json"])
                     new_refs = []
-                    for evidence_ref in evidence_refs:
+                    for sample in evidence:
+                        evidence_ref = sample["evidence_ref"]
                         inserted = self.connection.execute(
                             "INSERT OR IGNORE INTO workflow_opportunity_evidence "
                             "(tenant_id, opportunity_id, evidence_ref, seen_at) VALUES (?, ?, ?, ?)",
-                            (tenant_id, existing["opportunity_id"], evidence_ref, last_seen),
+                            (tenant_id, existing["opportunity_id"], evidence_ref, sample["seen_at"]),
                         ).rowcount
                         if inserted:
                             new_refs.append(evidence_ref)

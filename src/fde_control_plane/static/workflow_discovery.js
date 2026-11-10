@@ -49,6 +49,11 @@
     const date = new Date(`${value.replace(" ", "T")}Z`);
     return Number.isNaN(date.getTime()) ? "时间未记录" : date.toLocaleString("zh-CN", { hour12: false });
   }
+  function formatEvidenceTime(value) {
+    if (typeof value !== "string") return "时间未记录";
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? "时间未记录" : date.toLocaleString("zh-CN", { hour12: false });
+  }
   function renderSubscriptions() {
     const panel = $("workflow-subscriptions");
     panel.replaceChildren();
@@ -112,7 +117,10 @@
     const meta = document.createElement("p");
     meta.className = "muted";
     meta.textContent = `相同文本出现 ${item.occurrence_count} 次 · ${item.pattern_type} · ${item.evidence_refs.length} 条脱敏证据引用`;
-    card.append(head, meta);
+    const timing = document.createElement("p");
+    timing.className = "muted";
+    timing.textContent = `首次出现 ${formatEvidenceTime(item.first_seen)} · 最近出现 ${formatEvidenceTime(item.last_seen)}`;
+    card.append(head, meta, timing);
     if (item.source_active && item.source_consent_current) {
       const preview = document.createElement("div");
       preview.className = "workflow-preview";

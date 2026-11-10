@@ -171,6 +171,33 @@ def test_member_authorized_discovery_is_idempotent_private_and_creates_linked_dr
     assert "message-one" not in json.dumps(config)
 
 
+def test_repeated_message_becomes_candidate_across_days_with_true_evidence_times(tmp_path):
+    cp, service, reader, identities = setup(tmp_path)
+    identity = identities["member"]
+    first_seen = NOW - timedelta(hours=1)
+    second_seen = NOW + timedelta(hours=23)
+    reader.messages = [ChatMessage("day-one", first_seen, CHAT_TEXT)]
+    source = service.subscribe(identity, "oc_123456789", "GROUP", "测试群", True,
+                               WORKFLOW_SOURCE_CONSENT_VERSION)
+
+    assert service.scan_recent(identity, source["subscription_id"])["opportunity_ids"] == []
+    assert service.list_opportunities(identity) == []
+    service.clock = lambda: NOW + timedelta(days=1)
+    reader.messages = [ChatMessage("day-two", second_seen, CHAT_TEXT)]
+    opportunity_id = service.scan_recent(identity, source["subscription_id"])["opportunity_ids"][0]
+    opportunity = service.list_opportunities(identity)[0]
+    assert opportunity["occurrence_count"] == 2
+    assert opportunity["first_seen"] == first_seen.isoformat()
+    assert opportunity["last_seen"] == second_seen.isoformat()
+    evidence_times = {row["seen_at"] for row in cp.store.connection.execute(
+        "SELECT seen_at FROM workflow_opportunity_evidence WHERE opportunity_id = ?",
+        (opportunity_id,),
+    )}
+    assert evidence_times == {first_seen.isoformat(), second_seen.isoformat()}
+    service.scan_recent(identity, source["subscription_id"])
+    assert service.list_opportunities(identity)[0]["occurrence_count"] == 2
+
+
 def test_evidence_preview_re_reads_only_owner_matches_without_persisting_text(tmp_path):
     cp, service, reader, identities = setup(tmp_path)
     source = service.subscribe(identities["member"], "oc_123456789", "GROUP", "测试群", True,

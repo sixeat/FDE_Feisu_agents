@@ -42,6 +42,10 @@ async function main() {
     await subscription.getByRole('button', { name: '撤销订阅' }).click();
     await subscription.getByText('已撤销').waitFor();
     await subscription.getByRole('button', { name: '扫描最近 24 小时' }).waitFor({ state: 'detached' });
+    await page.getByRole('tab', { name: 'Agent', exact: true }).click();
+    const revokedDraft = page.locator('#agent-draft-list .agent-draft-row').filter({ hasText: `${label} Agent` });
+    await revokedDraft.getByText(/流程来源已撤销或读取说明需重新确认/).waitFor();
+    await page.getByRole('tab', { name: '流程发现' }).click();
 
     const p2pLabel = `单聊演练 ${runId}`;
     await page.locator('#workflow-chat-type').selectOption('P2P');
@@ -59,6 +63,7 @@ async function main() {
       body: JSON.stringify({ detail: 'FEISHU_CHAT_READ_99991663' }),
     }));
     await p2p.getByRole('button', { name: '扫描最近 24 小时' }).click();
+    await page.locator('#workflow-notice').getByText(/请刷新授权状态/).waitFor();
     const failureNotice = await page.locator('#workflow-notice').innerText();
     assert.match(failureNotice, /请刷新授权状态/);
     assert.doesNotMatch(failureNotice, /99991663/);

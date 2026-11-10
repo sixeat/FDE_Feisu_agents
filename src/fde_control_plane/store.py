@@ -1641,6 +1641,19 @@ class SQLiteStore:
         ).fetchone()
 
     @_workflow_serialized
+    def workflow_draft_source_available(self, tenant_id: str, draft_id: str,
+                                        opportunity_id: str,
+                                        consent_version: str) -> bool:
+        return self.connection.execute(
+            "SELECT 1 FROM workflow_opportunities AS o "
+            "JOIN workflow_source_subscriptions AS s ON s.subscription_id = o.subscription_id "
+            "WHERE o.opportunity_id = ? AND o.tenant_id = ? AND o.agent_draft_id = ? "
+            "AND o.status = 'AGENT_DRAFT_CREATED' AND s.tenant_id = ? AND s.status = 'ACTIVE' "
+            "AND s.consent_version = ?",
+            (opportunity_id, tenant_id, draft_id, tenant_id, consent_version),
+        ).fetchone() is not None
+
+    @_workflow_serialized
     def decide_workflow_opportunity(self, *, opportunity_id: str, tenant_id: str,
                                     member_id: str, decision_id: str, decision: str,
                                     reason: str, decided_by: str) -> bool:
@@ -1729,10 +1742,12 @@ class SQLiteStore:
             (draft_id, tenant_id, input_hash),
         ).fetchone()
 
+    @_workflow_serialized
     def publish_agent_config_draft(self, *, draft_id: str, tenant_id: str, approver_id: str,
                                    review_id: str, input_hash: str, agent_id: str,
                                    actor_type: str, capabilities: list[str],
-                                   skill_version: str | None, approval_id: str, event: Any) -> dict[str, Any]:
+                                   skill_version: str | None, approval_id: str, event: Any,
+                                   workflow_consent_version: str) -> dict[str, Any]:
         """Atomically publish a prechecked draft as an immutable AgentVersion."""
         self.connection.execute("BEGIN IMMEDIATE")
         try:
@@ -1752,6 +1767,11 @@ class SQLiteStore:
             data = json.loads(draft["data_json"])
             if hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=True).encode()).hexdigest() != input_hash:
                 raise ValueError("PRECHECK_VERSION_STALE")
+            opportunity_id = data.get("workflow_opportunity_id")
+            if opportunity_id is not None and not self.workflow_draft_source_available(
+                tenant_id, draft_id, opportunity_id, workflow_consent_version,
+            ):
+                raise ValueError("WORKFLOW_SOURCE_UNAVAILABLE")
             review = self.connection.execute(
                 "SELECT review_id, input_hash, status, report_json FROM agent_config_reviews "
                 "WHERE review_id = ? AND draft_id = ? AND tenant_id = ?",

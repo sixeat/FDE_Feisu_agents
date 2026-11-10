@@ -28,6 +28,7 @@ from .runtime import RuntimeAdapter
 from .task_due_correction import (
     approve_due_correction, correction_for_task, latest_remote_observation, propose_due_correction,
 )
+from .workflow_discovery import WORKFLOW_SOURCE_CONSENT_VERSION
 
 
 def csrf_token(session: str) -> str:
@@ -547,6 +548,12 @@ class MeetingReviewWebService:
             data = json.loads(row["data_json"])
             review = self.cp.store.get_latest_agent_config_review(row["draft_id"], identity.tenant_id)
             report = json.loads(review["report_json"]) if review is not None else None
+            opportunity_id = data.get("workflow_opportunity_id")
+            source_available = (None if opportunity_id is None else
+                                self.cp.store.workflow_draft_source_available(
+                                    identity.tenant_id, row["draft_id"], opportunity_id,
+                                    WORKFLOW_SOURCE_CONSENT_VERSION,
+                                ))
             items.append({
                 "draft_id": row["draft_id"], "status": row["status"],
                 "created_by_current_member": row["created_by"] == identity.actor_id,
@@ -554,7 +561,8 @@ class MeetingReviewWebService:
                 "actor_type": data["actor_type"], "description": data["description"],
                 "capabilities": data["capabilities"], "skill_version": data.get("skill_version"),
                 "base_version": data.get("base_version"),
-                "workflow_opportunity_id": data.get("workflow_opportunity_id"),
+                "workflow_opportunity_id": opportunity_id,
+                "workflow_source_available": source_available,
                 "workflow_occurrence_count": data.get("workflow_occurrence_count"),
                 "evaluation_status": (evaluation["status"] if (evaluation := self.cp.store.latest_agent_evaluation(
                     identity.tenant_id, row["draft_id"], hashlib.sha256(json.dumps(
@@ -784,7 +792,13 @@ class MeetingReviewWebService:
         input_hash = hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
         evaluation = self.cp.store.latest_agent_evaluation(identity.tenant_id, draft_id, input_hash)
         previous = self.cp.store.get_latest_agent_config_review(draft_id, identity.tenant_id)
+        opportunity_id = data.get("workflow_opportunity_id")
+        source_available = (opportunity_id is None or self.cp.store.workflow_draft_source_available(
+            identity.tenant_id, draft_id, opportunity_id, WORKFLOW_SOURCE_CONSENT_VERSION,
+        ))
         if (previous is not None and previous["input_hash"] == input_hash
+                and json.loads(previous["report_json"]).get("workflow_source_available", True)
+                == source_available
                 and json.loads(previous["report_json"]).get("evaluation_id") ==
                 (evaluation["evaluation_id"] if evaluation is not None else None)):
             report = json.loads(previous["report_json"])
@@ -803,6 +817,8 @@ class MeetingReviewWebService:
             blockers.append("SELF_REVIEW")
         if evaluation is None or evaluation["status"] != "PASSED":
             blockers.append("AGENT_EVALUATION_REQUIRED")
+        if not source_available:
+            blockers.append("WORKFLOW_SOURCE_UNAVAILABLE")
         existing = self.cp.store.list_agent_actors(identity.tenant_id)
         matched = [item for item in existing if str(item["actor_id"]).casefold() == str(data["name"]).casefold()]
         if data.get("base_version") is None:
@@ -824,6 +840,7 @@ class MeetingReviewWebService:
             "input_hash": input_hash, "blockers": blockers, "warnings": warnings,
             "requested_capabilities": sorted(capabilities), "reviewer_role": sorted(actor.roles & AGENT_REVIEWER_ROLES),
             "evaluation_id": evaluation["evaluation_id"] if evaluation is not None else None,
+            "workflow_source_available": source_available,
         }
         review_id = "agent-review-" + secrets.token_hex(10)
         self.cp.store.save_agent_config_review(review_id, draft_id, identity.tenant_id, identity.actor_id,
@@ -866,6 +883,7 @@ class MeetingReviewWebService:
                 review_id=body.review_id, input_hash=input_hash, agent_id=data["name"],
                 actor_type=ActorType(data["actor_type"]).value, capabilities=list(data.get("capabilities") or []),
                 skill_version=data.get("skill_version"), approval_id=approval_id, event=event,
+                workflow_consent_version=WORKFLOW_SOURCE_CONSENT_VERSION,
             )
         except ValueError as exc:
             reasons = {
@@ -877,6 +895,7 @@ class MeetingReviewWebService:
                 "AGENT_BASE_VERSION_STALE": (409, "Agent 基线版本已变化，请重新提交草稿"),
                 "AGENT_EVALUATION_REQUIRED": (409, "候选版本缺少通过的独立评测"),
                 "SELF_EVALUATION_APPROVAL": (409, "评测人不能确认发布自己的评测结果"),
+                "WORKFLOW_SOURCE_UNAVAILABLE": (409, "流程来源已撤销或失效，请重新确认来源后提交新草稿"),
             }
             code, message = reasons.get(str(exc), (409, "Agent 配置发布未完成，请重新核对"))
             raise HTTPException(code, message) from exc

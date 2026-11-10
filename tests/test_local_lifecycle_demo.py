@@ -260,6 +260,97 @@ def test_local_member_can_subscribe_scan_review_create_draft_and_revoke(tmp_path
     app.state.control_plane.store.close()
 
 
+def test_revoked_workflow_source_blocks_precheck_and_publication(tmp_path):
+    app = create_app(tmp_path / "revoked-workflow-demo.sqlite3")
+    client = TestClient(app)
+    member_headers = _role(client, "member")
+    subscribed = client.post("/api/workflow-opportunities/subscriptions", headers=member_headers,
+                             json={"chat_id": "oc_revoked123", "chat_type": "GROUP",
+                                   "display_label": "撤权测试群", "consent_confirmed": True,
+                                   "consent_version": "workflow-source-v1"})
+    assert subscribed.status_code == 200
+    subscription_id = subscribed.json()["subscription_id"]
+    scanned = client.post(f"/api/workflow-opportunities/subscriptions/{subscription_id}/scan",
+                          headers=member_headers)
+    opportunity_id = scanned.json()["opportunity_ids"][0]
+    assert client.post(f"/api/workflow-opportunities/{opportunity_id}/decision",
+                       headers=member_headers,
+                       json={"decision": "ACCEPTED", "reason": "每周都要重复整理资料"}).status_code == 200
+    created = client.post(f"/api/workflow-opportunities/{opportunity_id}/agent-draft",
+                          headers=member_headers,
+                          json={"name": "撤权来源 Agent", "description": "只做人工待确认建议"})
+    assert created.status_code == 200
+    draft_id = created.json()["draft_id"]
+    stored = app.state.control_plane.store.get_agent_config_draft(draft_id, "local-demo")
+    input_hash = hashlib.sha256(json.dumps(json.loads(stored["data_json"]),
+                                         sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+    reviewer_headers = _role(client, "reviewer")
+    digest = hashlib.sha256(b"READ_ONLY").hexdigest()
+    dataset = {"dataset_id": "revoked-source-eval", "cases": [
+        {"case_id": name, "expected_hash": digest, "evidence_ref": name}
+        for name in ("read-only-1", "read-only-2")
+    ]}
+    assert client.post("/api/meetings/agent-evaluation-datasets", json=dataset,
+                       headers=reviewer_headers).status_code == 200
+    assert client.post(f"/api/meetings/agent-drafts/{draft_id}/evaluate", json={
+        "input_hash": input_hash, "dataset_id": dataset["dataset_id"],
+        "cases": [case | {"observed_hash": digest} for case in dataset["cases"]],
+    }, headers=reviewer_headers).status_code == 200
+    ready = client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck",
+                        headers=reviewer_headers).json()
+    assert ready["status"] == "READY_FOR_ADMIN"
+
+    app.state.control_plane.store.connection.execute(
+        "UPDATE workflow_source_subscriptions SET consent_version = 'workflow-source-v0' "
+        "WHERE subscription_id = ?", (subscription_id,),
+    )
+    admin_headers = _role(client, "admin")
+    outdated = client.post(f"/api/meetings/agent-drafts/{draft_id}/confirm", json={
+        "review_id": ready["review_id"], "input_hash": ready["input_hash"],
+    }, headers=admin_headers)
+    assert outdated.status_code == 409
+    reviewer_headers = _role(client, "reviewer")
+    outdated_review = client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck",
+                                  headers=reviewer_headers).json()
+    assert "WORKFLOW_SOURCE_UNAVAILABLE" in outdated_review["blockers"]
+    member_headers = _role(client, "member")
+    renewed = client.post(f"/api/workflow-opportunities/subscriptions/{subscription_id}/consent",
+                          headers=member_headers,
+                          json={"consent_confirmed": True, "consent_version": "workflow-source-v1"})
+    assert renewed.status_code == 200
+    assert next(item for item in client.get("/api/meetings/agent-drafts").json()["drafts"]
+                if item["draft_id"] == draft_id)["workflow_source_available"] is True
+    reviewer_headers = _role(client, "reviewer")
+    ready = client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck",
+                        headers=reviewer_headers).json()
+    assert ready["status"] == "READY_FOR_ADMIN" and ready["duplicate"] is False
+
+    member_headers = _role(client, "member")
+    assert client.delete(f"/api/workflow-opportunities/subscriptions/{subscription_id}",
+                         headers=member_headers).status_code == 200
+    admin_headers = _role(client, "admin")
+    listed = next(item for item in client.get("/api/meetings/agent-drafts").json()["drafts"]
+                  if item["draft_id"] == draft_id)
+    assert listed["workflow_source_available"] is False
+    assert listed["review_status"] == "READY_FOR_ADMIN"
+    denied = client.post(f"/api/meetings/agent-drafts/{draft_id}/confirm", json={
+        "review_id": ready["review_id"], "input_hash": ready["input_hash"],
+    }, headers=admin_headers)
+    assert denied.status_code == 409
+    assert "来源已撤销或失效" in denied.json()["detail"]
+    reviewer_headers = _role(client, "reviewer")
+    blocked = client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck",
+                          headers=reviewer_headers).json()
+    assert blocked["status"] == "BLOCKED"
+    assert "WORKFLOW_SOURCE_UNAVAILABLE" in blocked["blockers"]
+    assert blocked["duplicate"] is False
+    repeated = client.post(f"/api/meetings/agent-drafts/{draft_id}/precheck",
+                           headers=reviewer_headers).json()
+    assert repeated["review_id"] == blocked["review_id"] and repeated["duplicate"] is True
+    assert app.state.control_plane.store.get_agent_config_approval(draft_id, "local-demo", input_hash) is None
+    assert app.state.control_plane.store.get_agent_version("撤权来源 Agent", 1) is None
+
+
 def test_browser_demo_recovers_session_and_draft_after_restart(tmp_path):
     path = tmp_path / "demo.sqlite3"
     first = create_app(path)

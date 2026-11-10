@@ -480,13 +480,15 @@ function renderAgentDrafts() {
       if(draft.review_blockers?.length)card.append(node("p",`阻断项：${draft.review_blockers.join("、")}`,"agent-review-findings"));
       if(draft.review_warnings?.length)card.append(node("p",`风险提示：${draft.review_warnings.join("、")}`,"agent-review-findings"));
     }
+    if(draft.status!=="PUBLISHED" && draft.workflow_source_available===false)
+      card.append(node("p","流程来源已撤销或读取说明需重新确认；当前草稿不能发布，请重新运行预审。","agent-review-findings"));
     if(agentState.canPrecheck && draft.status==="PENDING_REVIEW"){
       const actions=node("div",undefined,"commands agent-review-actions"),button=node("button","运行审核预审");
       button.type="button";button.addEventListener("click",()=>precheckAgentDraft(draft,button));actions.append(button);card.append(actions);
       if(draft.review_input_hash){const evaluate=node("button","登记独立评测");evaluate.type="button";
         evaluate.addEventListener("click",()=>evaluateAgentDraft(draft,evaluate));actions.append(evaluate);}
     }
-    if(agentState.canConfirm && draft.status!=="PUBLISHED" && draft.review_status==="READY_FOR_ADMIN"){
+    if(agentState.canConfirm && draft.status!=="PUBLISHED" && draft.review_status==="READY_FOR_ADMIN" && draft.workflow_source_available!==false){
       const actions=node("div",undefined,"commands agent-review-actions"),button=node("button","管理员确认发布");
       button.type="button";button.className="primary";button.addEventListener("click",()=>confirmAgentDraft(draft,button));actions.append(button);card.append(actions);
     }

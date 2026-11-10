@@ -24,6 +24,8 @@ from fde_control_plane.orchestration import AgentOrchestrator
 from fde_control_plane.runtime import (HermesAgentSampleAdapter, HermesRuntimeAdapter,
                                        HermesTeachingSourceAdapter)
 from fde_control_plane.user_document_access import FeishuUserDocumentReader, UserTokenVault
+from fde_control_plane.workflow_discovery import FeishuUserChatHistoryReader, WorkflowDiscoveryService
+from fde_control_plane.workflow_web import build_workflow_discovery_router
 from fde_control_plane.teaching import TeachingService
 from fde_control_plane.teaching_execution import TeachingSourceExecutionService
 from fde_control_plane.teaching_web import build_teaching_router
@@ -182,6 +184,17 @@ def create_app() -> FastAPI:
             allowed_agent_id=os.environ["FDE_TEACHING_SOURCE_AGENT_ID"].strip(),
         )
                     if extraction_enabled else None),
+    ))
+    chat_reader = (
+        FeishuUserChatHistoryReader(
+            user_token_store,
+            api_origin=os.environ.get("FEISHU_API_ORIGIN", "https://open.feishu.cn"),
+        )
+        if user_token_store is not None else None
+    )
+    app.include_router(build_workflow_discovery_router(
+        WorkflowDiscoveryService(control_plane, chat_reader, token_vault=user_token_store), sessions,
+        public_origin=f"{uri.scheme}://{uri.netloc}",
     ))
 
     @app.get("/health")

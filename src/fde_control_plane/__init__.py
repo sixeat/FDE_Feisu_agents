@@ -50,6 +50,11 @@ from .feishu_oauth_web import (
     build_session_dependency,
 )
 from .store import SQLiteStore
+from .workflow_discovery import (
+    CHAT_GROUP_READ_SCOPE, CHAT_P2P_READ_SCOPE, ChatMessage,
+    FeishuUserChatHistoryReader, WorkflowDiscoveryService,
+)
+from .workflow_web import build_workflow_discovery_router
 from .follow_up import (
     DailyFollowUpDigest,
     FollowUpStatus,
@@ -120,6 +125,12 @@ __all__ = [
     "OperationProposal",
     "RiskLevel",
     "SQLiteStore",
+    "CHAT_GROUP_READ_SCOPE",
+    "CHAT_P2P_READ_SCOPE",
+    "ChatMessage",
+    "FeishuUserChatHistoryReader",
+    "WorkflowDiscoveryService",
+    "build_workflow_discovery_router",
     "FollowUpStatus",
     "FollowUpObservation",
     "DailyFollowUpDigest",

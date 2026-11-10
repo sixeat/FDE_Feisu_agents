@@ -6,11 +6,11 @@ const organizerState = {csrf:"", tasks:[], busy:false};
 const agentState = {agents:[], drafts:[], csrf:"", canPrecheck:false, canConfirm:false, canPause:false, canResume:false, busy:false};
 const memberState = {requests:[], members:[], csrf:"", busy:false};
 const auditState = {events:[], counts:{}, summary:{}, csrf:"", busy:false, canView:false, canTriage:false, canManageMembers:false};
-const viewNames={meetings:"会议审核","owner-tasks":"我的待办","organizer-tasks":"发起的任务","follow-up":"跟进概览",agents:"Agent 管理",members:"成员与组织",audit:"审计运维"};
+const viewNames={meetings:"会议审核","owner-tasks":"我的待办","organizer-tasks":"发起的任务","follow-up":"跟进概览",agents:"Agent 管理","workflow-discovery":"流程发现",members:"成员与组织",audit:"审计运维"};
 let activeView="";
 const ownerStatusNames = {WAITING_OWNER:"等待你确认",IN_PROGRESS:"已接受，进行中",WAITING_HUMAN:"已退回，等待会议发起人处理",COMPLETED:"已完成",CANCELLED:"已取消",UNKNOWN:"等待核验",DUE_SOON:"即将到期",OVERDUE:"已逾期"};
 const taskNames = {WAITING_REVIEW:"待核对",WAITING_APPROVAL:"待审批",CANCELLED:"已取消",RUNNING:"执行中",RECONCILING:"待核验",SUCCEEDED:"已完成",PARTIAL_SUCCESS:"部分完成",FAILED:"执行失败"};
-const reasonNames = {ASSIGNEE_UNMAPPED:"负责人待确认",ASSIGNEE_INVALID:"负责人不可用",DUE_DATE_UNCONFIRMED:"截止日期待确认",DUE_DATE_INVALID:"截止日期格式无效",TITLE_MISSING:"标题待确认",POSSIBLE_DUPLICATE_OR_CONFLICT:"存在关联或冲突，需人工裁定",DISCARDED_BY_REVIEWER:"已舍弃"};
+const reasonNames = {ASSIGNEE_UNMAPPED:"负责人待确认",ASSIGNEE_INVALID:"负责人不可用",DUE_DATE_UNCONFIRMED:"截止日期待确认",DUE_DATE_INVALID:"截止日期格式无效",date_missing:"纪要未写明确日期",due_date_missing:"纪要未写明确日期",date_ambiguous:"日期表述有歧义",TITLE_MISSING:"标题待确认",POSSIBLE_DUPLICATE_OR_CONFLICT:"存在关联或冲突，需人工裁定",DISCARDED_BY_REVIEWER:"已舍弃"};
 const executionNames = {PREPARED:"待执行",DISPATCHED:"执行中",SUCCEEDED:"已创建",FAILED:"已阻断/失败",UNKNOWN:"结果待核验",RECONCILING:"结果待核验"};
 const agentTypeNames = {PERSONAL_ASSISTANT:"个人助手",BUSINESS_AGENT:"业务 Agent",MANAGEMENT_AGENT:"管理 Agent"};
 const agentStatusNames = {ACTIVE:"运行中",CANARY:"志愿者灰度",PAUSED:"已暂停",ARCHIVED:"已归档",UNVERSIONED:"待接入"};
@@ -616,7 +616,7 @@ function renderAuditSummary(){
 function renderAudit() {
   const panel=$("audit-list");panel.replaceChildren();
   if(!auditState.events.length){panel.append(node("p","暂无审计事件。","muted"));return;}
-  const categoryNames={AGENT_GOVERNANCE:"Agent治理",APPROVAL:"审批",SOURCE:"来源校验",MEMBER:"成员",TASK_FOLLOW_UP:"任务跟进",TASK:"任务",TOOL:"工具",OPERATIONS:"运维处置",SYSTEM:"系统"};
+  const categoryNames={AGENT_GOVERNANCE:"Agent治理",APPROVAL:"审批",SOURCE:"来源校验",WORKFLOW_DISCOVERY:"流程发现",MEMBER:"成员",TASK_FOLLOW_UP:"任务跟进",TASK:"任务",TOOL:"工具",OPERATIONS:"运维处置",SYSTEM:"系统"};
   const actionNames={NONE:"无需处理",CHECK_POLICY_OR_SOURCE:"检查权限、审批或来源版本",MANUAL_QUALITY_REVIEW:"审核官核实质量证据",RECONCILE_BEFORE_RETRY:"先对账确认，再考虑人工重试",REVIEW_EXPIRED_APPROVAL:"核对审批到期影响"};
   const triageNames={OPEN:"待处理",ACKNOWLEDGED:"已认领",RESOLVED:"已核实关闭"};
   auditState.events.forEach(item=>{
@@ -896,6 +896,7 @@ function showView(view,{updateHash=true}={}) {
   if(view==="organizer-tasks")loadOrganizerTasks();
   if(view==="follow-up")refreshDigest();
   if(view==="agents")loadAgents();
+  if(view==="workflow-discovery")loadWorkflowWorkspace();
   if(view==="members")loadMembers();
   if(view==="audit")loadAudit();
   return true;

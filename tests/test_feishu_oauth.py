@@ -271,7 +271,8 @@ def test_web_flow_builds_authorization_url_and_consumes_callback(tmp_path):
         OAuthWebConfig(
             app_id="cli_test",
             redirect_uri="https://example.test/oauth/callback",
-            scopes=("authen:user_info:read", "docx:document:readonly"),
+            scopes=("authen:user_info:read", "docx:document:readonly",
+                    "im:message.group_msg:get_as_user", "im:message.p2p_msg:get_as_user"),
         ),
     )
     url = flow.authorization_url(browser_session_ref="browser-1")
@@ -279,7 +280,8 @@ def test_web_flow_builds_authorization_url_and_consumes_callback(tmp_path):
     assert "client_id=cli_test" in url
     assert "response_type=code" in url
     assert "redirect_uri=https%3A%2F%2Fexample.test%2Foauth%2Fcallback" in url
-    assert "scope=authen%3Auser_info%3Aread+docx%3Adocument%3Areadonly" in url
+    assert ("scope=authen%3Auser_info%3Aread+docx%3Adocument%3Areadonly+"
+            "im%3Amessage.group_msg%3Aget_as_user+im%3Amessage.p2p_msg%3Aget_as_user") in url
     state = url.split("state=", 1)[1].split("&", 1)[0]
     assert flow.callback(state=state, code="code", browser_session_ref="browser-1").actor_id == "member"
     assert transport.codes == ["code"]

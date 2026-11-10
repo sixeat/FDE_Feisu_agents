@@ -1,6 +1,6 @@
 (() => {
   window.fdeLocalDemo = true;
-  const allowed = new Set(["agents", "audit"]);
+  const allowed = new Set(["agents", "workflow-discovery", "audit"]);
   const normalizeHash = () => {
     const view = location.hash.slice(1);
     if (!allowed.has(view) || (view === "audit" && document.getElementById("module-audit")?.hidden))
@@ -10,6 +10,7 @@
   window.addEventListener("hashchange", normalizeHash);
   window.addEventListener("popstate", normalizeHash);
   document.addEventListener("DOMContentLoaded", () => {
+    document.getElementById("workflow-demo-banner").hidden = false;
     for (const view of ["meetings", "owner-tasks", "organizer-tasks", "follow-up", "members"])
       document.getElementById(`module-${view}`).hidden = true;
     const account = document.querySelector(".topbar .account");

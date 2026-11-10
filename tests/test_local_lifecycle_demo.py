@@ -23,12 +23,16 @@ def test_browser_demo_runs_governance_without_feishu(tmp_path):
     client = TestClient(app)
     assert client.get("/health").json()["mode"] == "synthetic-local-demo"
     assert client.get("/h5", follow_redirects=False).headers["location"] == "/local-demo"
+    assert "/local-demo/h5#workflow-discovery" in client.get("/local-demo").text
     member_headers = _role(client, "member")
     assert client.get("/h5", follow_redirects=False).headers["location"] == "/local-demo/h5#agents"
     workspace = client.get("/local-demo/h5")
     assert workspace.status_code == 200
     assert '/assets/local_demo_ui.js' in workspace.text
     assert '/assets/local_demo.css' in workspace.text
+    assert '/assets/workflow_discovery.js' in workspace.text
+    assert workspace.text.index('/assets/local_demo_ui.js') < workspace.text.index('/assets/workflow_discovery.js')
+    assert 'id="workflow-demo-banner"' in workspace.text
     assert client.post("/api/meetings/start", json={}, headers=member_headers).status_code == 404
     draft = _draft(client, member_headers)
     reviewer_headers = _role(client, "reviewer")
@@ -216,6 +220,44 @@ def test_browser_demo_restricts_login_origin_and_remote_clients(tmp_path):
     assert client.post("/local-demo/login/unknown").status_code == 404
     remote = TestClient(app, client=("203.0.113.9", 40000))
     assert remote.get("/local-demo").status_code == 403
+
+
+def test_local_member_can_subscribe_scan_review_create_draft_and_revoke(tmp_path):
+    app = create_app(tmp_path / "workflow-demo.sqlite3")
+    client = TestClient(app)
+    headers = _role(client, "member")
+    subscribed = client.post("/api/workflow-opportunities/subscriptions", headers=headers,
+                             json={"chat_id": "oc_workflow123", "chat_type": "GROUP",
+                                   "display_label": "本地课程群", "consent_confirmed": True,
+                                   "consent_version": "workflow-source-v1"})
+    assert subscribed.status_code == 200
+    subscription_id = subscribed.json()["subscription_id"]
+
+    scanned = client.post(f"/api/workflow-opportunities/subscriptions/{subscription_id}/scan",
+                          headers=headers)
+    assert scanned.status_code == 200
+    assert scanned.json()["messages_scanned"] == 2
+    opportunity_id = scanned.json()["opportunity_ids"][0]
+    opportunity_url = f"/api/workflow-opportunities/{opportunity_id}"
+    assert client.get("/api/workflow-opportunities").json()["opportunities"][0]["status"] == "DISCOVERED"
+
+    decision = client.post(opportunity_url + "/decision", headers=headers,
+                           json={"decision": "ACCEPTED", "reason": "每周都会重复整理课程资料"})
+    assert decision.status_code == 200
+    draft = client.post(opportunity_url + "/agent-draft", headers=headers,
+                        json={"name": "课程资料 Agent", "description": "整理重复流程并输出待确认建议"})
+    assert draft.status_code == 200
+    assert draft.json()["status"] == "PENDING_REVIEW"
+    assert draft.json()["remote_write"] is False
+
+    revoked = client.delete(f"/api/workflow-opportunities/subscriptions/{subscription_id}",
+                            headers=headers)
+    assert revoked.status_code == 200
+    assert client.post(f"/api/workflow-opportunities/subscriptions/{subscription_id}/scan",
+                       headers=headers).status_code == 403
+    opportunity = client.get("/api/workflow-opportunities").json()["opportunities"][0]
+    assert opportunity["status"] == "AGENT_DRAFT_CREATED"
+    app.state.control_plane.store.close()
 
 
 def test_browser_demo_recovers_session_and_draft_after_restart(tmp_path):

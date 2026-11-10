@@ -194,6 +194,7 @@ AUDIT_EVENT_PREFIX_CATEGORIES = (
     ("AGENT_", "AGENT_GOVERNANCE"),
     ("APPROVAL", "APPROVAL"),
     ("FEISHU_DOCUMENT", "SOURCE"),
+    ("WORKFLOW_", "WORKFLOW_DISCOVERY"),
     ("MEMBER", "MEMBER"),
     ("OWNER_", "TASK_FOLLOW_UP"),
     ("TASK_", "TASK"),
@@ -553,6 +554,8 @@ class MeetingReviewWebService:
                 "actor_type": data["actor_type"], "description": data["description"],
                 "capabilities": data["capabilities"], "skill_version": data.get("skill_version"),
                 "base_version": data.get("base_version"),
+                "workflow_opportunity_id": data.get("workflow_opportunity_id"),
+                "workflow_occurrence_count": data.get("workflow_occurrence_count"),
                 "evaluation_status": (evaluation["status"] if (evaluation := self.cp.store.latest_agent_evaluation(
                     identity.tenant_id, row["draft_id"], hashlib.sha256(json.dumps(
                         data, sort_keys=True, ensure_ascii=True).encode()).hexdigest())) is not None else None),

@@ -7,6 +7,7 @@ import pytest
 from fde_control_plane import Actor, ActorType, ControlPlane, IdentityContext, SQLiteStore
 from fde_control_plane.feishu_oauth import FeishuOAuthIdentityGateway, OAuthGrant, OAuthUser
 from fde_control_plane.user_document_access import FeishuUserDocumentReader, UserTokenVault
+from fde_control_plane.user_document_access import CHAT_GROUP_READ_SCOPE
 
 
 KEY = base64.urlsafe_b64encode(b"k" * 32).decode()
@@ -48,6 +49,17 @@ def test_grant_downgrade_and_revocation_remove_old_document_access(tmp_path):
     vault.replace(identity(), OAuthGrant("third", " ".join(SCOPES), 3600))
     vault.revoke("member")
     assert store.get_user_oauth_token("member") is None
+
+
+def test_chat_only_oauth_grant_is_encrypted_and_scope_bound(tmp_path):
+    store = SQLiteStore(tmp_path / "chat-vault.sqlite3")
+    vault = UserTokenVault(store, KEY, clock=lambda: 1000)
+    chat_identity = IdentityContext("tenant", "member", "user_oauth", SUBJECT,
+                                    frozenset({CHAT_GROUP_READ_SCOPE}))
+    vault.replace(chat_identity, OAuthGrant("chat-token", CHAT_GROUP_READ_SCOPE, 3600))
+    assert vault.get(chat_identity, required_scope=CHAT_GROUP_READ_SCOPE) == "chat-token"
+    with pytest.raises(PermissionError, match="authorization is missing"):
+        vault.get(identity(), required_scope=CHAT_GROUP_READ_SCOPE)
 
 
 def test_empty_user_token_cannot_be_stored_or_used(tmp_path):

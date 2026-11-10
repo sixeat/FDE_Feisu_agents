@@ -332,6 +332,25 @@ def test_audit_view_is_admin_only_tenant_scoped_and_redacted(tmp_path):
     assert "admin-subject" not in result.text
     assert any(item["event_type"] == "TASK_CREATED" for item in body["events"])
 
+    private_chat_ref = "oc_private_workflow_source"
+    cp._audit("WORKFLOW_DISCOVERY_SCAN_BLOCKED", "tenant", "member", None,
+              {"chat_id": private_chat_ref, "reason": "USER_AUTHORIZATION_REQUIRED"}, "BLOCKED")
+    cp._audit("WORKFLOW_DISCOVERY_SCAN_FAILED", "tenant", "member", None,
+              {"error_code": "FEISHU_CHAT_READ_TRANSPORT_ERROR"}, "FAILED")
+    workflow_result = client.get("/api/meetings/audit")
+    workflow_events = workflow_result.json()["events"]
+    workflow_block = next(item for item in workflow_events
+                          if item["event_type"] == "WORKFLOW_DISCOVERY_SCAN_BLOCKED")
+    assert workflow_block["category"] == "WORKFLOW_DISCOVERY"
+    assert workflow_block["severity"] == "WARN"
+    assert workflow_block["recommended_action"] == "CHECK_POLICY_OR_SOURCE"
+    workflow_failure = next(item for item in workflow_events
+                            if item["event_type"] == "WORKFLOW_DISCOVERY_SCAN_FAILED")
+    assert workflow_failure["category"] == "WORKFLOW_DISCOVERY"
+    assert workflow_failure["severity"] == "HIGH"
+    assert workflow_failure["recommended_action"] == "RECONCILE_BEFORE_RETRY"
+    assert private_chat_ref not in workflow_result.text
+
 
 def test_audit_triage_requires_admin_and_preserves_conclusion_without_remote_write(tmp_path):
     cp, _, client, _, _, _, task_id = web_setup(tmp_path)

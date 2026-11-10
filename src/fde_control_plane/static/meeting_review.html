@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Agent 组织工作台</title>
   <link rel="stylesheet" href="/assets/meeting_review.css">
+  <script src="/assets/workflow_discovery.js" defer></script>
   <script src="/assets/meeting_review.js" defer></script>
 </head>
 <body>
@@ -18,6 +19,7 @@
         <button id="module-organizer-tasks" type="button" role="tab" aria-selected="false" aria-controls="view-organizer-tasks" data-view="organizer-tasks"><span>发起任务</span></button>
         <button id="module-follow-up" type="button" role="tab" aria-selected="false" aria-controls="view-follow-up" data-view="follow-up"><span>跟进概览</span></button>
         <button id="module-agents" type="button" role="tab" aria-selected="false" aria-controls="view-agents" data-view="agents"><span>Agent</span></button>
+        <button id="module-workflow-discovery" type="button" role="tab" aria-selected="false" aria-controls="view-workflow-discovery" data-view="workflow-discovery"><span>流程发现</span></button>
         <button id="module-members" type="button" role="tab" aria-selected="false" aria-controls="view-members" data-view="members" hidden><span>成员与组织</span></button>
         <button id="module-audit" type="button" role="tab" aria-selected="false" aria-controls="view-audit" data-view="audit" hidden><span>审计运维</span></button>
       </nav>
@@ -67,6 +69,26 @@
         </section>
         <section class="agent-registry" aria-labelledby="agent-registry-title"><div class="owner-heading"><h2 id="agent-registry-title">Agent 目录</h2></div><div id="agents-notice" role="status" aria-live="polite" hidden></div><div id="agent-list" aria-busy="true"><p class="muted">正在加载 Agent…</p></div></section>
         <section class="agent-drafts" aria-labelledby="agent-drafts-title"><div class="owner-heading"><h2 id="agent-drafts-title">配置草稿</h2></div><div id="agent-draft-list" aria-busy="true"><p class="muted">正在加载配置草稿…</p></div></section>
+      </section>
+      <section id="view-workflow-discovery" class="view-panel" role="tabpanel" aria-labelledby="module-workflow-discovery" hidden>
+        <div class="heading"><div><p class="eyebrow">人工主导的流程生命周期</p><h1>流程发现</h1><p class="muted">选择你有权访问的群聊或单聊，手动扫描最近 24 小时。只有你采纳的候选才能转成待审核 Agent 草稿。</p></div><div class="commands workflow-heading-actions"><button id="workflow-reload" type="button">刷新</button><button id="workflow-reauthorize" type="button">重新授权聊天读取</button></div></div>
+        <div id="workflow-demo-banner" class="workflow-demo-banner" hidden>本地合成演练：使用固定虚构消息，不会连接飞书，也不会读取真实聊天。</div>
+        <p id="workflow-chat-auth-status" class="workflow-auth-status" role="status" aria-live="polite">正在检查聊天授权…</p>
+        <div id="workflow-notice" role="status" aria-live="polite" hidden></div>
+        <section class="workflow-source" aria-labelledby="workflow-source-title">
+          <div class="owner-heading"><h2 id="workflow-source-title">订阅聊天来源</h2></div>
+          <form id="workflow-subscribe-form">
+            <div class="fields workflow-fields">
+              <label class="field"><span>会话类型</span><select id="workflow-chat-type"><option value="GROUP">群聊</option><option value="P2P">单聊</option></select></label>
+              <label class="field"><span>会话 ID</span><input id="workflow-chat-id" required minlength="9" maxlength="128" placeholder="oc_..." autocomplete="off"></label>
+              <label class="field"><span>显示名称</span><input id="workflow-chat-label" required minlength="2" maxlength="80" placeholder="例如：课程教研群" autocomplete="off"></label>
+            </div>
+            <div class="workflow-consent"><label><input id="workflow-consent" type="checkbox" data-consent-version="workflow-source-v1" required>我确认这是我有权访问的会话，并同意只读扫描最近 24 小时的文本消息。</label><span>扫描仅聚合重复文本信号；不保存消息正文或原始消息 ID。撤销后停止扫描。</span></div>
+            <div class="commands"><button class="primary" type="submit">登记订阅</button></div>
+          </form>
+        </section>
+        <section class="workflow-section" aria-labelledby="workflow-subscriptions-title"><div class="owner-heading"><h2 id="workflow-subscriptions-title">我的订阅</h2></div><div id="workflow-subscriptions" aria-busy="true"></div></section>
+        <section class="workflow-section" aria-labelledby="workflow-opportunities-title"><div class="owner-heading"><h2 id="workflow-opportunities-title">流程候选</h2></div><div id="workflow-opportunities" aria-busy="true"></div></section>
       </section>
       <section id="view-members" class="view-panel" role="tabpanel" aria-labelledby="module-members" hidden>
         <div class="heading"><div><p class="eyebrow">组织管理</p><h1>成员与组织</h1><p class="muted">同租户成员首次通过飞书授权后自动接入为普通成员；管理员可管理成员状态。</p></div><button id="members-reload" type="button">刷新成员</button></div>

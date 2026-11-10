@@ -15,9 +15,18 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
+from functools import wraps
 from pathlib import Path
 from threading import RLock
 from typing import Any, Iterable
+
+
+def _workflow_serialized(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._workflow_lock:
+            return method(self, *args, **kwargs)
+    return wrapped
 
 
 class SQLiteStore:
@@ -29,6 +38,7 @@ class SQLiteStore:
         self.path = str(path)
         self._owner_decision_lock = RLock()
         self._session_lock = RLock()
+        self._workflow_lock = RLock()
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         # Autocommit keeps read-only lookups from holding a snapshot. Atomic
@@ -239,6 +249,44 @@ class SQLiteStore:
                 subject_ref_hash TEXT NOT NULL, scopes_json TEXT NOT NULL,
                 token_ciphertext TEXT NOT NULL, expires_at INTEGER NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS workflow_source_subscriptions (
+                subscription_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                member_id TEXT NOT NULL, chat_id TEXT NOT NULL,
+                chat_type TEXT NOT NULL CHECK(chat_type IN ('GROUP', 'P2P')),
+                display_label TEXT NOT NULL,
+                fingerprint_salt TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('ACTIVE', 'REVOKED')),
+                consented_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                consent_version TEXT,
+                revoked_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflow_subscriptions_member
+                ON workflow_source_subscriptions(tenant_id, member_id, status);
+            CREATE TABLE IF NOT EXISTS workflow_opportunities (
+                opportunity_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                subscription_id TEXT NOT NULL, signature_hash TEXT NOT NULL,
+                occurrence_count INTEGER NOT NULL, first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL, evidence_refs_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('DISCOVERED', 'ACCEPTED', 'REJECTED', 'DEFERRED', 'AGENT_DRAFT_CREATED', 'SOURCE_REVOKED')),
+                decision_reason TEXT, agent_draft_id TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(tenant_id, subscription_id, signature_hash),
+                FOREIGN KEY(subscription_id) REFERENCES workflow_source_subscriptions(subscription_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflow_opportunities_member
+                ON workflow_opportunities(tenant_id, subscription_id, status, last_seen);
+            CREATE TABLE IF NOT EXISTS workflow_opportunity_evidence (
+                tenant_id TEXT NOT NULL, opportunity_id TEXT NOT NULL,
+                evidence_ref TEXT NOT NULL, seen_at TEXT NOT NULL,
+                PRIMARY KEY(tenant_id, opportunity_id, evidence_ref),
+                FOREIGN KEY(opportunity_id) REFERENCES workflow_opportunities(opportunity_id)
+            );
+            CREATE TABLE IF NOT EXISTS workflow_opportunity_decisions (
+                decision_id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL, decided_by TEXT NOT NULL,
+                decision TEXT NOT NULL, reason TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(opportunity_id) REFERENCES workflow_opportunities(opportunity_id)
             );
             CREATE TABLE IF NOT EXISTS task_runs (
                 task_run_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
@@ -621,6 +669,12 @@ class SQLiteStore:
             self.connection.execute(
                 "ALTER TABLE teaching_sources ADD COLUMN data_reviewed INTEGER NOT NULL DEFAULT 0 "
                 "CHECK(data_reviewed IN (0, 1))"
+            )
+        workflow_source_columns = {row["name"] for row in self.connection.execute(
+            "PRAGMA table_info(workflow_source_subscriptions)").fetchall()}
+        if "consent_version" not in workflow_source_columns:
+            self.connection.execute(
+                "ALTER TABLE workflow_source_subscriptions ADD COLUMN consent_version TEXT"
             )
         self.connection.commit()
 
@@ -1411,6 +1465,239 @@ class SQLiteStore:
             "FROM agent_config_drafts WHERE draft_id = ? AND tenant_id = ?",
             (draft_id, tenant_id),
         ).fetchone()
+
+    @_workflow_serialized
+    def create_workflow_subscription(self, *, subscription_id: str, tenant_id: str,
+                                     member_id: str, chat_id: str, chat_type: str,
+                                     display_label: str,
+                                     fingerprint_salt: str, consent_version: str) -> sqlite3.Row:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.connection.execute(
+                "SELECT 1 FROM workflow_source_subscriptions WHERE tenant_id = ? "
+                "AND member_id = ? AND chat_id = ? AND status = 'ACTIVE'",
+                (tenant_id, member_id, chat_id),
+            ).fetchone()
+            if existing is not None:
+                raise ValueError("chat source is already subscribed")
+            self.connection.execute(
+                "INSERT INTO workflow_source_subscriptions(subscription_id, tenant_id, member_id, chat_id, "
+                "chat_type, display_label, fingerprint_salt, status, consent_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)",
+                (subscription_id, tenant_id, member_id, chat_id, chat_type, display_label,
+                 fingerprint_salt, consent_version),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return self.get_workflow_subscription(subscription_id, tenant_id, member_id)
+
+    @_workflow_serialized
+    def get_workflow_subscription(self, subscription_id: str, tenant_id: str,
+                                  member_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM workflow_source_subscriptions WHERE subscription_id = ? "
+            "AND tenant_id = ? AND member_id = ?", (subscription_id, tenant_id, member_id),
+        ).fetchone()
+
+    @_workflow_serialized
+    def list_workflow_subscriptions(self, tenant_id: str, member_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT subscription_id, display_label, chat_type, status, consented_at, "
+            "consent_version, revoked_at "
+            "FROM workflow_source_subscriptions "
+            "WHERE tenant_id = ? AND member_id = ? ORDER BY consented_at DESC",
+            (tenant_id, member_id),
+        ).fetchall()
+
+    @_workflow_serialized
+    def renew_workflow_subscription_consent(self, subscription_id: str, tenant_id: str,
+                                           member_id: str, consent_version: str) -> bool:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            changed = self.connection.execute(
+                "UPDATE workflow_source_subscriptions "
+                "SET consent_version = ?, consented_at = CURRENT_TIMESTAMP "
+                "WHERE subscription_id = ? AND tenant_id = ? AND member_id = ? "
+                "AND status = 'ACTIVE'",
+                (consent_version, subscription_id, tenant_id, member_id),
+            ).rowcount
+            self.connection.commit()
+            return changed == 1
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    @_workflow_serialized
+    def revoke_workflow_subscription(self, subscription_id: str, tenant_id: str,
+                                     member_id: str) -> bool:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            changed = self.connection.execute(
+                "UPDATE workflow_source_subscriptions SET status = 'REVOKED', revoked_at = CURRENT_TIMESTAMP "
+                "WHERE subscription_id = ? AND tenant_id = ? AND member_id = ? AND status = 'ACTIVE'",
+                (subscription_id, tenant_id, member_id),
+            ).rowcount
+            if changed:
+                self.connection.execute(
+                    "UPDATE workflow_opportunities SET status = 'SOURCE_REVOKED', "
+                    "decision_reason = 'SOURCE_REVOKED' WHERE subscription_id = ? "
+                    "AND status IN ('DISCOVERED', 'ACCEPTED')",
+                    (subscription_id,),
+                )
+            self.connection.commit()
+            return changed == 1
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    @_workflow_serialized
+    def upsert_workflow_opportunities(self, *, tenant_id: str, subscription_id: str,
+                                      consent_version: str,
+                                      candidates: list[dict[str, Any]]) -> list[sqlite3.Row]:
+        """Commit one scan as a unit after rechecking its source authorization."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            subscription = self.connection.execute(
+                "SELECT status, consent_version FROM workflow_source_subscriptions WHERE subscription_id = ? "
+                "AND tenant_id = ?",
+                (subscription_id, tenant_id),
+            ).fetchone()
+            if (subscription is None or subscription["status"] != "ACTIVE"
+                    or subscription["consent_version"] != consent_version):
+                raise ValueError("workflow source subscription is no longer active")
+            rows = []
+            for candidate in candidates:
+                opportunity_id = candidate["opportunity_id"]
+                signature_hash = candidate["signature_hash"]
+                first_seen = candidate["first_seen"]
+                last_seen = candidate["last_seen"]
+                evidence_refs = candidate["evidence_refs"]
+                existing = self.connection.execute(
+                    "SELECT * FROM workflow_opportunities WHERE tenant_id = ? AND subscription_id = ? "
+                    "AND signature_hash = ?", (tenant_id, subscription_id, signature_hash),
+                ).fetchone()
+                if existing is None:
+                    self.connection.execute(
+                        "INSERT INTO workflow_opportunities(opportunity_id, tenant_id, subscription_id, "
+                        "signature_hash, occurrence_count, first_seen, last_seen, evidence_refs_json, status) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'DISCOVERED')",
+                        (opportunity_id, tenant_id, subscription_id, signature_hash, len(evidence_refs),
+                         first_seen, last_seen, self._json(evidence_refs[-50:])),
+                    )
+                    for evidence_ref in evidence_refs:
+                        self.connection.execute(
+                            "INSERT OR IGNORE INTO workflow_opportunity_evidence "
+                            "(tenant_id, opportunity_id, evidence_ref, seen_at) VALUES (?, ?, ?, ?)",
+                            (tenant_id, opportunity_id, evidence_ref, last_seen),
+                        )
+                else:
+                    refs = json.loads(existing["evidence_refs_json"])
+                    new_refs = []
+                    for evidence_ref in evidence_refs:
+                        inserted = self.connection.execute(
+                            "INSERT OR IGNORE INTO workflow_opportunity_evidence "
+                            "(tenant_id, opportunity_id, evidence_ref, seen_at) VALUES (?, ?, ?, ?)",
+                            (tenant_id, existing["opportunity_id"], evidence_ref, last_seen),
+                        ).rowcount
+                        if inserted:
+                            new_refs.append(evidence_ref)
+                    if new_refs:
+                        refs = (refs + new_refs)[-50:]
+                        self.connection.execute(
+                            "UPDATE workflow_opportunities SET occurrence_count = occurrence_count + ?, "
+                            "first_seen = MIN(first_seen, ?), last_seen = MAX(last_seen, ?), "
+                            "evidence_refs_json = ? WHERE opportunity_id = ?",
+                            (len(new_refs), first_seen, last_seen, self._json(refs), existing["opportunity_id"]),
+                        )
+                rows.append(self.connection.execute(
+                    "SELECT * FROM workflow_opportunities WHERE tenant_id = ? AND subscription_id = ? "
+                    "AND signature_hash = ?", (tenant_id, subscription_id, signature_hash),
+                ).fetchone())
+            self.connection.commit()
+            return rows
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    @_workflow_serialized
+    def list_workflow_opportunities(self, tenant_id: str, member_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT o.*, s.display_label FROM workflow_opportunities AS o "
+            "JOIN workflow_source_subscriptions AS s "
+            "ON s.subscription_id = o.subscription_id WHERE o.tenant_id = ? AND s.member_id = ? "
+            "AND o.occurrence_count >= 2 "
+            "ORDER BY o.last_seen DESC, o.opportunity_id", (tenant_id, member_id),
+        ).fetchall()
+
+    @_workflow_serialized
+    def get_workflow_opportunity(self, opportunity_id: str, tenant_id: str,
+                                 member_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT o.* FROM workflow_opportunities AS o JOIN workflow_source_subscriptions AS s "
+            "ON s.subscription_id = o.subscription_id WHERE o.opportunity_id = ? "
+            "AND o.tenant_id = ? AND s.member_id = ?", (opportunity_id, tenant_id, member_id),
+        ).fetchone()
+
+    @_workflow_serialized
+    def decide_workflow_opportunity(self, *, opportunity_id: str, tenant_id: str,
+                                    member_id: str, decision_id: str, decision: str,
+                                    reason: str, decided_by: str) -> bool:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT o.status FROM workflow_opportunities AS o JOIN workflow_source_subscriptions AS s "
+                "ON s.subscription_id = o.subscription_id WHERE o.opportunity_id = ? "
+                "AND o.tenant_id = ? AND s.member_id = ? AND s.status = 'ACTIVE'",
+                (opportunity_id, tenant_id, member_id),
+            ).fetchone()
+            if row is None or row["status"] != "DISCOVERED":
+                self.connection.rollback()
+                return False
+            self.connection.execute(
+                "UPDATE workflow_opportunities SET status = ?, decision_reason = ? WHERE opportunity_id = ?",
+                (decision, reason, opportunity_id),
+            )
+            self.connection.execute(
+                "INSERT INTO workflow_opportunity_decisions(decision_id, opportunity_id, tenant_id, "
+                "decided_by, decision, reason) VALUES (?, ?, ?, ?, ?, ?)",
+                (decision_id, opportunity_id, tenant_id, decided_by, decision, reason),
+            )
+            self.connection.commit()
+            return True
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    @_workflow_serialized
+    def link_workflow_opportunity_draft(self, *, opportunity_id: str, tenant_id: str,
+                                        member_id: str, draft_id: str, draft_data: dict[str, Any]) -> bool:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT o.status FROM workflow_opportunities AS o JOIN workflow_source_subscriptions AS s "
+                "ON s.subscription_id = o.subscription_id WHERE o.opportunity_id = ? "
+                "AND o.tenant_id = ? AND s.member_id = ? AND s.status = 'ACTIVE'",
+                (opportunity_id, tenant_id, member_id),
+            ).fetchone()
+            if row is None or row["status"] != "ACCEPTED":
+                self.connection.rollback()
+                return False
+            self.connection.execute(
+                "INSERT INTO agent_config_drafts(draft_id, tenant_id, created_by, status, data_json) "
+                "VALUES (?, ?, ?, 'PENDING_REVIEW', ?)",
+                (draft_id, tenant_id, member_id, self._json(draft_data)),
+            )
+            self.connection.execute(
+                "UPDATE workflow_opportunities SET status = 'AGENT_DRAFT_CREATED', agent_draft_id = ? "
+                "WHERE opportunity_id = ? AND status = 'ACCEPTED'", (draft_id, opportunity_id),
+            )
+            self.connection.commit()
+            return True
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def save_agent_config_review(self, review_id: str, draft_id: str, tenant_id: str,
                                  reviewer_id: str, input_hash: str, status: str,

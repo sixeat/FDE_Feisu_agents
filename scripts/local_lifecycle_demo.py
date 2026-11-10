@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import asyncio
 import secrets
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -20,6 +21,9 @@ from fde_control_plane import (Actor, ActorType, AgentOrchestrator, AssistantBin
 from fde_control_plane.meeting_review_web import (MeetingReviewWebService,
                                                    build_meeting_review_router, csrf_token)
 from fde_control_plane.runtime import RunEvent, RunRequest, RuntimeResult
+from fde_control_plane.workflow_discovery import (CHAT_GROUP_READ_SCOPE, CHAT_P2P_READ_SCOPE,
+                                                  ChatMessage, WorkflowDiscoveryService)
+from fde_control_plane.workflow_web import build_workflow_discovery_router
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,6 +70,16 @@ class DisabledDocumentReader:
         raise RuntimeError("Feishu document access is disabled in the local lifecycle demo")
 
 
+class SyntheticWorkflowReader:
+    def list_messages(self, identity, chat_id, chat_type, start_at, end_at):
+        text = "请每周帮我把课程资料整理成待确认事项"
+        moment = end_at - datetime.resolution
+        return [
+            ChatMessage("synthetic-message-1", moment, text),
+            ChatMessage("synthetic-message-2", moment, text),
+        ]
+
+
 def create_app(db_path: Path | None = None, *, port: int = 8212) -> FastAPI:
     path = db_path or ROOT / "deploy" / "data" / "local-lifecycle-demo.sqlite3"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,9 +99,14 @@ def create_app(db_path: Path | None = None, *, port: int = 8212) -> FastAPI:
                                          DisabledDocumentReader())
     service = MeetingReviewWebService(gateway, sample_runtime=SyntheticRuntime())
     app = FastAPI(title="Local Agent Lifecycle Demo")
+    request_lock = asyncio.Lock()
     app.mount("/assets", StaticFiles(directory=STATIC), name="assets")
     app.include_router(build_meeting_review_router(
         service, sessions, public_origin=f"http://127.0.0.1:{port}",
+    ))
+    app.include_router(build_workflow_discovery_router(
+        WorkflowDiscoveryService(cp, SyntheticWorkflowReader()), sessions,
+        public_origin=f"http://127.0.0.1:{port}",
     ))
     app.state.control_plane = cp
     app.state.sessions = sessions
@@ -102,7 +121,10 @@ def create_app(db_path: Path | None = None, *, port: int = 8212) -> FastAPI:
                        "/api/meetings/agent-evaluation-datasets", "/api/meetings/logout")
             if not request.url.path.startswith(allowed):
                 return JSONResponse({"detail": "this demo runs Agent governance only"}, status_code=404)
-        return await call_next(request)
+        if request.url.path.startswith("/assets/") or request.url.path == "/health":
+            return await call_next(request)
+        async with request_lock:
+            return await call_next(request)
 
     @app.get("/health")
     def health():
@@ -146,7 +168,8 @@ def create_app(db_path: Path | None = None, *, port: int = 8212) -> FastAPI:
             "</style><h1>本地 Agent 生命周期</h1>"
             "<p>虚构身份与固定样例回答；不连接飞书，也不执行远端写入。</p>"
             f"<p>当前身份：<strong>{current}</strong></p>{buttons}"
-            "<p><a href='/local-demo/h5#agents'>进入 Agent 工作台</a></p></html>",
+            "<p><a href='/local-demo/h5#agents'>进入 Agent 工作台</a> · "
+            "<a href='/local-demo/h5#workflow-discovery'>进入流程发现演练</a></p></html>",
             headers={"Cache-Control": "no-store"},
         )
 
@@ -157,7 +180,8 @@ def create_app(db_path: Path | None = None, *, port: int = 8212) -> FastAPI:
         origin = request.headers.get("origin")
         if origin is not None and origin != f"http://127.0.0.1:{port}":
             raise HTTPException(403, "invalid local origin")
-        identity = IdentityContext(TENANT, role, "user_oauth", f"local-demo-{role}")
+        identity = IdentityContext(TENANT, role, "user_oauth", f"local-demo-{role}",
+                                   frozenset({CHAT_GROUP_READ_SCOPE, CHAT_P2P_READ_SCOPE}))
         response = RedirectResponse("/local-demo/h5#agents", status_code=303)
         response.set_cookie("fde_auth_session", sessions(identity), max_age=86400,
                             httponly=True, secure=False, samesite="lax")
@@ -180,10 +204,15 @@ def create_app(db_path: Path | None = None, *, port: int = 8212) -> FastAPI:
             return RedirectResponse("/local-demo", status_code=303)
         html = (STATIC / "meeting_review.html").read_text(encoding="utf-8")
         script = '<script src="/assets/meeting_review.js" defer></script>'
-        if script not in html:
+        workflow_script = '<script src="/assets/workflow_discovery.js" defer></script>'
+        if script not in html or workflow_script not in html:
             raise RuntimeError("Agent workspace script is missing")
-        html = html.replace(script, '<link rel="stylesheet" href="/assets/local_demo.css">'
-                            '<script src="/assets/local_demo_ui.js" defer></script>' + script, 1)
+        html = html.replace(
+            workflow_script,
+            '<link rel="stylesheet" href="/assets/local_demo.css">'
+            '<script src="/assets/local_demo_ui.js" defer></script>' + workflow_script,
+            1,
+        )
         return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
     @app.get("/")

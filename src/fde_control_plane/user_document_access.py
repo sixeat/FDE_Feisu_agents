@@ -18,6 +18,9 @@ from .store import SQLiteStore
 
 
 DOC_READ_SCOPE = "docx:document:readonly"
+CHAT_GROUP_READ_SCOPE = "im:message.group_msg:get_as_user"
+CHAT_P2P_READ_SCOPE = "im:message.p2p_msg:get_as_user"
+CHAT_READ_SCOPES = frozenset({CHAT_GROUP_READ_SCOPE, CHAT_P2P_READ_SCOPE})
 
 
 class UserDocumentAuthorizationRequired(PermissionError):
@@ -49,7 +52,7 @@ class UserTokenVault:
             raise PermissionError("user OAuth access token is missing")
         scopes = identity.scopes
         lifetime = int(grant.expires_in or 0)
-        if DOC_READ_SCOPE not in scopes or lifetime <= 30:
+        if not scopes.intersection({DOC_READ_SCOPE, *CHAT_READ_SCOPES}) or lifetime <= 30:
             self.store.delete_user_oauth_token(identity.actor_id)
             return
         nonce = secrets.token_bytes(12)
@@ -63,13 +66,16 @@ class UserTokenVault:
             token_ciphertext=payload, expires_at=int(self.clock()) + lifetime,
         )
 
-    def get(self, identity: IdentityContext) -> str:
+    def get(self, identity: IdentityContext, *, required_scope: str = DOC_READ_SCOPE) -> str:
+        if required_scope not in {DOC_READ_SCOPE, *CHAT_READ_SCOPES}:
+            raise ValueError("unsupported user token scope")
         if identity.auth_mode not in {"feishu_event", "user_oauth"}:
             raise PermissionError("user document authorization requires a member identity")
         row = self.store.get_user_oauth_token(identity.actor_id)
         if (row is None or row["tenant_id"] != identity.tenant_id
                 or row["subject_ref_hash"] != identity.subject_ref_hash
-                or DOC_READ_SCOPE not in json.loads(row["scopes_json"])
+                or (identity.auth_mode == "user_oauth" and required_scope not in identity.scopes)
+                or required_scope not in json.loads(row["scopes_json"])
                 or int(row["expires_at"]) <= int(self.clock()) + 30):
             raise UserDocumentAuthorizationRequired("user document authorization is missing or expired")
         try:
@@ -83,6 +89,19 @@ class UserTokenVault:
             return token
         except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
             raise UserDocumentAuthorizationRequired("user document authorization cannot be verified") from exc
+
+    def chat_authorization_status(self, identity: IdentityContext) -> dict[str, bool]:
+        if identity.auth_mode != "user_oauth":
+            raise PermissionError("user OAuth identity is required")
+        status = {}
+        for name, scope in (("group_chat", CHAT_GROUP_READ_SCOPE),
+                            ("p2p_chat", CHAT_P2P_READ_SCOPE)):
+            try:
+                self.get(identity, required_scope=scope)
+                status[name] = True
+            except UserDocumentAuthorizationRequired:
+                status[name] = False
+        return status
 
     def revoke(self, actor_id: str) -> None:
         self.store.delete_user_oauth_token(actor_id)
@@ -106,4 +125,6 @@ class FeishuUserDocumentReader:
         return FeishuDocumentRevisionReader(self.client, user_access_token=token).get_revision(document_id)
 
 
-__all__ = ["DOC_READ_SCOPE", "FeishuUserDocumentReader", "UserDocumentAuthorizationRequired", "UserTokenVault"]
+__all__ = ["CHAT_GROUP_READ_SCOPE", "CHAT_P2P_READ_SCOPE", "CHAT_READ_SCOPES",
+           "DOC_READ_SCOPE", "FeishuUserDocumentReader",
+           "UserDocumentAuthorizationRequired", "UserTokenVault"]
